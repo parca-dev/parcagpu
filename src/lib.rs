@@ -104,7 +104,7 @@ redhook::hook! {
             let r = p_cap_stat.as_ref().unwrap();
             if *r != 0 {
                 println!("Stream is capturing; not recording the event.");
-                real(func, grid_dim, block_dim, args, shared_mem, stream);
+                return real(func, grid_dim, block_dim, args, shared_mem, stream);
             }
         }
         let mut rng = rand::rng();
