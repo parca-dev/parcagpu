@@ -70,7 +70,7 @@ fn dostuff(rx: Receiver<KernelDescription>) {
         unsafe {
             let err = cudaEventSynchronize(ev2);
             if err != 0 {
-                println!("wtf: {err}");
+                println!("wtf: {err}, {id:x}");
                 continue;
             }
             let mut ms: c_float = 0.0;
@@ -103,13 +103,13 @@ redhook::hook! {
             }
             let r = p_cap_stat.as_ref().unwrap();
             if *r != 0 {
-                println!("Stream is capturing; not recording the event.");
+                println!("Stream {stream:p} is capturing; not recording the event.");
                 return real(func, grid_dim, block_dim, args, shared_mem, stream);
             }
         }
         let mut rng = rand::rng();
         let id: u32 = rng.random();
-        println!("Kernel launched: {func:p}; id: 0x{id:x}");
+        println!("Kernel launched: {func:p}; id: 0x{id:x}, stream {stream:p}");
 
         let kd = unsafe {
             let mut ev1: CUevent = std::ptr::null_mut();
