@@ -49,7 +49,7 @@ unsafe extern "C" {
     // ​cudaError_t cudaEventElapsedTime_v2 ( float* ms, cudaEvent_t start, cudaEvent_t end )
     fn cudaEventElapsedTime_v2(ms: *mut c_float, start: CUevent, end: CUevent) -> CudaErrorT;
     //cudaError_t cudaStreamIsCapturing ( cudaStream_t stream, cudaStreamCaptureStatus ** pCaptureStatus )
-    fn cudaStreamIsCapturing(stream: CUstream, pCaptureStatus: *mut *mut CudaStreamCaptureStatus) -> CudaErrorT;
+    fn cudaStreamIsCapturing(stream: CUstream, pCaptureStatus: *mut CudaStreamCaptureStatus) -> CudaErrorT;
 }
 
 // __host__​cudaError_t cudaLaunchKernel ( const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream )
@@ -95,14 +95,13 @@ redhook::hook! {
     ) -> CudaErrorT => shim {
         let real = redhook::real!(cudaLaunchKernel);
         unsafe {
-            let mut p_cap_stat = null_mut();
+            let mut p_cap_stat = 0;
             let err = cudaStreamIsCapturing(stream, &raw mut p_cap_stat);
             if err != 0 {
                 println!("Couldn't detect whether the stream is capturing: {err}");
                 return err;
             }
-            let r = p_cap_stat.as_ref().unwrap();
-            if *r != 0 {
+            if p_cap_stat != 0 {
                 println!("Stream {stream:p} is capturing; not recording the event.");
                 return real(func, grid_dim, block_dim, args, shared_mem, stream);
             }
