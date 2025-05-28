@@ -12,7 +12,6 @@ checksum = "d750af042f7ef4f724306de029d18836c26c1765a54a6a3f094cbd23a7267ffa"
 name = "parcagpu"
 version = "0.1.0"
 dependencies = [
- "libc",
  "redhook",
 ]
 
