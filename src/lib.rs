@@ -17,23 +17,28 @@ macro_rules! opaque_type {
     };
 }
 
-opaque_type! {CUfunc_st}
+opaque_type! {pub CUfunc_st}
 
 type CUfunction = *mut CUfunc_st;
 
-opaque_type! {CUstream_st}
+opaque_type! {pub CUstream_st}
 
 type CUstream = *mut CUstream_st;
 
-unsafe extern "C" {
-    fn cuLaunchKernel(
+redhook::hook! {
+    unsafe fn cuLaunchKernel(
         f: CUfunction,
-        gridDimX: c_uint,
-        gridDimY: c_uint,
-        gridDimZ: c_uint,
-        sharedMemBytes: c_uint,
-        hStream: CUstream,
-        kernelParams: *mut *mut c_void,
-        extra: *mut *mut c_void,
-    ) -> CUresult;
+        grid_dim_x: c_uint,
+        grid_dim_y: c_uint,
+        grid_dim_z: c_uint,
+        shared_mem_bytes: c_uint,
+        h_stream: CUstream,
+        kernel_params: *mut *mut c_void,
+        extra: *mut *mut c_void
+    ) -> CUresult => shim {
+        println!("Kernel launched: {f:p}");
+        unsafe {
+            redhook::real!(cuLaunchKernel)(f, grid_dim_x, grid_dim_y, grid_dim_z, shared_mem_bytes, h_stream, kernel_params, extra)
+        }
+    }
 }

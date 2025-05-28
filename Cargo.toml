@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2.172"
+redhook = "2.0.0"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["dylib"]
