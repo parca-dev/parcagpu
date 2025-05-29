@@ -1,9 +1,13 @@
+use futures::{FutureExt, pin_mut, select};
+use smol::channel::{Receiver, Sender, unbounded};
+use smol::io::AsyncWriteExt;
+use smol::net::unix::{UnixListener, UnixStream};
 use std::ffi::{c_float, c_int, c_uint, c_void};
 use std::ptr::null_mut;
 use std::sync::OnceLock;
-use std::sync::mpsc::{Receiver, Sender, channel};
+// use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 
 use rand::Rng;
 
@@ -51,7 +55,10 @@ unsafe extern "C" {
     fn cudaEventElapsedTime_v2(ms: *mut c_float, start: CUevent, end: CUevent) -> CudaErrorT;
     fn cudaEventElapsedTime(ms: *mut c_float, start: CUevent, end: CUevent) -> CudaErrorT;
     //cudaError_t cudaStreamIsCapturing ( cudaStream_t stream, cudaStreamCaptureStatus ** pCaptureStatus )
-    fn cudaStreamIsCapturing(stream: CUstream, pCaptureStatus: *mut CudaStreamCaptureStatus) -> CudaErrorT;
+    fn cudaStreamIsCapturing(
+        stream: CUstream,
+        pCaptureStatus: *mut CudaStreamCaptureStatus,
+    ) -> CudaErrorT;
 }
 
 // __host__​cudaError_t cudaLaunchKernel ( const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream )
@@ -66,34 +73,64 @@ unsafe impl Send for KernelDescription {}
 
 static CELL: OnceLock<Sender<KernelDescription>> = OnceLock::new();
 
-// XXX - cleanup
-fn dostuff(rx: Receiver<KernelDescription>) {
-    let mut tot: f64 = 0.0;
-    let mut ct = 0;
-    let mut since = Instant::now();
-    for KernelDescription { ev1, ev2, id } in rx {
-        if since.elapsed() >= Duration::from_secs(10) {
-            eprintln!("{tot} {ct}");
-            since = Instant::now();
-        }
+async fn serve_stream(mut stream: UnixStream, rx: &Receiver<KernelDescription>) {
+    loop {
+        let KernelDescription { ev1, ev2, id } = rx.recv().await.expect("XXX");
         unsafe {
             let err = cudaEventSynchronize(ev2);
             if err != 0 {
-                println!("wtf: {err}, {id:x}");
-                continue;
+                panic!("{err}");
             }
             let mut ms: c_float = 0.0;
-            let err = cudaEventElapsedTime(&raw mut ms, ev1, ev2);
+            let err = cudaEventElapsedTime(&mut ms, ev1, ev2);
             if err != 0 {
-                println!("wtf: {err}, {id:x}");
-            } else {
-                tot += (ms as f64) * 128.0;
-                ct += 1;
-               println!("{id:x}: {ms}")
+                panic!("{err}");
+            }
 
+            let mut buf = [0; 8];
+            buf[0..4].copy_from_slice(&id.to_le_bytes());
+            buf[4..8].copy_from_slice(&ms.to_le_bytes());
+
+            if let Err(_) = stream.write_all(&buf).await {
+                return;
             }
         }
     }
+}
+
+// XXX - cleanup
+async fn process_messages(rx: Receiver<KernelDescription>) {
+    // XXX - this is not going to work in containers.
+    let path = format!("/tmp/parcagpu.{}", std::process::id());
+    let l = UnixListener::bind(&path).expect("XXX");
+    loop {
+        let stream_fut = l.accept().fuse();
+        let rx_fut = rx.recv().fuse();
+        pin_mut!(stream_fut, rx_fut);
+        select! {
+            res = stream_fut => {
+                let (stream, _) = res.expect("XXX");
+                serve_stream(stream, &rx).await;
+            },
+            res = rx_fut => {
+                res.expect("XXX");
+            }
+        };
+    }
+}
+
+#[inline(never)]
+extern "C" fn shim_inner(
+    _id: u32,
+    func: *const c_void,
+    grid_dim: Dim3,
+    block_dim: Dim3,
+    args: *mut *mut c_void,
+    shared_mem: usize,
+    stream: CUstream,
+) -> CudaErrorT {
+    let real = redhook::real!(cudaLaunchKernel);
+    unsafe { real(func, grid_dim, block_dim, args, shared_mem, stream) }
 }
 
 redhook::hook! {
@@ -124,7 +161,6 @@ redhook::hook! {
         if id % 128 != 0 {
             return unsafe { real(func, grid_dim, block_dim, args, shared_mem, stream) };
         }
-        println!("Kernel launched: {func:p}; id: 0x{id:x}, stream {stream:p}");
 
         let kd = unsafe {
             let mut ev1: CUevent = std::ptr::null_mut();
@@ -155,33 +191,14 @@ redhook::hook! {
         };
 
         let tx = CELL.get_or_init(|| {
-            let (tx, rx) = channel();
+            let (tx, rx) = unbounded();
+            smol::spawn(process_messages(rx)).detach();
 
-            thread::spawn(move  || dostuff(rx));
             tx
         });
 
-        tx.send(kd).unwrap();
+        smol::block_on(tx.send(kd)).unwrap();
 
         0
     }
-
-
-    // CUresult cuLaunchKernel ( CUfunction f, unsigned int  gridDimX, unsigned int  gridDimY, unsigned int  gridDimZ, unsigned int  blockDimX, unsigned int  blockDimY, unsigned int  blockDimZ, unsigned int  sharedMemBytes, CUstream hStream, void** kernelParams, void** extra )
-    // unsafe fn cuLaunchKernel(
-    //     f: CUfunction,
-    //     grid_dim_x: c_uint,
-    //     grid_dim_y: c_uint,
-    //     grid_dim_z: c_uint,
-    //     shared_mem_bytes: c_uint,
-    //     h_stream: CUstream,
-    //     kernel_params: *mut *mut c_void,
-    //     extra: *mut *mut c_void
-    // ) -> CUresult => shim {
-    //     println!("Kernel launched: {f:p}");
-    //     unsafe {
-    //         redhook::real!(cuLaunchKernel)(f, grid_dim_x, grid_dim_y, grid_dim_z, shared_mem_bytes, h_stream, kernel_params, extra)
-    //     }
-    // }
-
 }
