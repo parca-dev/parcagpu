@@ -3,6 +3,7 @@ use std::ptr::null_mut;
 use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
+use std::time::{Instant, Duration};
 
 use rand::Rng;
 
@@ -48,6 +49,7 @@ unsafe extern "C" {
     fn cudaEventSynchronize(event: CUevent) -> CudaErrorT;
     // ​cudaError_t cudaEventElapsedTime_v2 ( float* ms, cudaEvent_t start, cudaEvent_t end )
     fn cudaEventElapsedTime_v2(ms: *mut c_float, start: CUevent, end: CUevent) -> CudaErrorT;
+    fn cudaEventElapsedTime(ms: *mut c_float, start: CUevent, end: CUevent) -> CudaErrorT;
     //cudaError_t cudaStreamIsCapturing ( cudaStream_t stream, cudaStreamCaptureStatus ** pCaptureStatus )
     fn cudaStreamIsCapturing(stream: CUstream, pCaptureStatus: *mut CudaStreamCaptureStatus) -> CudaErrorT;
 }
@@ -66,7 +68,14 @@ static CELL: OnceLock<Sender<KernelDescription>> = OnceLock::new();
 
 // XXX - cleanup
 fn dostuff(rx: Receiver<KernelDescription>) {
+    let mut tot: f64 = 0.0;
+    let mut ct = 0;
+    let mut since = Instant::now();
     for KernelDescription { ev1, ev2, id } in rx {
+        if since.elapsed() >= Duration::from_secs(10) {
+            eprintln!("{tot} {ct}");
+            since = Instant::now();
+        }
         unsafe {
             let err = cudaEventSynchronize(ev2);
             if err != 0 {
@@ -74,11 +83,14 @@ fn dostuff(rx: Receiver<KernelDescription>) {
                 continue;
             }
             let mut ms: c_float = 0.0;
-            let err = cudaEventElapsedTime_v2(&raw mut ms, ev1, ev2);
+            let err = cudaEventElapsedTime(&raw mut ms, ev1, ev2);
             if err != 0 {
                 println!("wtf: {err}, {id:x}");
             } else {
-                println!("{id:x}: {ms}")
+                tot += (ms as f64) * 128.0;
+                ct += 1;
+//                println!("{id:x}: {ms}")
+
             }
         }
     }
@@ -108,7 +120,11 @@ redhook::hook! {
         }
         let mut rng = rand::rng();
         let id: u32 = rng.random();
-        println!("Kernel launched: {func:p}; id: 0x{id:x}, stream {stream:p}");
+
+        if id % 128 != 0 {
+            return unsafe { real(func, grid_dim, block_dim, args, shared_mem, stream) };
+        }
+        // println!("Kernel launched: {func:p}; id: 0x{id:x}, stream {stream:p}");
 
         let kd = unsafe {
             let mut ev1: CUevent = std::ptr::null_mut();

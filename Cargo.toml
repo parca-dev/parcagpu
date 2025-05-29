@@ -10,3 +10,6 @@ redhook = "2.0.0"
 
 [lib]
 crate-type = ["dylib"]
+
+[profile.release]
+debug = true
