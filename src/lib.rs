@@ -89,7 +89,7 @@ fn dostuff(rx: Receiver<KernelDescription>) {
             } else {
                 tot += (ms as f64) * 128.0;
                 ct += 1;
-//                println!("{id:x}: {ms}")
+               println!("{id:x}: {ms}")
 
             }
         }
@@ -124,7 +124,7 @@ redhook::hook! {
         if id % 128 != 0 {
             return unsafe { real(func, grid_dim, block_dim, args, shared_mem, stream) };
         }
-        // println!("Kernel launched: {func:p}; id: 0x{id:x}, stream {stream:p}");
+        println!("Kernel launched: {func:p}; id: 0x{id:x}, stream {stream:p}");
 
         let kd = unsafe {
             let mut ev1: CUevent = std::ptr::null_mut();
