@@ -119,6 +119,15 @@ async fn process_messages(rx: Receiver<KernelDescription>) {
     }
 }
 
+type RealFn = unsafe extern "C" fn(
+    *const c_void,
+    Dim3,
+    Dim3,
+    *mut *mut c_void,
+    usize,
+    *mut CUstream_st,
+) -> i32;
+
 #[inline(never)]
 extern "C" fn shim_inner(
     _id: u32,
@@ -128,8 +137,8 @@ extern "C" fn shim_inner(
     args: *mut *mut c_void,
     shared_mem: usize,
     stream: CUstream,
+    real: RealFn,
 ) -> CudaErrorT {
-    let real = redhook::real!(cudaLaunchKernel);
     unsafe { real(func, grid_dim, block_dim, args, shared_mem, stream) }
 }
 
@@ -172,7 +181,7 @@ redhook::hook! {
             if err != 0 {
                 return err;
             }
-            let err = shim_inner(id, func, grid_dim, block_dim, args, shared_mem, stream);
+            let err = shim_inner(id, func, grid_dim, block_dim, args, shared_mem, stream, real);
             if err != 0 {
                 return err;
             }
