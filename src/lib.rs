@@ -172,7 +172,7 @@ redhook::hook! {
             if err != 0 {
                 return err;
             }
-            let err = real(func, grid_dim, block_dim, args, shared_mem, stream);
+            let err = shim_inner(id, func, grid_dim, block_dim, args, shared_mem, stream);
             if err != 0 {
                 return err;
             }
