@@ -129,6 +129,7 @@ type RealFn = unsafe extern "C" fn(
 ) -> i32;
 
 #[inline(never)]
+#[unsafe(no_mangle)]
 extern "C" fn shim_inner(
     _id: u32,
     func: *const c_void,
