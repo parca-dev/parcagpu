@@ -143,6 +143,8 @@ extern "C" fn shim_inner(
     unsafe { real(func, grid_dim, block_dim, args, shared_mem, stream) }
 }
 
+const SAMP: u32 = 1;
+
 redhook::hook! {
     unsafe fn cudaLaunchKernel(
         func: *const c_void,
@@ -168,7 +170,7 @@ redhook::hook! {
         let mut rng = rand::rng();
         let id: u32 = rng.random();
 
-        if id % 128 != 0 {
+        if id % SAMP != 0 {
             return unsafe { real(func, grid_dim, block_dim, args, shared_mem, stream) };
         }
 
