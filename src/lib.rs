@@ -103,6 +103,7 @@ async fn serve_stream(mut stream: UnixStream, rx: &Receiver<KernelDescription>) 
 async fn process_messages(rx: Receiver<KernelDescription>) {
     // XXX - this is not going to work in containers.
     let path = format!("/tmp/parcagpu.{}", std::process::id());
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
     let l = UnixListener::bind(&path).expect("XXX");
     loop {
         let stream_fut = l.accept().fuse();

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 futures = "0.3.31"
+libc = "0.2.172"
 rand = "0.9.1"
 # libc = "0.2.172"
 redhook = "2.0.0"
