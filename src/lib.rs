@@ -3,6 +3,7 @@ use smol::channel::{Receiver, Sender, unbounded};
 use smol::io::AsyncWriteExt;
 use smol::net::unix::{UnixListener, UnixStream};
 use std::ffi::{c_float, c_int, c_uint, c_void};
+use std::hint::black_box;
 use std::ptr::null_mut;
 use std::sync::OnceLock;
 // use std::sync::mpsc::{Receiver, Sender, channel};
@@ -131,7 +132,7 @@ type RealFn = unsafe extern "C" fn(
 #[inline(never)]
 #[unsafe(no_mangle)]
 extern "C" fn shim_inner(
-    _id: u32,
+    id: u32,
     func: *const c_void,
     grid_dim: Dim3,
     block_dim: Dim3,
@@ -140,6 +141,7 @@ extern "C" fn shim_inner(
     stream: CUstream,
     real: RealFn,
 ) -> CudaErrorT {
+    black_box(id);
     unsafe { real(func, grid_dim, block_dim, args, shared_mem, stream) }
 }
 
