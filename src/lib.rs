@@ -1,9 +1,13 @@
 use futures::{FutureExt, pin_mut, select};
+use smol::Async;
 use smol::channel::{Receiver, Sender, unbounded};
 use smol::io::AsyncWriteExt;
 use smol::net::unix::{UnixListener, UnixStream};
 use std::ffi::{c_float, c_int, c_uint, c_void};
 use std::hint::black_box;
+use std::os::linux::net::SocketAddrExt;
+use std::os::unix::net::SocketAddr;
+use std::os::unix::net::UnixListener as StdUnixListener;
 use std::ptr::null_mut;
 use std::sync::OnceLock;
 // use std::sync::mpsc::{Receiver, Sender, channel};
@@ -102,9 +106,13 @@ async fn serve_stream(mut stream: UnixStream, rx: &Receiver<KernelDescription>) 
 // XXX - cleanup
 async fn process_messages(rx: Receiver<KernelDescription>) {
     // XXX - this is not going to work in containers.
-    let path = format!("/tmp/parcagpu.{}", std::process::id());
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-    let l = UnixListener::bind(&path).expect("XXX");
+    let name = format!("parcagpu.{}", std::process::id());
+    // let path = format!("/tmp/parcagpu.{}", std::process::id());
+    let addr = SocketAddr::from_abstract_name(&name).unwrap();
+    let l: UnixListener = Async::new(StdUnixListener::bind_addr(&addr).expect("XXX"))
+        .expect("XXX")
+        .into();
     loop {
         let stream_fut = l.accept().fuse();
         let rx_fut = rx.recv().fuse();
