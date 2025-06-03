@@ -41,6 +41,8 @@ type CudaErrorT = c_int;
 
 type CudaStreamCaptureStatus = c_int;
 
+const CUDA_EVENT_BLOCKING_SYNC: c_uint = 0x1;
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct Dim3 {
@@ -52,7 +54,7 @@ struct Dim3 {
 #[link(name = "cudart")]
 unsafe extern "C" {
     //cudaError_t cudaEventCreate ( cudaEvent_t* event )
-    fn cudaEventCreate(event: *mut CUevent) -> CudaErrorT;
+    fn cudaEventCreateWithFlags(event: *mut CUevent, flags: c_uint) -> CudaErrorT;
     fn cudaEventRecord(event: CUevent, stream: CUstream) -> CudaErrorT;
     // __host__​cudaError_t cudaEventSynchronize ( cudaEvent_t event )
     fn cudaEventSynchronize(event: CUevent) -> CudaErrorT;
@@ -65,8 +67,6 @@ unsafe extern "C" {
         pCaptureStatus: *mut CudaStreamCaptureStatus,
     ) -> CudaErrorT;
 }
-
-// __host__​cudaError_t cudaLaunchKernel ( const void* func, dim3 gridDim, dim3 blockDim, void** args, size_t sharedMem, cudaStream_t stream )
 
 struct KernelDescription {
     ev1: CUevent,
@@ -187,7 +187,7 @@ redhook::hook! {
 
         let kd = unsafe {
             let mut ev1: CUevent = std::ptr::null_mut();
-            let err = cudaEventCreate(&raw mut ev1);
+            let err = cudaEventCreateWithFlags(&raw mut ev1, CUDA_EVENT_BLOCKING_SYNC);
             if err != 0 {
                 return err;
             }
@@ -200,7 +200,7 @@ redhook::hook! {
                 return err;
             }
             let mut ev2: CUevent = std::ptr::null_mut();
-            let err = cudaEventCreate(&raw mut ev2);
+            let err = cudaEventCreateWithFlags(&raw mut ev2, CUDA_EVENT_BLOCKING_SYNC);
             if err != 0 {
                 return err;
             }
