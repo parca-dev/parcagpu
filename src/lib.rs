@@ -78,6 +78,7 @@ unsafe impl Send for KernelDescription {}
 
 static CELL: OnceLock<Sender<KernelDescription>> = OnceLock::new();
 
+// FIXME - we don't clean up the events after handling them here.
 async fn serve_stream(mut stream: UnixStream, rx: &Receiver<KernelDescription>) {
     loop {
         let KernelDescription { ev1, ev2, id } = rx.recv().await.expect("XXX");
@@ -103,12 +104,13 @@ async fn serve_stream(mut stream: UnixStream, rx: &Receiver<KernelDescription>) 
     }
 }
 
-// XXX - cleanup
+// FIXME - this is not going to work in containers,
+// since it relies on the parca-agent being able to find things in
+// the target process's network namespace.
 async fn process_messages(rx: Receiver<KernelDescription>) {
-    // XXX - this is not going to work in containers.
+    // The socket sends SIGPIPE when it's ignored, just ignore that.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
     let name = format!("parcagpu.{}", std::process::id());
-    // let path = format!("/tmp/parcagpu.{}", std::process::id());
     let addr = SocketAddr::from_abstract_name(&name).unwrap();
     let l: UnixListener = Async::new(StdUnixListener::bind_addr(&addr).expect("XXX"))
         .expect("XXX")
@@ -118,10 +120,14 @@ async fn process_messages(rx: Receiver<KernelDescription>) {
         let rx_fut = rx.recv().fuse();
         pin_mut!(stream_fut, rx_fut);
         select! {
+            // we got a connection, so handle it.
             res = stream_fut => {
                 let (stream, _) = res.expect("XXX");
+                // This blocks until the connection breaks
                 serve_stream(stream, &rx).await;
             },
+            // if we receive any messages while no parca-agent is connected,
+            // just drop them here.
             res = rx_fut => {
                 res.expect("XXX");
             }
