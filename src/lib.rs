@@ -135,6 +135,13 @@ type RealFn = unsafe extern "C" fn(
     *mut CUstream_st,
 ) -> i32;
 
+/// shim_inner receives an ID of a kernel launch along with the arguments to `cudaLaunchKernel`
+/// and just passes them all through.
+///
+/// The point of this is to act as a uprobe point (TODO: should we replace it with USDT?)
+/// where parca-agent can take a stack trace. Since the `id` will be in a known position
+/// (the first argument to the function, so rax on x86 and r0 on aarch64),
+/// parca-agent can record it and later use it to correlate the stack trace with the timing information it receives on the UNIX socket.
 #[inline(never)]
 #[unsafe(no_mangle)]
 extern "C" fn shim_inner(
@@ -147,6 +154,11 @@ extern "C" fn shim_inner(
     stream: CUstream,
     real: RealFn,
 ) -> CudaErrorT {
+    // We don't do anything with `id`, we just need it to be present in rax/r0 when this function is
+    // called, so that parca-agent can see it. Because we're not using it, llvm is smart enough to realize
+    // it doesn't actually need to pass it in release mode -- even despite the use of the `inline_never`
+    // and `no_mangle` annotations on this function. So we use `black_box` here which is an optimization
+    // barrier that basically signals to the compiler that it has to pretend its argument is used.
     black_box(id);
     unsafe { real(func, grid_dim, block_dim, args, shared_mem, stream) }
 }
@@ -154,6 +166,18 @@ extern "C" fn shim_inner(
 const SAMP: u32 = 1;
 
 redhook::hook! {
+    // This replaces the `cudaLaunchKernel` function in libcudart.
+    // It generates a first cuda event, then calls the "shim_inner" function
+    // which in turn calls the underlying real `cudaLaunchKernel` from libcudart. It also passes a randomly
+    // generated ID to `shim_inner`
+    // It then generates a second cuda event, and sends both the events, along with the ID, to another task.
+    //
+    // That other task receives the events and asks CUDA for the elapsed time between them firing.
+    // Because CUDA serializes the start event, the kernel execution, and the end event, this will
+    // tell us how long the kernel took to execute. This data is then sent to parca-agent on a UNIX domain socket.
+    //
+    // TODO: Replace the events-based timing with CUPTI https:///docs.nvidia.com/cupti/
+    // and see if that makes the overhead less bad.
     unsafe fn cudaLaunchKernel(
         func: *const c_void,
         grid_dim: Dim3,
