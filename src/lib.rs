@@ -8,11 +8,7 @@ use std::hint::black_box;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::SocketAddr;
 use std::os::unix::net::UnixListener as StdUnixListener;
-use std::ptr::null_mut;
 use std::sync::OnceLock;
-// use std::sync::mpsc::{Receiver, Sender, channel};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use rand::Rng;
 
@@ -53,15 +49,10 @@ struct Dim3 {
 
 #[link(name = "cudart")]
 unsafe extern "C" {
-    //cudaError_t cudaEventCreate ( cudaEvent_t* event )
     fn cudaEventCreateWithFlags(event: *mut CUevent, flags: c_uint) -> CudaErrorT;
     fn cudaEventRecord(event: CUevent, stream: CUstream) -> CudaErrorT;
-    // __host__​cudaError_t cudaEventSynchronize ( cudaEvent_t event )
     fn cudaEventSynchronize(event: CUevent) -> CudaErrorT;
-    // ​cudaError_t cudaEventElapsedTime_v2 ( float* ms, cudaEvent_t start, cudaEvent_t end )
-    fn cudaEventElapsedTime_v2(ms: *mut c_float, start: CUevent, end: CUevent) -> CudaErrorT;
     fn cudaEventElapsedTime(ms: *mut c_float, start: CUevent, end: CUevent) -> CudaErrorT;
-    //cudaError_t cudaStreamIsCapturing ( cudaStream_t stream, cudaStreamCaptureStatus ** pCaptureStatus )
     fn cudaStreamIsCapturing(
         stream: CUstream,
         pCaptureStatus: *mut CudaStreamCaptureStatus,
