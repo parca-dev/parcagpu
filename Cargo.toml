@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+blocking = "1.6.1"
 futures = "0.3.31"
 libc = "0.2.172"
 rand = "0.9.1"

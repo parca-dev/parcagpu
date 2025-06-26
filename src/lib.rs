@@ -1,3 +1,4 @@
+use blocking::unblock;
 use futures::{FutureExt, pin_mut, select};
 use smol::Async;
 use smol::channel::{Receiver, Sender, unbounded};
@@ -73,13 +74,20 @@ static CELL: OnceLock<Sender<KernelDescription>> = OnceLock::new();
 async fn serve_stream(mut stream: UnixStream, rx: &Receiver<KernelDescription>) {
     loop {
         let KernelDescription { ev1, ev2, id } = rx.recv().await.expect("XXX");
+        // hack, force them to be send/sync
+        let ev1 = ev1 as usize;
+        let ev2 = ev2 as usize;
         unsafe {
-            let err = cudaEventSynchronize(ev2);
+            let err = unblock(move || {
+                let ev2 = ev2 as CUevent;
+                cudaEventSynchronize(ev2)
+            })
+            .await;
             if err != 0 {
                 panic!("{err}");
             }
             let mut ms: c_float = 0.0;
-            let err = cudaEventElapsedTime(&mut ms, ev1, ev2);
+            let err = cudaEventElapsedTime(&mut ms, ev1 as CUevent, ev2 as CUevent);
             if err != 0 {
                 panic!("{err}");
             }
