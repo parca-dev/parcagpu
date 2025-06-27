@@ -12,6 +12,10 @@ use std::os::unix::net::UnixListener as StdUnixListener;
 use std::sync::OnceLock;
 
 use rand::Rng;
+use probe::probe;
+use std::arch::asm;
+
+// Use probe crate for USDT probes
 
 macro_rules! opaque_type {
     {$vis:vis $name:ident} => {
@@ -107,30 +111,83 @@ async fn serve_stream(mut stream: UnixStream, rx: &Receiver<KernelDescription>) 
 // since it relies on the parca-agent being able to find things in
 // the target process's network namespace.
 async fn process_messages(rx: Receiver<KernelDescription>) {
-    // The socket sends SIGPIPE when it's ignored, just ignore that.
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-    let name = format!("parcagpu.{}", std::process::id());
-    let addr = SocketAddr::from_abstract_name(&name).unwrap();
-    let l: UnixListener = Async::new(StdUnixListener::bind_addr(&addr).expect("XXX"))
-        .expect("XXX")
-        .into();
-    loop {
-        let stream_fut = l.accept().fuse();
-        let rx_fut = rx.recv().fuse();
-        pin_mut!(stream_fut, rx_fut);
-        select! {
-            // we got a connection, so handle it.
-            res = stream_fut => {
-                let (stream, _) = res.expect("XXX");
-                // This blocks until the connection breaks
-                serve_stream(stream, &rx).await;
-            },
-            // if we receive any messages while no parca-agent is connected,
-            // just drop them here.
-            res = rx_fut => {
-                res.expect("XXX");
+    // Check if Unix socket should be used
+    let use_socket = std::env::var("PARCAGPU_USE_SOCKET").map(|v| v == "1").unwrap_or(false);
+
+    if use_socket {
+        // The socket sends SIGPIPE when it's ignored, just ignore that.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        let name = format!("parcagpu.{}", std::process::id());
+        let addr = SocketAddr::from_abstract_name(&name).unwrap();
+        let l: UnixListener = Async::new(StdUnixListener::bind_addr(&addr).expect("XXX"))
+            .expect("XXX")
+            .into();
+        loop {
+            let stream_fut = l.accept().fuse();
+            let rx_fut = rx.recv().fuse();
+            pin_mut!(stream_fut, rx_fut);
+            select! {
+                // we got a connection, so handle it.
+                res = stream_fut => {
+                    let (stream, _) = res.expect("XXX");
+                    // This blocks until the connection breaks
+                    serve_stream(stream, &rx).await;
+                },
+                // if we receive any messages while no parca-agent is connected,
+                // calculate timing and emit USDT tracepoint, then drop them.
+                res = rx_fut => {
+                    let KernelDescription { ev1, ev2, id } = res.expect("XXX");
+                    // hack, force them to be send/sync
+                    let ev1 = ev1 as usize;
+                    let ev2 = ev2 as usize;
+                    unsafe {
+                        let err = unblock(move || {
+                            let ev2 = ev2 as CUevent;
+                            cudaEventSynchronize(ev2)
+                        })
+                        .await;
+                        if err != 0 {
+                            eprintln!("cudaEventSynchronize failed: {err}");
+                            return;
+                        }
+                        let mut ms: c_float = 0.0;
+                        let err = cudaEventElapsedTime(&mut ms, ev1 as CUevent, ev2 as CUevent);
+                        if err != 0 {
+                            eprintln!("cudaEventElapsedTime failed: {err}");
+                            return;
+                        }
+                    }
+                }
+            };
+        }
+    } else {
+        // Socket disabled, only process messages for USDT tracepoints
+        loop {
+            let KernelDescription { ev1, ev2, id } = rx.recv().await.expect("XXX");
+            // hack, force them to be send/sync
+            let ev1 = ev1 as usize;
+            let ev2 = ev2 as usize;
+            unsafe {
+                let err = unblock(move || {
+                    let ev2 = ev2 as CUevent;
+                    cudaEventSynchronize(ev2)
+                })
+                .await;
+                if err != 0 {
+                    eprintln!("cudaEventSynchronize failed: {err}");
+                    return;
+                }
+                let mut ms: c_float = 0.0;
+                let err = cudaEventElapsedTime(&mut ms, ev1 as CUevent, ev2 as CUevent);
+                if err != 0 {
+                    eprintln!("cudaEventElapsedTime failed: {err}");
+                    return;
+                }
+
+                // Emit USDT tracepoint with kernel timing data
+                probe!(parcagpu, kernel_launch, id, ms);
             }
-        };
+        }
     }
 }
 
@@ -237,6 +294,8 @@ redhook::hook! {
             if err != 0 {
                 return err;
             }
+
+
             KernelDescription {
                 ev1, ev2, id
             }
