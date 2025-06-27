@@ -35,10 +35,6 @@ LD_LIBRARY_PATH=. PARCAGPU_USE_SOCKET=0 LD_PRELOAD=./target/release/libparcagpu.
 TEST_PID=$!
 
 echo "Test program PID: $TEST_PID"
-echo ""
-echo "Starting USDT tracer to capture kernel timing events..."
-echo "TIME                 KERNEL_ID   DURATION_MS"
-echo "==================== =========== ==========="
 
 # Start the eBPF-based tracer
 sudo ./usdt_tracer/usdt_tracer $TEST_PID &

@@ -133,30 +133,9 @@ async fn process_messages(rx: Receiver<KernelDescription>) {
                     // This blocks until the connection breaks
                     serve_stream(stream, &rx).await;
                 },
-                // if we receive any messages while no parca-agent is connected,
-                // calculate timing and emit USDT tracepoint, then drop them.
+                // if we receive any messages while no parca-agent is connected then drop them.
                 res = rx_fut => {
-                    let KernelDescription { ev1, ev2, id } = res.expect("XXX");
-                    // hack, force them to be send/sync
-                    let ev1 = ev1 as usize;
-                    let ev2 = ev2 as usize;
-                    unsafe {
-                        let err = unblock(move || {
-                            let ev2 = ev2 as CUevent;
-                            cudaEventSynchronize(ev2)
-                        })
-                        .await;
-                        if err != 0 {
-                            eprintln!("cudaEventSynchronize failed: {err}");
-                            return;
-                        }
-                        let mut ms: c_float = 0.0;
-                        let err = cudaEventElapsedTime(&mut ms, ev1 as CUevent, ev2 as CUevent);
-                        if err != 0 {
-                            eprintln!("cudaEventElapsedTime failed: {err}");
-                            return;
-                        }
-                    }
+                    res.expect("XXX");
                 }
             };
         }
@@ -174,7 +153,7 @@ async fn process_messages(rx: Receiver<KernelDescription>) {
                 })
                 .await;
                 if err != 0 {
-                    eprintln!("cudaEventSynchronize failed: {err}");
+                    eprintln!("cudaEventSynchronize failed: {err}{id}");
                     return;
                 }
                 let mut ms: c_float = 0.0;

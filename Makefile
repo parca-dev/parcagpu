@@ -19,6 +19,10 @@ libcudart.so: mock_cudart.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 	@echo "Mock libcudart.so built successfully"
 
+test_mock: test_mock.c
+	$(CC) $(CFLAGS) -o $@ $< -L. -lcudart
+	@echo "Test mock program built successfully"
+
 # eBPF targets
 bpf: $(BPF_OBJ)
 

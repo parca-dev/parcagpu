@@ -149,10 +149,10 @@ func main() {
 		// When using PID, Cilium eBPF handles the base address adjustment internally
 		// We should pass the file offset, not the runtime address
 		fmt.Printf("Attaching to probe at file offset 0x%x\n", probe.Location)
-		
+
 		uprobeOpts := &link.UprobeOptions{
 			PID:     pid,
-			Address: probe.Location,  // Use file offset, not runtime address
+			Address: probe.Location, // Use file offset, not runtime address
 		}
 
 		l, err := ex.Uprobe("", prog, uprobeOpts)
@@ -205,6 +205,7 @@ func main() {
 		for {
 			select {
 			case <-ctx.Done():
+				log.Printf("Context cancelled, stopping event reader")
 				return
 			default:
 				record, err := reader.Read()
@@ -286,9 +287,9 @@ func parseUSDTProbes(path string) ([]USDTProbe, error) {
 				}
 
 				// Note header: namesz(4) + descsz(4) + type(4)
-				namesz := binary.LittleEndian.Uint32(data[offset:offset+4])
-				descsz := binary.LittleEndian.Uint32(data[offset+4:offset+8])
-				noteType := binary.LittleEndian.Uint32(data[offset+8:offset+12])
+				namesz := binary.LittleEndian.Uint32(data[offset : offset+4])
+				descsz := binary.LittleEndian.Uint32(data[offset+4 : offset+8])
+				noteType := binary.LittleEndian.Uint32(data[offset+8 : offset+12])
 				offset += 12
 
 				if noteType != 3 { // NT_STAPSDT
@@ -301,13 +302,13 @@ func parseUSDTProbes(path string) ([]USDTProbe, error) {
 
 				// Skip owner name (should be "stapsdt")
 				nameEnd := offset + int((namesz+3)&^3)
-				
+
 				if nameEnd+int(descsz) > len(data) {
 					break
 				}
 
 				// Parse descriptor
-				desc := data[nameEnd:nameEnd+int(descsz)]
+				desc := data[nameEnd : nameEnd+int(descsz)]
 				if len(desc) < 24 { // 3 uint64 values
 					offset = nameEnd + int((descsz+3)&^3)
 					continue
@@ -357,25 +358,25 @@ func findLibraryBaseAddress(pid int, libPath string) (uint64, error) {
 			if len(fields) < 1 {
 				continue
 			}
-			
+
 			// Check if this is an executable segment (r-xp)
 			if len(fields) >= 2 && strings.Contains(fields[1], "x") {
 				addrRange := strings.Split(fields[0], "-")
 				if len(addrRange) != 2 {
 					continue
 				}
-				
+
 				// Parse the start address
 				baseAddr, err := strconv.ParseUint(addrRange[0], 16, 64)
 				if err != nil {
 					continue
 				}
-				
+
 				return baseAddr, nil
 			}
 		}
 	}
-	
+
 	return 0, fmt.Errorf("library %s not found in process memory maps", libPath)
 }
 
