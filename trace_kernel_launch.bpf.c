@@ -21,14 +21,22 @@ int trace_kernel_launch(struct pt_regs *ctx) {
     struct kernel_timing timing = {};
 
     // Read USDT probe arguments from specific registers
-    // Based on readelf output: Arguments: -8@%rcx -8@%rax
-    // arg0: kernel_id (u32) - in rcx register
+    // Based on readelf output: Arguments: -8@%rdx -8@%rax
+    // arg0: kernel_id (u32) - in rdx register
     // arg1: duration_ms (f32) - in rax register
-    timing.kernel_id = (__u32)ctx->rcx;        // Read from RCX register
+    timing.kernel_id = (__u32)ctx->rdx;        // Read from RDX register
     timing.duration_bits = (__u32)ctx->rax;    // Read from RAX register
 
     // Submit event to userspace via perf event array
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &timing, sizeof(timing));
+    if (bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &timing, sizeof(timing))) {
+        // If output fails, we can log an error or handle it as needed
+        bpf_printk("Failed to output kernel timing event: kernel_id=%u duration_bits=%u\n",
+                   timing.kernel_id, timing.duration_bits);
+    } else {
+        // Optionally log successful event submission
+        bpf_printk("Kernel launch traced: kernel_id=%u duration_bits=%u\n",
+                   timing.kernel_id, timing.duration_bits);
+    }
 
     return 0;
 }

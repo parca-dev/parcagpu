@@ -24,9 +24,9 @@ cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim,
 int main() {
     printf("Testing mock CUDA runtime... (PID: %d)\n", getpid());
     
-    // Run test loop for 60 seconds to give time for tracer attachment
-    for (int i = 0; i < 20; i++) {
-        printf("=== Test iteration %d/20 ===\n", i + 1);
+    // Run test loop indefinitely to give time for tracer attachment
+    for (int i = 0; ; i++) {
+        printf("=== Test iteration %d ===\n", i + 1);
         
         // Test event creation
         cudaEvent_t event1, event2;

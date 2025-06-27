@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"usdt_tracer/util"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -194,6 +195,8 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
+	go util.ReadTracePipe(ctx)
+
 	go func() {
 		<-sig
 		fmt.Println("\nShutting down eBPF tracer...")
@@ -208,6 +211,7 @@ func main() {
 				log.Printf("Context cancelled, stopping event reader")
 				return
 			default:
+				log.Printf("Waiting for perf events...")
 				record, err := reader.Read()
 				if err != nil {
 					if err == perf.ErrClosed {

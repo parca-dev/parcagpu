@@ -31,7 +31,7 @@ trap cleanup EXIT
 echo "Starting test program..."
 echo "PID: $$"
 echo "Running single test iteration..."
-LD_LIBRARY_PATH=. PARCAGPU_USE_SOCKET=0 LD_PRELOAD=./target/release/libparcagpu.so ./test_mock > /dev/null 2>&1 &
+LD_LIBRARY_PATH=. PARCAGPU_USE_SOCKET=0 LD_PRELOAD=./target/release/libparcagpu.so ./test_mock > mock.out 2>&1 &
 TEST_PID=$!
 
 echo "Test program PID: $TEST_PID"

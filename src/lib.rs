@@ -162,6 +162,7 @@ async fn process_messages(rx: Receiver<KernelDescription>) {
                     eprintln!("cudaEventElapsedTime failed: {err}");
                     return;
                 }
+                println!("hitting kernel_launch tracepoint with id {id} and ms {ms}");
 
                 // Emit USDT tracepoint with kernel timing data
                 probe!(parcagpu, kernel_launch, id, ms);
