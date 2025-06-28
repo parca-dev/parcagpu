@@ -164,8 +164,12 @@ async fn process_messages(rx: Receiver<KernelDescription>) {
                 }
                 println!("hitting kernel_launch tracepoint with id {id} and ms {ms}");
 
-                // Emit USDT tracepoint with kernel timing data
+                // Emit USDT tracepoint with kernel timing data (NOT working yet, cilium has trouble with usdt in a
+                // shared library, so we use a uprobe instead)
                 probe!(parcagpu, kernel_launch, id, ms);
+
+                // Call the new function for uprobe attachment with duration as raw bits
+                launchKernelTiming(id, ms.to_bits());
             }
         }
     }
@@ -179,6 +183,15 @@ type RealFn = unsafe extern "C" fn(
     usize,
     *mut CUstream_st,
 ) -> i32;
+
+/// Function specifically for uprobe attachment that receives kernel timing data
+#[inline(never)]
+#[unsafe(no_mangle)]
+extern "C" fn launchKernelTiming(id: u32, duration_bits: u32) {
+    // Use black_box to prevent optimization and ensure parameters are in registers
+    black_box(id);
+    black_box(duration_bits);
+}
 
 /// shim_inner receives an ID of a kernel launch along with the arguments to `cudaLaunchKernel`
 /// and just passes them all through.

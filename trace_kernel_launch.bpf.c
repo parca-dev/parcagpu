@@ -16,28 +16,27 @@ struct {
     __uint(max_entries, 1024);
 } events SEC(".maps");
 
-SEC("uprobe/parcagpu_kernel_launch")
+SEC("uprobe/trace_kernel_launch")
 int trace_kernel_launch(struct pt_regs *ctx) {
-    struct kernel_timing timing = {};
-
-    // Read USDT probe arguments from specific registers
-    // Based on readelf output: Arguments: -8@%rdx -8@%rax
-    // arg0: kernel_id (u32) - in rdx register
-    // arg1: duration_ms (f32) - in rax register
-    timing.kernel_id = (__u32)ctx->rdx;        // Read from RDX register
-    timing.duration_bits = (__u32)ctx->rax;    // Read from RAX register
-
-    // Submit event to userspace via perf event array
-    if (bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &timing, sizeof(timing))) {
-        // If output fails, we can log an error or handle it as needed
-        bpf_printk("Failed to output kernel timing event: kernel_id=%u duration_bits=%u\n",
-                   timing.kernel_id, timing.duration_bits);
-    } else {
-        // Optionally log successful event submission
-        bpf_printk("Kernel launch traced: kernel_id=%u duration_bits=%u\n",
-                   timing.kernel_id, timing.duration_bits);
-    }
-
+    bpf_printk("trace_kernel_launch fired!\n");
+    
+    // We're now attaching to launchKernelTiming(id: u32, duration_bits: u32)
+    // Parameters: RDI = id (u32), RSI = duration_bits (u32)
+    
+    __u32 kernel_id = (__u32)PT_REGS_PARM1(ctx);        // RDI - first parameter (id)
+    __u32 duration_bits = (__u32)PT_REGS_PARM2(ctx);    // RSI - second parameter (duration_bits)
+    
+    bpf_printk("launchKernelTiming: kernel_id=%u, duration_bits=0x%x\n", 
+               kernel_id, duration_bits);
+    
+    // Send the actual timing data from the function parameters
+    struct kernel_timing timing = {
+        .kernel_id = kernel_id,
+        .duration_bits = duration_bits,
+    };
+    
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &timing, sizeof(timing));
+    
     return 0;
 }
 

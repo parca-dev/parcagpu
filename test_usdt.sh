@@ -8,8 +8,6 @@ echo "=============================="
 # Build everything using Makefile
 echo "Building components..."
 make all
-cargo build --release
-cd usdt_tracer && go build -o usdt_tracer main.go && cd ..
 
 echo ""
 echo "Starting USDT tracing demonstration..."

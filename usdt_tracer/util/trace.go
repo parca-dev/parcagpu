@@ -5,10 +5,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"os"
 	"strings"
-
-	log "github.com/sirupsen/logrus"
 )
 
 func getTracePipe() (*os.File, error) {
@@ -21,7 +20,7 @@ func getTracePipe() (*os.File, error) {
 		if err == nil {
 			return t, nil
 		}
-		log.Debugf("Could not open trace_pipe at %s: %s", mnt, err)
+		log.Printf("Could not open trace_pipe at %s: %s", mnt, err)
 	}
 	return nil, os.ErrNotExist
 }
@@ -29,7 +28,7 @@ func getTracePipe() (*os.File, error) {
 func ReadTracePipe(ctx context.Context) {
 	tp, err := getTracePipe()
 	if err != nil {
-		log.Warning("Could not open trace_pipe, check that debugfs is mounted")
+		log.Printf("Could not open trace_pipe, check that debugfs is mounted")
 		return
 	}
 
@@ -40,18 +39,20 @@ func ReadTracePipe(ctx context.Context) {
 	}()
 
 	r := bufio.NewReader(tp)
+
+	log.Println("reading trace_pipe")
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				continue
 			}
-			log.Error(err)
+			log.Print(err)
 			return
 		}
 		line = strings.TrimSpace(line)
 		if len(line) > 0 {
-			log.Debugf("%s", line)
+			log.Printf("%s\n", line)
 		}
 	}
 }

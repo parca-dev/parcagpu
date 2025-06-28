@@ -147,18 +147,12 @@ func main() {
 	// Attach uprobe to all USDT probe locations
 	var links []link.Link
 	for _, probe := range targetProbes {
-		// When using PID, Cilium eBPF handles the base address adjustment internally
-		// We should pass the file offset, not the runtime address
-		fmt.Printf("Attaching to probe at file offset 0x%x\n", probe.Location)
+		// Attach to the launchKernelTiming function that receives id and duration
+		fmt.Printf("Attaching to launchKernelTiming function\n")
 
-		uprobeOpts := &link.UprobeOptions{
-			PID:     pid,
-			Address: probe.Location, // Use file offset, not runtime address
-		}
-
-		l, err := ex.Uprobe("", prog, uprobeOpts)
+		l, err := ex.Uprobe("launchKernelTiming", prog, nil)
 		if err != nil {
-			log.Fatalf("Failed to attach to USDT probe at location 0x%x: %v", probe.Location, err)
+			log.Fatalf("Failed to attach to USDT probe at offset 0x%x: %v", probe.Location, err)
 		}
 		links = append(links, l)
 		fmt.Printf("Successfully attached to USDT probe at location 0x%x\n", probe.Location)
