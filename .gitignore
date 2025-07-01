@@ -1,1 +1,4 @@
 /target
+test_mock
+libcudart.so*
+usdt_tracer/usdt_tracer
