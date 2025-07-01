@@ -162,7 +162,6 @@ async fn process_messages(rx: Receiver<KernelDescription>) {
                     eprintln!("cudaEventElapsedTime failed: {err}");
                     return;
                 }
-                println!("hitting kernel_launch tracepoint with id {id} and ms {ms}");
 
                 // Emit USDT tracepoint with kernel timing data (NOT working yet, cilium has trouble with usdt in a
                 // shared library, so we use a uprobe instead)
