@@ -1,0 +1,22 @@
+FROM alpine:latest
+
+# Install runtime dependencies
+RUN apk add --no-cache ca-certificates
+
+# Set working directory
+WORKDIR /app
+
+# Copy pre-built binary and eBPF object file
+COPY usdt_tracer/usdt_tracer /usr/local/bin/
+COPY target/bpf/trace_kernel_launch.bpf.o /app/target/bpf/
+
+# Make it executable
+RUN chmod +x /usr/local/bin/usdt_tracer
+
+# The tracer needs to run with proper permissions to trace other processes
+USER root
+
+# Set working directory to /app so it can find the BPF object file
+WORKDIR /app
+
+ENTRYPOINT ["/usr/local/bin/usdt_tracer"]

@@ -118,14 +118,20 @@ func main() {
 	}
 	fmt.Printf("Library loaded at base address: 0x%x\n", baseAddr)
 
+	// For cross-container access, prepend /proc/<pid>/root to the path
+	procLibPath := libPath
+	if !strings.HasPrefix(libPath, "/proc/") {
+		procLibPath = fmt.Sprintf("/proc/%d/root%s", pid, libPath)
+	}
+
 	// Open the library executable
-	ex, err := link.OpenExecutable(libPath)
+	ex, err := link.OpenExecutable(procLibPath)
 	if err != nil {
 		log.Fatalf("Failed to open executable/library: %v", err)
 	}
 
 	// Parse USDT probes from ELF file
-	probes, err := parseUSDTProbes(libPath)
+	probes, err := parseUSDTProbes(procLibPath)
 	if err != nil {
 		log.Fatalf("Failed to parse USDT probes: %v", err)
 	}

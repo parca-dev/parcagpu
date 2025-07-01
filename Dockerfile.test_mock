@@ -1,0 +1,23 @@
+FROM ubuntu:22.04
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Copy pre-built binaries
+COPY libcudart.so .
+COPY test_mock .
+COPY target-glibc235/libparcagpu.so .
+
+# Make test_mock executable
+RUN chmod +x test_mock
+
+# Set library path and preload libparcagpu.so
+ENV LD_LIBRARY_PATH=/app:$LD_LIBRARY_PATH
+ENV LD_PRELOAD=/app/libparcagpu.so
+
+# Run the test program
+CMD ["./test_mock"]
