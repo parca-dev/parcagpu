@@ -112,6 +112,15 @@ cudaError_t cudaStreamIsCapturing(cudaStream_t stream, cudaStreamCaptureStatus *
     return cudaSuccess;
 }
 
+static void busy_loop(int milliseconds) {
+    // Simulate a busy wait for the specified number of milliseconds
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    do {
+        clock_gettime(CLOCK_MONOTONIC, &end);
+    } while ((end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000 < milliseconds);
+}
+
 cudaError_t cudaLaunchKernel(const void* func,
                             dim3 gridDim,
                             dim3 blockDim,
@@ -121,8 +130,9 @@ cudaError_t cudaLaunchKernel(const void* func,
     printf("[MOCK] cudaLaunchKernel: Launching kernel %p with grid(%u,%u,%u) block(%u,%u,%u) sharedMem=%zu stream=%p\n",
            func, gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, sharedMem, (void*)stream);
 
-    // Simulate kernel execution with a small delay
-    usleep(5000); // 5ms
+    // spin cpu for 10 to 20 milliseconds to simulate kernel execution
+    int sleep_time = 10 + (rand() % 11); // Random sleep between
+    busy_loop(sleep_time);
 
     return cudaSuccess;
 }
