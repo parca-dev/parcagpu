@@ -1,0 +1,1 @@
+strace: Cannot stat './test_probe.bt': No such file or directory

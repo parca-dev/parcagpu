@@ -35,7 +35,7 @@ TEST_PID=$!
 echo "Test program PID: $TEST_PID"
 
 # Start the eBPF-based tracer
-sudo ./usdt_tracer/usdt_tracer $TEST_PID &
+sudo ./gotracer/gotracer $TEST_PID &
 TRACER_PID=$!
 
 # Wait for the test program to complete

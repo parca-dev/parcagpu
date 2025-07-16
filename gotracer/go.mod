@@ -3,8 +3,8 @@ module usdt_tracer
 go 1.21
 
 require (
+	github.com/aquasecurity/libbpfgo v0.4.5-libbpf-1.0.1
 	github.com/cilium/ebpf v0.12.3
-	github.com/sirupsen/logrus v1.9.3
 )
 
 require (

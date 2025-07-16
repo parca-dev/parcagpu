@@ -1,4 +1,0 @@
-usdt:./target/release/libparcagpu.so:parcagpu:kernel_launch
-{
-    printf("kernel_launch fired! args: %d, %d\n", arg0, arg1);
-}

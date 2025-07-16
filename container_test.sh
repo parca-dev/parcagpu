@@ -4,7 +4,7 @@
 # This will:
 # 1. Build binaries locally using Makefile and glibc-2.35 script
 # 2. Run test_mock with libparcagpu.so preloaded in a container
-# 3. Run usdt_tracer in another container to trace the CUDA calls
+# 3. Run gotracer in another container to trace the CUDA calls
 # 4. Demonstrate container-to-container tracing
 
 set -e
@@ -17,8 +17,8 @@ make mock-cudart test_mock
 echo "Building eBPF object file..."
 make bpf
 
-echo "Building usdt_tracer..."
-make usdt_tracer
+echo "Building gotracer..."
+make gotracer
 
 echo "Building libparcagpu.so with glibc 2.35..."
 ./build-glibc-2.35.sh
@@ -29,8 +29,8 @@ echo "=== Building Docker images ==="
 echo "Building test_mock image..."
 docker build -f Dockerfile.test_mock -t test-mock-cuda .
 
-echo "Building usdt_tracer image..."
-docker build -f Dockerfile.usdt_tracer -t usdt-tracer .
+echo "Building gotracer image..."
+docker build -f Dockerfile.gotracer -t gotracer .
 
 echo ""
 echo "=== Starting containers ==="
@@ -49,7 +49,7 @@ TEST_PID=$(docker inspect -f '{{.State.Pid}}' test-mock-container)
 echo "test_mock container is running with host PID: $TEST_PID"
 
 echo ""
-echo "=== Running usdt_tracer ==="
+echo "=== Running gotracer ==="
 echo "Tracing CUDA calls from test_mock (PID: $TEST_PID)..."
 echo "Press Ctrl+C to stop tracing"
 
@@ -63,11 +63,11 @@ else
 fi
 
 docker run --rm $DOCKER_FLAGS \
-    --name usdt-tracer-container \
+    --name gotracer-container \
     --pid host \
     --privileged \
     -v /sys/kernel/debug:/sys/kernel/debug:rw \
-    usdt-tracer $TEST_PID
+    gotracer $TEST_PID
 
 # Cleanup
 echo ""

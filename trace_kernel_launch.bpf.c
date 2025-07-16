@@ -16,27 +16,37 @@ struct {
     __uint(max_entries, 1024);
 } events SEC(".maps");
 
+// USDT probe for parcagpu:kernel_launch
+// The probe!(parcagpu, kernel_launch, id, ms) in Rust code passes two arguments:
+// - arg0: id (u32)
+// - arg1: ms (f32) - but we'll receive it as u32 bits
+//
+// When attached as a uprobe to a USDT probe, the arguments are passed in registers
 SEC("uprobe/trace_kernel_launch")
 int trace_kernel_launch(struct pt_regs *ctx) {
     bpf_printk("trace_kernel_launch fired!\n");
-    
-    // We're now attaching to launchKernelTiming(id: u32, duration_bits: u32)
-    // Parameters: RDI = id (u32), RSI = duration_bits (u32)
-    
-    __u32 kernel_id = (__u32)PT_REGS_PARM1(ctx);        // RDI - first parameter (id)
-    __u32 duration_bits = (__u32)PT_REGS_PARM2(ctx);    // RSI - second parameter (duration_bits)
-    
-    bpf_printk("launchKernelTiming: kernel_id=%u, duration_bits=0x%x\n", 
+
+    // USDT probes on x86_64 typically pass arguments via registers
+    // The exact registers depend on the calling convention and USDT implementation
+    // For SystemTap-style USDT probes, arguments are often in:
+    // arg1: RDI or RSI
+    // arg2: RSI or RDX
+
+    // Try the standard calling convention first
+    __u32 kernel_id = (__u32)PT_REGS_PARM1(ctx);
+    __u32 duration_bits = (__u32)PT_REGS_PARM2(ctx);
+
+    bpf_printk("USDT kernel_launch: kernel_id=%u, duration_bits=0x%x\n",
                kernel_id, duration_bits);
-    
-    // Send the actual timing data from the function parameters
+
+    // Send the timing data through perf event
     struct kernel_timing timing = {
         .kernel_id = kernel_id,
         .duration_bits = duration_bits,
     };
-    
+
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &timing, sizeof(timing));
-    
+
     return 0;
 }
 
