@@ -1,0 +1,52 @@
+#!/usr/bin/env bpftrace
+
+/*
+ * Simple CUPTI USDT Test
+ * Tests the three parcagpu USDT probes
+ */
+
+BEGIN
+{
+    printf("Simple CUPTI USDT Test Started\n");
+    printf("Monitoring parcagpu USDT probes...\n\n");
+}
+
+// Track graph launches
+// Arguments: start, end, correlationId|deviceId, streamId, graphId
+usdt:/home/tpr/libparcagpucupti.so:parcagpu:graph_executed
+{
+    $start = arg0;
+    $end = arg1;
+    printf("[%d] Graph executed:\n", pid);
+    printf("  start=%lu, end=%lu, duration=%lu ns\n", $start, $end, $end - $start);
+    $devId = arg2 >> 32;
+    $corId = (uint64)arg2 & 0xFFFFFFFF;
+    printf("  correlationId=%u, deviceId=%u, streamId=%u, graphId=%u\n",
+           $corId, $devId, arg3, arg4);
+    @graph_launches = count();
+}
+
+// Track kernel executions
+// Arguments: start, end, correlationId, deviceId, streamId, name (pointer)
+usdt:/home/tpr/libparcagpucupti.so:parcagpu:kernel_executed
+{
+    $start = arg0;
+    $end = arg1;
+    printf("[%d] Kernel executed:\n", pid);
+    printf("  start=%lu, end=%lu, duration=%lu ns\n", $start, $end, $end - $start);
+    $devId = arg2 >>32;
+    $corId = (uint64)arg2 & 0xFFFFFFFF;		
+    printf("  correlationId=%u, deviceId=%u, streamId=%u\n",
+           $corId, $devId, arg3);
+    printf("  name=%s\n", str(arg4));
+    @kernel_executions = count();
+}
+
+END
+{
+    printf("\n=== Summary ===\n");
+    printf("Graph executions: ");
+    print(@graph_launches);
+    printf("Kernel executions: ");
+    print(@kernel_executions);
+}

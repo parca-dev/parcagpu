@@ -1,4 +1,2 @@
-/target
-test_mock
-libcudart.so*
-gotracer/gotracer
+cupti/build
+libparcagpucupti.so

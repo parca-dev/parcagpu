@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(cupti-prof C)
+project(parcagpucupti C)
 
 # Find CUDA Toolkit
 find_package(CUDAToolkit REQUIRED)
@@ -8,32 +8,32 @@ find_package(CUDAToolkit REQUIRED)
 link_directories(/usr/local/cuda-12.9/extras/CUPTI/lib64)
 
 # Create shared library
-add_library(cupti-prof SHARED cupti-prof.c)
+add_library(parcagpucupti SHARED cupti-prof.c)
 
 # Set properties
-set_target_properties(cupti-prof PROPERTIES
+set_target_properties(parcagpucupti PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED ON
     POSITION_INDEPENDENT_CODE ON
 )
 
 # Add debug symbols
-target_compile_options(cupti-prof PRIVATE -g)
+target_compile_options(parcagpucupti PRIVATE -g)
 
 # Include directories
-target_include_directories(cupti-prof PRIVATE
+target_include_directories(parcagpucupti PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
     /usr/local/cuda-12.9/extras/CUPTI/include
 )
 
 # Link libraries
-target_link_libraries(cupti-prof PRIVATE
+target_link_libraries(parcagpucupti PRIVATE
     CUDA::cupti
     CUDA::cuda_driver
     nvperf_host
 )
 
 # Installation
-install(TARGETS cupti-prof
+install(TARGETS parcagpucupti
     LIBRARY DESTINATION lib
 )
