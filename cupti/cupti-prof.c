@@ -378,6 +378,14 @@ static void bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
 
 // Cleanup function (destructor disabled to prevent early cleanup)
 void cleanup(void) {
+  static bool cleanup_done = false;
+
+  // Make cleanup idempotent - safe to call multiple times
+  if (cleanup_done) {
+    return;
+  }
+  cleanup_done = true;
+
   DEBUG_PRINTF("[CUPTI] Cleanup started\n");
   // Flush any remaining activity records
   cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
@@ -385,6 +393,7 @@ void cleanup(void) {
   // Unsubscribe from callbacks
   if (subscriber) {
     cuptiUnsubscribe(subscriber);
+    subscriber = 0;
   }
 
   // Free all activity buffers

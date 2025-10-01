@@ -13,7 +13,7 @@ BEGIN
 
 // Track graph launches
 // Arguments: start, end, correlationId|deviceId, streamId, graphId
-usdt:/home/tpr/libparcagpucupti.so:parcagpu:graph_executed
+usdt:cupti/build/libparcagpucupti.so:parcagpu:graph_executed
 {
     $start = arg0;
     $end = arg1;
@@ -28,7 +28,7 @@ usdt:/home/tpr/libparcagpucupti.so:parcagpu:graph_executed
 
 // Track kernel executions
 // Arguments: start, end, correlationId, deviceId, streamId, name (pointer)
-usdt:/home/tpr/libparcagpucupti.so:parcagpu:kernel_executed
+usdt:cupti/build/libparcagpucupti.so:parcagpu:kernel_executed
 {
     $start = arg0;
     $end = arg1;
