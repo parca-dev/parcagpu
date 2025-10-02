@@ -1,0 +1,49 @@
+# Multi-stage build for ARM64 libparcagpucupti.so using cross-compilation
+FROM ubuntu:22.04 AS builder
+
+# Install cross-compilation tools and CUDA headers for ARM64
+RUN apt-get update && apt-get install -y \
+    cmake \
+    make \
+    gcc-aarch64-linux-gnu \
+    g++-aarch64-linux-gnu \
+    wget \
+    systemtap-sdt-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy CUDA headers from build context (mounted from host)
+# Headers are architecture-independent
+COPY --from=cuda-headers . /usr/local/cuda-12.2/
+
+# Create ARM64 stub libraries for linking
+RUN mkdir -p /cuda-arm64/usr/local/cuda-12.2/extras/CUPTI/lib64 && \
+    echo "int cuInit(unsigned int Flags) { return 0; }" > /tmp/cuda_stub.c && \
+    aarch64-linux-gnu-gcc -shared -fPIC /tmp/cuda_stub.c -o /cuda-arm64/usr/local/cuda-12.2/extras/CUPTI/lib64/libcuda.so && \
+    echo "int cuptiGetVersion(int *version) { return 0; }" > /tmp/cupti_stub.c && \
+    aarch64-linux-gnu-gcc -shared -fPIC /tmp/cupti_stub.c -o /cuda-arm64/usr/local/cuda-12.2/extras/CUPTI/lib64/libcupti.so && \
+    echo "int NV_Init(void) { return 0; }" > /tmp/nvperf_stub.c && \
+    aarch64-linux-gnu-gcc -shared -fPIC /tmp/nvperf_stub.c -o /cuda-arm64/usr/local/cuda-12.2/extras/CUPTI/lib64/libnvperf_host.so && \
+    rm -f /tmp/*stub.c
+
+# Copy systemtap header to a neutral location (it's architecture-agnostic)
+RUN mkdir -p /usr/include/sys && \
+    cp /usr/include/x86_64-linux-gnu/sys/sdt.h /usr/include/sys/sdt.h && \
+    cp /usr/include/x86_64-linux-gnu/sys/sdt-config.h /usr/include/sys/sdt-config.h 2>/dev/null || true
+
+# Copy source code
+WORKDIR /build
+COPY cupti/ ./cupti/
+
+# Build the library for ARM64
+ENV CUDA_HOST_ROOT=/usr/local/cuda-12.2
+ENV CUDA_CROSS_ROOT=/cuda-arm64/usr/local/cuda-12.2
+RUN mkdir -p cupti/build && \
+    cd cupti/build && \
+    cmake -DCMAKE_TOOLCHAIN_FILE=../toolchain-arm64.cmake \
+          -DCUDA_HOST_ROOT=${CUDA_HOST_ROOT} \
+          -DCUDA_CROSS_ROOT=${CUDA_CROSS_ROOT} .. && \
+    make VERBOSE=1
+
+# Extract the built library
+FROM scratch AS export
+COPY --from=builder /build/cupti/build/libparcagpucupti.so /

@@ -26,11 +26,12 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(mock_cupti);
 
     // Create versioned symlink so libparcagpucupti.so can find it
-    const symlink = b.addInstallFile(
-        mock_cupti.getEmittedBin(),
-        b.pathJoin(&.{ "lib", "libcupti.so.12" })
-    );
-    symlink.step.dependOn(&mock_cupti.step);
+    const symlink_step = b.addSystemCommand(&[_][]const u8{
+        "ln", "-sf", "libcupti.so", "libcupti.so.12"
+    });
+    symlink_step.setCwd(.{ .cwd_relative = b.getInstallPath(.lib, "") });
+    symlink_step.step.dependOn(&mock_cupti.step);
+    b.getInstallStep().dependOn(&symlink_step.step);
 
     // Note: libparcagpucupti.so should be built with CMake for production use.
     // This Zig build only builds the test infrastructure (mock CUPTI + test program).

@@ -9,9 +9,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <cuda.h>
 #include <cupti.h>
-#include <nvperf_host.h>
 
 // Debug logging control
 static bool debug_enabled = false;
