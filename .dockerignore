@@ -1,0 +1,20 @@
+# Ignore build directories
+cupti/build
+cupti/build-arm64
+cupti/build-amd64
+zig-out
+.zig-cache
+
+# Ignore git
+.git
+.gitignore
+
+# Ignore test outputs
+/tmp
+
+# Ignore IDE files
+.vscode
+.idea
+
+# Don't ignore CUDA headers prepared for Docker build
+!.cuda_headers

@@ -19,9 +19,10 @@ pub fn build(b: *std.Build) void {
     });
     mock_cupti.linkLibC();
 
-    // Add CUDA include paths
-    mock_cupti.addIncludePath(.{ .cwd_relative = "/usr/local/cuda/include" });
-    mock_cupti.addIncludePath(.{ .cwd_relative = "/opt/cuda/include" });
+    // Add CUDA include paths (from Docker-built headers)
+    // These will be extracted from the Docker build
+    const cuda_include = b.option([]const u8, "cuda-include", "Path to CUDA include directory") orelse "/usr/local/cuda/include";
+    mock_cupti.addIncludePath(.{ .cwd_relative = cuda_include });
 
     b.installArtifact(mock_cupti);
 
@@ -52,8 +53,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     test_exe.linkLibC();
-    test_exe.addIncludePath(.{ .cwd_relative = "/usr/local/cuda/include" });
-    test_exe.addIncludePath(.{ .cwd_relative = "/opt/cuda/include" });
+    test_exe.addIncludePath(.{ .cwd_relative = cuda_include });
 
     // Link against mock CUPTI for headers
     test_exe.linkLibrary(mock_cupti);
