@@ -6,9 +6,9 @@ if(NOT DEFINED CUDA_ROOT)
     set(CUDA_ROOT "/usr/local/cuda" CACHE PATH "CUDA installation directory")
 endif()
 
-# CUDA stub library directory (for linking without actual GPU libraries)
-if(NOT DEFINED CUDA_STUB_LIBDIR)
-    set(CUDA_STUB_LIBDIR "${CUDA_ROOT}/lib64/stubs" CACHE PATH "CUDA stub library directory")
+# CUDA library directory
+if(NOT DEFINED CUDA_LIBDIR)
+    set(CUDA_LIBDIR "${CUDA_ROOT}/lib64" CACHE PATH "CUDA library directory")
 endif()
 
 # Set include directories for CUDA headers
@@ -17,8 +17,8 @@ set(CUDAToolkit_INCLUDE_DIRS
     "${CUDA_ROOT}/extras/CUPTI/include"
 )
 
-# Add stub library directory to link directories
-link_directories(${CUDA_STUB_LIBDIR})
+# Add CUDA library directory to link directories
+link_directories(${CUDA_LIBDIR})
 
 # Create shared library
 add_library(parcagpucupti SHARED cupti-prof.c)
@@ -40,9 +40,16 @@ target_include_directories(parcagpucupti PRIVATE
 
 # systemtap headers are now in /usr/include/sys/ (copied in Dockerfile for cross-compilation)
 
-# Link libraries by name (using stub libraries from CUDA_STUB_LIBDIR)
+# Find the CUPTI library explicitly
+find_library(CUPTI_LIBRARY
+    NAMES cupti
+    PATHS ${CUDA_LIBDIR}
+    REQUIRED
+)
+
+# Link libraries
 target_link_libraries(parcagpucupti PRIVATE
-    cupti
+    ${CUPTI_LIBRARY}
 )
 
 # Installation

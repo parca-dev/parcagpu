@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 
 # Parse arguments
 USE_BPFTRACE=0
+ARCH="${ARCH:-amd64}"
 for arg in "$@"; do
     case $arg in
         --bpftrace)
@@ -17,15 +18,6 @@ for arg in "$@"; do
             ;;
     esac
 done
-
-echo "=== Building libparcagpucupti.so with CMake ==="
-if [ ! -d "cupti/build" ]; then
-    mkdir -p cupti/build
-    cd cupti/build
-    cmake ..
-    cd ../..
-fi
-cmake --build cupti/build
 
 echo ""
 echo "=== Building test infrastructure with Zig ==="
@@ -59,7 +51,7 @@ echo "=== Running test program ==="
 export LD_LIBRARY_PATH="$(pwd)/zig-out/lib:$LD_LIBRARY_PATH"
 export PARCAGPU_DEBUG=1
 # Use the CMake-built library with real CUPTI
-zig-out/bin/test_cupti_prof cupti/build/libparcagpucupti.so "$@"
+zig-out/bin/test_cupti_prof cupti/build-$ARCH/libparcagpucupti.so "$@"
 
 # If bpftrace was started, stop it and show results
 if [ "$USE_BPFTRACE" -eq 1 ]; then
