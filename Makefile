@@ -1,4 +1,4 @@
-.PHONY: all clean test cupti-amd64 cupti-arm64 test-infra
+.PHONY: all clean test cupti-amd64 cupti-arm64 test-infra docker-push
 
 # Default target: build everything for native architecture
 all: cupti-all test-infra
@@ -40,3 +40,18 @@ clean:
 	@rm -rf zig-out
 	@rm -rf .zig-cache
 	@echo "Clean complete"
+
+# Build and push multi-arch Docker images to ghcr.io
+# Set IMAGE_TAG to override the default tag (e.g., make docker-push IMAGE_TAG=v1.0.0)
+IMAGE_TAG ?= latest
+docker-push:
+	@echo "=== Setting up buildx builder ==="
+	@docker buildx create --name parcagpu-builder --use --bootstrap 2>/dev/null || docker buildx use parcagpu-builder
+	@echo "=== Building and pushing multi-arch Docker images to ghcr.io/parca-dev/parcagpu:$(IMAGE_TAG) ==="
+	@docker buildx build -f Dockerfile \
+		--target runtime \
+		--platform linux/amd64,linux/arm64 \
+		--tag ghcr.io/parca-dev/parcagpu:$(IMAGE_TAG) \
+		--push \
+		.
+	@echo "Images pushed successfully to ghcr.io/parca-dev/parcagpu:$(IMAGE_TAG)"

@@ -21,6 +21,11 @@ RUN mkdir -p cupti/build && \
     cmake -DCUDA_ROOT=${CUDA_ROOT} .. && \
     make VERBOSE=1
 
-# Extract the built library
+# Extract the built library (for local builds)
 FROM scratch AS export
 COPY --from=builder /build/cupti/build/libparcagpucupti.so /
+
+# Runtime image (for container registry)
+FROM nvidia/cuda:12.6.0-base-ubuntu22.04 AS runtime
+COPY --from=builder /build/cupti/build/libparcagpucupti.so /usr/local/lib/
+RUN ldconfig

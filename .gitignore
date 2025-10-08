@@ -1,2 +1,3 @@
-cupti/build
-libparcagpucupti.so
+cupti/build-*
+.zig-cache/
+zig-out/
