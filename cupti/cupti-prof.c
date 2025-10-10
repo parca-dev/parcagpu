@@ -118,6 +118,16 @@ int InitializeInjection(void) {
             errstr);
   }
 
+  // Enable runtime API callbacks for cudaGraphLaunch
+  result = cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
+                               CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000);
+  if (result != CUPTI_SUCCESS) {
+    const char *errstr;
+    cuptiGetResultString(result, &errstr);
+    fprintf(stderr, "[CUPTI] Failed to enable cudaGraphLaunch callback: %s\n",
+            errstr);
+  }
+
   // Register activity buffer callbacks
   result = cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted);
   if (result != CUPTI_SUCCESS) {
@@ -224,6 +234,7 @@ static void runtimeApiCallback(void *userdata, CUpti_CallbackDomain domain,
       case CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000:
       case CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernelExC_v11060:
       case CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000:
+      case CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000:
         outstandingEvents++;
         DTRACE_PROBE1(parcagpu, cuda_correlation, correlationId);
         break;
