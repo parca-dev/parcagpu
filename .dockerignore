@@ -1,8 +1,8 @@
-# Ignore build directories
+# Ignore build directories (except for test container)
 cupti/build
 cupti/build-arm64
-cupti/build-amd64
-zig-out
+# cupti/build-amd64 - needed for test container
+# zig-out - needed for test container
 .zig-cache
 
 # Ignore git

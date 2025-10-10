@@ -26,6 +26,5 @@ FROM scratch AS export
 COPY --from=builder /build/cupti/build/libparcagpucupti.so /
 
 # Runtime image (for container registry)
-FROM nvidia/cuda:12.6.0-base-ubuntu22.04 AS runtime
+FROM busybox:latest AS runtime
 COPY --from=builder /build/cupti/build/libparcagpucupti.so /usr/local/lib/
-RUN ldconfig
