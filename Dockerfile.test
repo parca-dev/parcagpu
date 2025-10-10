@@ -1,0 +1,28 @@
+# Test container for running test.sh in isolation
+FROM debian:bookworm-slim
+
+# Install minimal runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /test
+
+# Create directory structure
+RUN mkdir -p cupti/build-amd64 zig-out/bin zig-out/lib
+
+# Copy the built library
+COPY cupti/build-amd64/libparcagpucupti.so ./cupti/build-amd64/
+
+# Copy the zig-built test files
+COPY zig-out/bin/test_cupti_prof ./zig-out/bin/
+COPY zig-out/lib/libcupti.so ./zig-out/lib/
+COPY zig-out/lib/libcupti.so.12 ./zig-out/lib/
+
+# Set environment
+ENV LD_LIBRARY_PATH=/test/zig-out/lib
+ENV PARCAGPU_DEBUG=1
+
+# Run tests by default
+ENTRYPOINT ["/test/zig-out/bin/test_cupti_prof", "/test/cupti/build-amd64/libparcagpucupti.so"]
+CMD []
