@@ -47,9 +47,17 @@ find_library(CUPTI_LIBRARY
     REQUIRED
 )
 
+# Find the CUDA driver library
+find_library(CUDA_LIBRARY
+    NAMES cuda
+    PATHS ${CUDA_LIBDIR} ${CUDA_LIBDIR}/stubs
+    REQUIRED
+)
+
 # Link libraries
 target_link_libraries(parcagpucupti PRIVATE
     ${CUPTI_LIBRARY}
+    ${CUDA_LIBRARY}
 )
 
 # Installation

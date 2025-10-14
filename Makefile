@@ -6,20 +6,28 @@ all: cupti-all test-infra
 # Build libparcagpucupti.so for AMD64 using Docker
 cupti-amd64:
 	@echo "=== Building libparcagpucupti.so for AMD64 with Docker ==="
-	@mkdir -p cupti/build-amd64
+	@mkdir -p /tmp/parcagpu-build-amd64
+	@docker buildx use default
 	@docker buildx build -f Dockerfile \
-		--output type=local,dest=cupti/build-amd64 \
-		--platform linux/amd64 .
-	@echo "AMD64 library built: cupti/build-amd64/libparcagpucupti.so"
+		--target export \
+		--output type=local,dest=/tmp/parcagpu-build-amd64 \
+		--platform linux/amd64 cupti
+	@mkdir -p build/amd64
+	@cp /tmp/parcagpu-build-amd64/libparcagpucupti.so build/amd64/
+	@echo "AMD64 library built: build/amd64/libparcagpucupti.so"
 
 # Build libparcagpucupti.so for ARM64 using Docker
 cupti-arm64:
 	@echo "=== Building libparcagpucupti.so for ARM64 with Docker ==="
-	@mkdir -p cupti/build-arm64
+	@mkdir -p /tmp/parcagpu-build-arm64
+	@docker buildx create --name parcagpu-builder --use --bootstrap 2>/dev/null || docker buildx use parcagpu-builder
 	@docker buildx build -f Dockerfile \
-		--output type=local,dest=cupti/build-arm64 \
-		--platform linux/arm64 .
-	@echo "ARM64 library built: cupti/build-arm64/libparcagpucupti.so"
+		--target export \
+		--output type=local,dest=/tmp/parcagpu-build-arm64 \
+		--platform linux/arm64 cupti
+	@mkdir -p build/arm64
+	@cp /tmp/parcagpu-build-arm64/libparcagpucupti.so build/arm64/
+	@echo "ARM64 library built: build/arm64/libparcagpucupti.so"
 
 # Build both architectures
 cupti-all: cupti-amd64 cupti-arm64
@@ -36,7 +44,7 @@ test: cupti-amd64 test-infra
 # Clean build artifacts
 clean:
 	@echo "=== Cleaning build artifacts ==="
-	@rm -rf cupti/build cupti/build-amd64 cupti/build-arm64
+	@rm -rf cupti/build cupti/build-amd64 cupti/build-arm64 build
 	@rm -rf zig-out
 	@rm -rf .zig-cache
 	@echo "Clean complete"

@@ -1,6 +1,6 @@
 # Multi-platform build for libparcagpucupti.so
 # Supports both AMD64 and ARM64 architectures
-FROM nvidia/cuda:12.6.0-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
 # Install build tools
 RUN apt-get update && apt-get install -y \
@@ -11,13 +11,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy source code
-WORKDIR /build
-COPY cupti/ ./cupti/
+WORKDIR /build/cupti
+COPY . .
 
 # Build the library
 ENV CUDA_ROOT=/usr/local/cuda
-RUN mkdir -p cupti/build && \
-    cd cupti/build && \
+RUN mkdir -p build && \
+    cd build && \
     cmake -DCUDA_ROOT=${CUDA_ROOT} .. && \
     make VERBOSE=1
 

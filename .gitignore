@@ -1,3 +1,4 @@
 cupti/build-*
+build/
 .zig-cache/
 zig-out/
