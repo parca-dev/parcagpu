@@ -77,3 +77,6 @@ docker-test-build: cupti-amd64 test-infra
 docker-test-run: docker-test-build
 	@echo "=== Running tests in container ==="
 	@docker run --rm parcagpu-test:latest $(ARGS)
+
+format:
+	clang-format -i -style=file cupti/*.[ch]
