@@ -16,31 +16,72 @@ typedef int (*InitializeInjectionFunc)(void);
 // Global callback functions that will be registered by InitializeInjection
 static void (*bufferRequestedCallback)(uint8_t **buffer, size_t *size, size_t *maxNumRecords) = NULL;
 static void (*bufferCompletedCallback)(CUcontext ctx, uint32_t streamId, uint8_t *buffer, size_t size, size_t validSize) = NULL;
-static void (*runtimeApiCallback)(void *userdata, CUpti_CallbackDomain domain, CUpti_CallbackId cbid, const CUpti_CallbackData *cbdata) = NULL;
+static void (*parcagpuCuptiCallback)(void *userdata, CUpti_CallbackDomain domain, CUpti_CallbackId cbid, const CUpti_CallbackData *cbdata) = NULL;
 
 // Helper to create activity buffer with kernel records
 static uint8_t *create_kernel_activity_buffer(size_t *validSize,
                                                uint32_t correlationId, uint32_t deviceId,
                                                uint32_t streamId, const char *kernelName) {
     // Allocate buffer large enough for one kernel record
-    size_t bufferSize = sizeof(CUpti_ActivityKernel4) + 256;
+    size_t bufferSize = sizeof(CUpti_ActivityKernel5) + 256;
     uint8_t *buffer = (uint8_t *)malloc(bufferSize);
     memset(buffer, 0, bufferSize);
 
-    CUpti_ActivityKernel4 *kernel = (CUpti_ActivityKernel4 *)buffer;
+    CUpti_ActivityKernel5 *kernel = (CUpti_ActivityKernel5 *)buffer;
     kernel->kind = CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL;
     kernel->correlationId = correlationId;
     kernel->deviceId = deviceId;
     kernel->streamId = streamId;
+    kernel->graphId = 0;  // Not a graph launch
+    kernel->graphNodeId = 0;
     kernel->start = 1000000000UL + (correlationId * 1000000UL);
     kernel->end = kernel->start + 500000UL;
 
     // Copy kernel name
-    char *namePtr = (char *)(buffer + sizeof(CUpti_ActivityKernel4));
+    char *namePtr = (char *)(buffer + sizeof(CUpti_ActivityKernel5));
     strncpy(namePtr, kernelName, 255);
     kernel->name = namePtr;
 
-    *validSize = sizeof(CUpti_ActivityKernel4);
+    *validSize = sizeof(CUpti_ActivityKernel5);
+    return buffer;
+}
+
+// Helper to create activity buffer with multiple kernel records for a graph launch
+// This simulates how real graph launches work: N kernel activities with the same
+// correlationId (matching the cudaGraphLaunch) and the same graphId
+static uint8_t *create_graph_kernel_activities_buffer(size_t *validSize,
+                                                       uint32_t correlationId,
+                                                       uint32_t deviceId,
+                                                       uint32_t streamId,
+                                                       uint32_t graphId,
+                                                       int numKernels) {
+    // Allocate buffer large enough for multiple kernel records
+    size_t recordSize = sizeof(CUpti_ActivityKernel5);
+    size_t namesSize = numKernels * 256;
+    size_t bufferSize = (recordSize * numKernels) + namesSize;
+    uint8_t *buffer = (uint8_t *)malloc(bufferSize);
+    memset(buffer, 0, bufferSize);
+
+    // Create multiple kernel records with the SAME correlationId but different graphNodeIds
+    uint64_t baseTime = 1000000000UL + (correlationId * 1000000UL);
+    for (int i = 0; i < numKernels; i++) {
+        CUpti_ActivityKernel5 *kernel = (CUpti_ActivityKernel5 *)(buffer + (i * recordSize));
+        kernel->kind = CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL;
+        kernel->correlationId = correlationId;  // SAME correlationId for all kernels in the graph
+        kernel->deviceId = deviceId;
+        kernel->streamId = streamId;
+        kernel->graphId = graphId;  // Same graphId for all kernels in this graph
+        kernel->graphNodeId = 100 + i;  // Different node IDs
+        kernel->start = baseTime + (i * 100000UL);  // Slightly offset start times
+        kernel->end = kernel->start + 50000UL;
+
+        // Copy kernel name
+        char *namePtr = (char *)(buffer + (numKernels * recordSize) + (i * 256));
+        snprintf(namePtr, 255, "graph_kernel_%d", i);
+        kernel->name = namePtr;
+    }
+
+    *validSize = recordSize * numKernels;
     return buffer;
 }
 
@@ -110,8 +151,8 @@ int main(int argc, char **argv) {
 
     // Dereference to get the actual callback functions
     if (runtime_api_cb_ptr) {
-        runtimeApiCallback = (void (*)(void *, CUpti_CallbackDomain, CUpti_CallbackId, const CUpti_CallbackData *))*runtime_api_cb_ptr;
-        fprintf(stderr, "Got runtime callback: %p\n", (void *)runtimeApiCallback);
+        parcagpuCuptiCallback = (void (*)(void *, CUpti_CallbackDomain, CUpti_CallbackId, const CUpti_CallbackData *))*runtime_api_cb_ptr;
+        fprintf(stderr, "Got runtime callback: %p\n", (void *)parcagpuCuptiCallback);
     }
     if (buffer_requested_cb_ptr) {
         bufferRequestedCallback = (void (*)(uint8_t **, size_t *, size_t *))*buffer_requested_cb_ptr;
@@ -122,7 +163,7 @@ int main(int argc, char **argv) {
     }
 
     // Check if we have the callback pointers
-    if (!runtimeApiCallback || !bufferCompletedCallback) {
+    if (!parcagpuCuptiCallback || !bufferCompletedCallback) {
         fprintf(stderr, "Warning: Could not get callback pointers from mock CUPTI.\n");
         fprintf(stderr, "Test will run but won't be able to simulate full callback flow.\n");
         fprintf(stderr, "The library is loaded and InitializeInjection was called successfully.\n");
@@ -137,8 +178,10 @@ int main(int argc, char **argv) {
 
     // Now simulate CUPTI callbacks
     fprintf(stderr, "\n=== Starting test simulation (1000 events/second) ===\n");
+    fprintf(stderr, "Graph launches will have 3 kernel activities each with the same correlationId\n");
 
     uint32_t correlationId = 1;
+    uint32_t graphId = 1000;  // Start with graphId 1000
     struct timespec sleep_time = {0, 1000000}; // 1ms sleep = 1000 events/second
 
     for (int i = 0; run_forever || i < 100; i++) {
@@ -149,13 +192,15 @@ int main(int argc, char **argv) {
             cbdata.correlationId = correlationId;
 
             // Alternate between kernel and graph launches
-            if (correlationId % 2 == 0) {
-                runtimeApiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API,
-                                   CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000,
+            if (correlationId % 3 == 0) {
+                // Graph launch - this will have multiple kernel activities with same correlationId
+                parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API,
+                                   CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000,
                                    &cbdata);
             } else {
-                runtimeApiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API,
-                                   CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000,
+                // Regular kernel launch - this will have one kernel activity
+                parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API,
+                                   CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000,
                                    &cbdata);
             }
 
@@ -169,11 +214,14 @@ int main(int argc, char **argv) {
                 uint8_t *buffer;
                 size_t validSize;
 
-                if (recCorrelationId % 2 == 0) {
-                    buffer = create_kernel_activity_buffer(&validSize, recCorrelationId, 0, 1, "mock_cuda_kernel_name");
+                if (recCorrelationId % 3 == 0) {
+                    // Graph launch: create buffer with 3 kernel activities sharing the same correlationId
+                    buffer = create_graph_kernel_activities_buffer(&validSize, recCorrelationId, 0, 1, graphId, 3);
                     bufferCompletedCallback(NULL, 1, buffer, 32 * 1024, validSize);
+                    graphId++;  // Different graphId for next graph
                 } else {
-                    buffer = create_graph_activity_buffer(&validSize, recCorrelationId, 0, 1, recCorrelationId / 2);
+                    // Regular kernel launch: single kernel activity
+                    buffer = create_kernel_activity_buffer(&validSize, recCorrelationId, 0, 1, "mock_cuda_kernel_name");
                     bufferCompletedCallback(NULL, 1, buffer, 32 * 1024, validSize);
                 }
 

@@ -50,7 +50,7 @@ static void init_debug(void) {
   } while (0)
 
 // Forward declarations
-static void runtimeApiCallback(void *userdata, CUpti_CallbackDomain domain,
+static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
                                CUpti_CallbackId cbid,
                                const CUpti_CallbackData *cbdata);
 static void bufferRequested(uint8_t **buffer, size_t *size,
@@ -79,7 +79,7 @@ int InitializeInjection(void) {
 
   // Try to subscribe to callbacks
   result =
-      cuptiSubscribe(&subscriber, (CUpti_CallbackFunc)runtimeApiCallback, NULL);
+      cuptiSubscribe(&subscriber, (CUpti_CallbackFunc)parcagpuCuptiCallback, NULL);
   if (result != CUPTI_SUCCESS) {
     const char *errstr;
     cuptiGetResultString(result, &errstr);
@@ -219,7 +219,7 @@ static void print_backtrace(const char *prefix) {
 }
 
 // Callback handler for both runtime and driver API
-static void runtimeApiCallback(void *userdata, CUpti_CallbackDomain domain,
+static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
                                CUpti_CallbackId cbid,
                                const CUpti_CallbackData *cbdata) {
   if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {

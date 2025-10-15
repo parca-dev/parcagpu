@@ -105,7 +105,8 @@ CUptiResult cuptiActivityGetNextRecord(uint8_t *buffer,
     switch (activity->kind) {
         case CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL:
         case CUPTI_ACTIVITY_KIND_KERNEL:
-            recordSize = sizeof(CUpti_ActivityKernel4);
+            // Use CUpti_ActivityKernel5 which includes graphId and graphNodeId
+            recordSize = sizeof(CUpti_ActivityKernel5);
             break;
         case CUPTI_ACTIVITY_KIND_GRAPH_TRACE:
             recordSize = sizeof(CUpti_ActivityGraphTrace);
