@@ -4,11 +4,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Add CUDA include paths (from Docker-built headers)
+    const cuda_include = b.option([]const u8, "cuda-include", "Path to CUDA include directory") orelse "/usr/local/cuda/include";
+
     // Mock CUPTI library
-    const mock_cupti = b.addSharedLibrary(.{
-        .name = "cupti",
+    const mock_cupti_module = b.createModule(.{
         .target = target,
         .optimize = optimize,
+    });
+
+    const mock_cupti = b.addLibrary(.{
+        .name = "cupti",
+        .root_module = mock_cupti_module,
+        .linkage = .dynamic,
     });
     mock_cupti.addCSourceFile(.{
         .file = b.path("test/mock_cupti.c"),
@@ -18,10 +26,6 @@ pub fn build(b: *std.Build) void {
         },
     });
     mock_cupti.linkLibC();
-
-    // Add CUDA include paths (from Docker-built headers)
-    // These will be extracted from the Docker build
-    const cuda_include = b.option([]const u8, "cuda-include", "Path to CUDA include directory") orelse "/usr/local/cuda/include";
     mock_cupti.addIncludePath(.{ .cwd_relative = cuda_include });
 
     b.installArtifact(mock_cupti);
@@ -39,10 +43,14 @@ pub fn build(b: *std.Build) void {
     // The test will use the CMake-built library from cupti/build/libparcagpucupti.so
 
     // Test executable
-    const test_exe = b.addExecutable(.{
-        .name = "test_cupti_prof",
+    const test_exe_module = b.createModule(.{
         .target = target,
         .optimize = optimize,
+    });
+
+    const test_exe = b.addExecutable(.{
+        .name = "test_cupti_prof",
+        .root_module = test_exe_module,
     });
     test_exe.addCSourceFile(.{
         .file = b.path("test/test_cupti_prof.c"),
