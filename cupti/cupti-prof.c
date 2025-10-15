@@ -223,23 +223,28 @@ static void runtimeApiCallback(void *userdata, CUpti_CallbackDomain domain,
                                CUpti_CallbackId cbid,
                                const CUpti_CallbackData *cbdata) {
   if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
-    // We hook on EXIT because that makes our uprobe overhead not add to GPU
+    // We hook on EXIT because that makes our probe overhead not add to GPU
     // launch latency and hopefully covers some of the overhead in the shadow of
     // GPU async work.
     if (cbdata->callbackSite == CUPTI_API_EXIT) {
       // Probablistic gate should go here.
       uint32_t correlationId = cbdata->correlationId;
       // Call stub functions for uprobe attachment
+      const char *name = cbdata->functionName;
       switch (cbid) {
       case CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000:
       case CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernelExC_v11060:
+        if (cbdata->symbolName) {
+          DEBUG_PRINTF("----------- %s\n", cbdata->symbolName);
+          name = cbdata->symbolName;
+        }
       case CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000:
       case CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000:
-        DEBUG_PRINTF(
-            "[CUPTI] Runtime API callback: cbid=%d, correlationId=%u\n", cbid,
-            correlationId);
+        DEBUG_PRINTF("[CUPTI] Runtime API callback: cbid=%d, correlationId=%u, "
+                     "func=%s\n",
+                     cbid, correlationId, cbdata->functionName);
         outstandingEvents++;
-        DTRACE_PROBE1(parcagpu, cuda_correlation, correlationId);
+        DTRACE_PROBE3(parcagpu, cuda_correlation, correlationId, cbid, name);
         break;
       default:
         // Debug: print any other runtime API callback we see with backtrace
@@ -337,9 +342,9 @@ static void bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
                    k->graphId, k->graphNodeId, k->name, k->correlationId,
                    k->deviceId, k->streamId, k->start, k->end,
                    k->end - k->start);
-      DTRACE_PROBE7(parcagpu, kernel_executed, k->start, k->end,
+      DTRACE_PROBE8(parcagpu, kernel_executed, k->start, k->end,
                     k->correlationId, k->deviceId, k->streamId, k->graphId,
-                    k->name);
+                    k->graphNodeId, k->name);
       break;
     }
     // case CUPTI_ACTIVITY_KIND_GRAPH_TRACE: {
