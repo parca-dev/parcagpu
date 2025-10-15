@@ -30,7 +30,6 @@ static CUpti_SubscriberHandle subscriber = 0;
 
 static size_t outstandingEvents = 0;
 
-
 static void init_debug(void) {
   static bool initialized = false;
   if (!initialized) {
@@ -119,8 +118,9 @@ int InitializeInjection(void) {
   }
 
   // Enable runtime API callbacks for cudaGraphLaunch
-  result = cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
-                               CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000);
+  result =
+      cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
+                          CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000);
   if (result != CUPTI_SUCCESS) {
     const char *errstr;
     cuptiGetResultString(result, &errstr);
@@ -173,15 +173,15 @@ int InitializeInjection(void) {
   //   }
 
   // Try enabling graph activities
-  result = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_GRAPH_TRACE);
-  if (result != CUPTI_SUCCESS) {
-    const char *errstr;
-    cuptiGetResultString(result, &errstr);
-    fprintf(stderr, "[CUPTI] Failed to enable graph trace activity: %s\n",
-            errstr);
-  } else {
-    DEBUG_PRINTF("[CUPTI] Enabled GRAPH_TRACE activity\n");
-  }
+  //   result = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_GRAPH_TRACE);
+  //   if (result != CUPTI_SUCCESS) {
+  //     const char *errstr;
+  //     cuptiGetResultString(result, &errstr);
+  //     fprintf(stderr, "[CUPTI] Failed to enable graph trace activity: %s\n",
+  //             errstr);
+  //   } else {
+  //     DEBUG_PRINTF("[CUPTI] Enabled GRAPH_TRACE activity\n");
+  //   }
 
   atexit(cleanup);
 
@@ -235,6 +235,9 @@ static void runtimeApiCallback(void *userdata, CUpti_CallbackDomain domain,
       case CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernelExC_v11060:
       case CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000:
       case CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000:
+        DEBUG_PRINTF(
+            "[CUPTI] Runtime API callback: cbid=%d, correlationId=%u\n", cbid,
+            correlationId);
         outstandingEvents++;
         DTRACE_PROBE1(parcagpu, cuda_correlation, correlationId);
         break;
@@ -326,35 +329,34 @@ static void bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
     }
     case CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL:
     case CUPTI_ACTIVITY_KIND_KERNEL: {
-      CUpti_ActivityKernel4 *k = (CUpti_ActivityKernel4 *)record;
+      CUpti_ActivityKernel5 *k = (CUpti_ActivityKernel5 *)record;
 
-      DEBUG_PRINTF(
-          "[CUPTI] Kernel activity: name=%s, correlationId=%u, deviceId=%u, "
-          "streamId=%u, start=%lu, end=%lu, duration=%lu ns\n",
-          k->name, k->correlationId, k->deviceId, k->streamId, k->start, k->end,
-          k->end - k->start);
-      // Call stub function for uprobe attachment
-      uint64_t devCorrelationId =
-          k->correlationId | ((uint64_t)k->deviceId << 32);
-      DTRACE_PROBE5(parcagpu, kernel_executed, k->start, k->end,
-                    devCorrelationId, k->streamId, k->name);
+      DEBUG_PRINTF("[CUPTI] Kernel activity: graphId=%u graphNodeId=%lu "
+                   "name=%s, correlationId=%u, deviceId=%u, "
+                   "streamId=%u, start=%lu, end=%lu, duration=%lu ns\n",
+                   k->graphId, k->graphNodeId, k->name, k->correlationId,
+                   k->deviceId, k->streamId, k->start, k->end,
+                   k->end - k->start);
+      DTRACE_PROBE7(parcagpu, kernel_executed, k->start, k->end,
+                    k->correlationId, k->deviceId, k->streamId, k->graphId,
+                    k->name);
       break;
     }
-    case CUPTI_ACTIVITY_KIND_GRAPH_TRACE: {
-      CUpti_ActivityGraphTrace *g = (CUpti_ActivityGraphTrace *)record;
+    // case CUPTI_ACTIVITY_KIND_GRAPH_TRACE: {
+    //   CUpti_ActivityGraphTrace *g = (CUpti_ActivityGraphTrace *)record;
 
-      DEBUG_PRINTF(
-          "[CUPTI] Graph activity: graphId=%u, correlationId=%u, deviceId=%u, "
-          "streamId=%u, start=%lu, end=%lu, duration=%lu ns\n",
-          g->graphId, g->correlationId, g->deviceId, g->streamId, g->start,
-          g->end, g->end - g->start);
-      // Call stub function for uprobe attachment
-      uint64_t devCorrelationId =
-          g->correlationId | ((uint64_t)g->deviceId << 32);
-      DTRACE_PROBE5(parcagpu, graph_executed, g->start, g->end,
-                    devCorrelationId, g->streamId, g->graphId);
-      break;
-    }
+    //   DEBUG_PRINTF(
+    //       "[CUPTI] Graph activity: graphId=%u, correlationId=%u, deviceId=%u,
+    //       " "streamId=%u, start=%lu, end=%lu, duration=%lu ns\n", g->graphId,
+    //       g->correlationId, g->deviceId, g->streamId, g->start, g->end,
+    //       g->end - g->start);
+    //   // Call stub function for uprobe attachment
+    //   uint64_t devCorrelationId =
+    //       g->correlationId | ((uint64_t)g->deviceId << 32);
+    //   DTRACE_PROBE5(parcagpu, graph_executed, g->start, g->end,
+    //                 devCorrelationId, g->streamId, g->graphId);
+    //   break;
+    // }
     default:
       DEBUG_PRINTF("[CUPTI] Activity record %d: kind=%d\n", recordCount,
                    record->kind);
