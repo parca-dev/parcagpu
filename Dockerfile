@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy source code
 WORKDIR /build/cupti
-COPY . .
+COPY cupti/ .
 
 # Build the library
 ENV CUDA_ROOT=/usr/local/cuda
