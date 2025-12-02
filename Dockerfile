@@ -1,33 +1,36 @@
-# Multi-platform build for libparcagpucupti.so
-# Supports both AMD64 and ARM64 architectures
-# Builds both CUDA 12 and 13 versions in a single container
-#
-# Build args:
-#   CUDA_12_FULL_VERSION: Full CUDA 12 version (default: 12.9.1)
-#   CUDA_13_FULL_VERSION: Full CUDA 13 version (default: 13.0.2)
-#
-# Stages:
-#   builder-cuda12: Builds library for CUDA 12
-#   builder-cuda13: Builds library for CUDA 13
-#   runtime: Final image with both CUDA versions included
+# Slim multi-platform build for libparcagpucupti.so
+# Uses pre-built CUDA header images instead of full CUDA development images
+# This significantly reduces build time and disk space requirements
 
-ARG CUDA_12_FULL_VERSION=12.9.1
-ARG CUDA_13_FULL_VERSION=13.0.2
+# CUDA header images (can be overridden at build time)
+ARG CUDA_12_HEADERS=ghcr.io/parca-dev/cuda-headers:12
+ARG CUDA_13_HEADERS=ghcr.io/parca-dev/cuda-headers:13
+
+# Import CUDA 12 headers
+FROM ${CUDA_12_HEADERS} AS cuda12-headers
+
+# Import CUDA 13 headers
+FROM ${CUDA_13_HEADERS} AS cuda13-headers
 
 # Build stage for CUDA 12
-FROM nvidia/cuda:${CUDA_12_FULL_VERSION}-devel-ubuntu22.04 AS builder-cuda12
+FROM ubuntu:22.04 AS builder-cuda12
 
-# Install build tools
+# Install only build tools (no CUDA toolkit needed)
 RUN apt-get update && apt-get install -y \
     cmake \
     make \
     gcc \
+    g++ \
     systemtap-sdt-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy source code
 WORKDIR /build/cupti
-COPY . .
+
+# Copy CUDA headers and libraries from header image
+COPY --from=cuda12-headers /usr/local/cuda /usr/local/cuda
+
+# Copy source code
+COPY cupti/cupti-prof.c cupti/CMakeLists.txt ./
 
 # Build the library for CUDA 12
 ENV CUDA_ROOT=/usr/local/cuda
@@ -38,19 +41,24 @@ RUN mkdir -p build && \
     mv libparcagpucupti.so libparcagpucupti.so.12
 
 # Build stage for CUDA 13
-FROM nvidia/cuda:${CUDA_13_FULL_VERSION}-devel-ubuntu22.04 AS builder-cuda13
+FROM ubuntu:22.04 AS builder-cuda13
 
-# Install build tools
+# Install only build tools (no CUDA toolkit needed)
 RUN apt-get update && apt-get install -y \
     cmake \
     make \
     gcc \
+    g++ \
     systemtap-sdt-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy source code
 WORKDIR /build/cupti
-COPY . .
+
+# Copy CUDA headers and libraries from header image
+COPY --from=cuda13-headers /usr/local/cuda /usr/local/cuda
+
+# Copy source code
+COPY cupti/cupti-prof.c cupti/CMakeLists.txt ./
 
 # Build the library for CUDA 13
 ENV CUDA_ROOT=/usr/local/cuda

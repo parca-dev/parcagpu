@@ -13,6 +13,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  CUDA_HEADERS_REGISTRY: ghcr.io/parca-dev/cuda-headers
 
 jobs:
   build-and-push:
@@ -55,6 +56,9 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          build-args: |
+            CUDA_12_HEADERS=${{ env.CUDA_HEADERS_REGISTRY }}:12
+            CUDA_13_HEADERS=${{ env.CUDA_HEADERS_REGISTRY }}:13
           platforms: linux/amd64,linux/arm64
           target: runtime
           push: ${{ github.event_name != 'pull_request' }}
@@ -104,6 +108,8 @@ jobs:
         run: |
           mkdir -p build/${{ matrix.arch }}
           docker buildx build -f Dockerfile \
+            --build-arg CUDA_12_HEADERS=${{ env.CUDA_HEADERS_REGISTRY }}:12 \
+            --build-arg CUDA_13_HEADERS=${{ env.CUDA_HEADERS_REGISTRY }}:13 \
             --target export-cuda${{ matrix.cuda_major }} \
             --output type=local,dest=build/${{ matrix.arch }} \
             --platform ${{ matrix.platform }} \
