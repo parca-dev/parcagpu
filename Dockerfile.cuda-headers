@@ -1,0 +1,16 @@
+# Dockerfile to create minimal CUDA header images
+# These are pushed to ghcr.io and used as build dependencies
+# Usage: docker build --build-arg CUDA_VERSION=12.9.1 -t ghcr.io/parca-dev/cuda-headers:12 .
+
+ARG CUDA_VERSION=12.9.1
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS extractor
+
+# Extract only headers and CUPTI library (no CUDA driver library needed for build)
+RUN mkdir -p /cuda-sdk/include /cuda-sdk/lib64 && \
+    cp -r /usr/local/cuda/include/* /cuda-sdk/include/ && \
+    cp /usr/local/cuda/lib64/libcupti.so* /cuda-sdk/lib64/ && \
+    cp /usr/local/cuda/lib64/stubs/libcuda.so /cuda-sdk/lib64/
+
+# Minimal runtime image with just the SDK files
+FROM busybox:latest
+COPY --from=extractor /cuda-sdk /usr/local/cuda

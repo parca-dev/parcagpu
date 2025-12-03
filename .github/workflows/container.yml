@@ -13,6 +13,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  CUDA_HEADERS_REGISTRY: ghcr.io/parca-dev/cuda-headers
 
 jobs:
   build-and-push:
@@ -45,17 +46,19 @@ jobs:
             # For releases: use semantic version tags
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
             # For main branch: use date and commit SHA
             type=raw,value={{date 'YYYYMMDD'}}-{{sha}},enable={{is_default_branch}}
-            # Also tag as latest for main branch
+            # Tag as latest for main branch
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push multi-arch image
+      - name: Build and push multi-arch image with both CUDA versions
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
+          build-args: |
+            CUDA_12_HEADERS=${{ env.CUDA_HEADERS_REGISTRY }}:12
+            CUDA_13_HEADERS=${{ env.CUDA_HEADERS_REGISTRY }}:13
           platforms: linux/amd64,linux/arm64
           target: runtime
           push: ${{ github.event_name != 'pull_request' }}
@@ -74,10 +77,22 @@ jobs:
 
     strategy:
       matrix:
-        platform:
-          - arch: amd64
+        include:
+          - cuda_major: "12"
+            cuda_full: "12.9.1"
+            arch: amd64
             platform: linux/amd64
-          - arch: arm64
+          - cuda_major: "12"
+            cuda_full: "12.9.1"
+            arch: arm64
+            platform: linux/arm64
+          - cuda_major: "13"
+            cuda_full: "13.0.2"
+            arch: amd64
+            platform: linux/amd64
+          - cuda_major: "13"
+            cuda_full: "13.0.2"
+            arch: arm64
             platform: linux/arm64
 
     steps:
@@ -87,27 +102,34 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and extract binary for ${{ matrix.platform.arch }}
+      - name: Build and extract binary for ${{ matrix.arch }} (CUDA ${{ matrix.cuda_major }})
+        env:
+          LIB_NAME: libparcagpucupti.so.${{ matrix.cuda_major }}
         run: |
-          mkdir -p build/${{ matrix.platform.arch }}
+          mkdir -p build/${{ matrix.arch }}
           docker buildx build -f Dockerfile \
-            --target export \
-            --output type=local,dest=build/${{ matrix.platform.arch }} \
-            --platform ${{ matrix.platform.platform }} \
+            --build-arg CUDA_12_HEADERS=${{ env.CUDA_HEADERS_REGISTRY }}:12 \
+            --build-arg CUDA_13_HEADERS=${{ env.CUDA_HEADERS_REGISTRY }}:13 \
+            --target export-cuda${{ matrix.cuda_major }} \
+            --output type=local,dest=build/${{ matrix.arch }} \
+            --platform ${{ matrix.platform }} \
             .
 
-      - name: Rename binary with arch suffix
+      - name: Rename binary with arch and CUDA version suffix
+        env:
+          LIB_NAME: libparcagpucupti.so.${{ matrix.cuda_major }}
+          OUTPUT_NAME: libparcagpucupti.so.${{ matrix.cuda_major }}-${{ matrix.arch }}
         run: |
-          mv build/${{ matrix.platform.arch }}/libparcagpucupti.so \
-             build/${{ matrix.platform.arch }}/libparcagpucupti-${{ matrix.platform.arch }}.so
+          mv build/${{ matrix.arch }}/${LIB_NAME} \
+             build/${{ matrix.arch }}/${OUTPUT_NAME}
 
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libparcagpucupti-${{ matrix.platform.arch }}
-          path: build/${{ matrix.platform.arch }}/libparcagpucupti-${{ matrix.platform.arch }}.so
+          name: libparcagpucupti.so.${{ matrix.cuda_major }}-${{ matrix.arch }}
+          path: build/${{ matrix.arch }}/libparcagpucupti.so.${{ matrix.cuda_major }}-${{ matrix.arch }}
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          files: build/${{ matrix.platform.arch }}/libparcagpucupti-${{ matrix.platform.arch }}.so
+          files: build/${{ matrix.arch }}/libparcagpucupti.so.${{ matrix.cuda_major }}-${{ matrix.arch }}
