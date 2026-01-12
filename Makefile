@@ -12,7 +12,7 @@ all: cupti-all test-infra
 cupti-amd64:
 	@echo "=== Building $(LIB_NAME) for AMD64 with Docker (CUDA $(CUDA_MAJOR)) ==="
 	@mkdir -p /tmp/parcagpu-build-amd64
-	@docker buildx use default
+	@docker buildx create --name parcagpu-builder --use --bootstrap 2>/dev/null || docker buildx use parcagpu-builder
 	@docker buildx build -f Dockerfile \
 		--build-arg CUDA_12_HEADERS=$(CUDA_12_HEADERS) \
 		--build-arg CUDA_13_HEADERS=$(CUDA_13_HEADERS) \
