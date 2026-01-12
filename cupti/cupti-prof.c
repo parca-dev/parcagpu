@@ -15,7 +15,7 @@
 static bool debug_enabled = false;
 
 // Activity buffer management
-static size_t activityBufferSize = 64 * 1024 * 1024; // 64MB
+static size_t activityBufferSize = 10 * 1024 * 1024;
 
 // Global variables
 static CUpti_SubscriberHandle subscriber = 0;
@@ -43,8 +43,8 @@ static void init_debug(void) {
 
 // Forward declarations
 static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
-                               CUpti_CallbackId cbid,
-                               const CUpti_CallbackData *cbdata);
+                                  CUpti_CallbackId cbid,
+                                  const CUpti_CallbackData *cbdata);
 static void bufferRequested(uint8_t **buffer, size_t *size,
                             size_t *maxNumRecords);
 static void bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
@@ -70,8 +70,8 @@ int InitializeInjection(void) {
   }
 
   // Try to subscribe to callbacks
-  result =
-      cuptiSubscribe(&subscriber, (CUpti_CallbackFunc)parcagpuCuptiCallback, NULL);
+  result = cuptiSubscribe(&subscriber,
+                          (CUpti_CallbackFunc)parcagpuCuptiCallback, NULL);
   if (result != CUPTI_SUCCESS) {
     const char *errstr;
     cuptiGetResultString(result, &errstr);
@@ -212,8 +212,8 @@ static void print_backtrace(const char *prefix) {
 
 // Callback handler for both runtime and driver API
 static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
-                               CUpti_CallbackId cbid,
-                               const CUpti_CallbackData *cbdata) {
+                                  CUpti_CallbackId cbid,
+                                  const CUpti_CallbackData *cbdata) {
   if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
     // We hook on EXIT because that makes our probe overhead not add to GPU
     // launch latency and hopefully covers some of the overhead in the shadow of
@@ -253,7 +253,9 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
   // If we let too many events pile up it overwhelms the perf_event buffers,
   // just another reason to explore just passing the activity buffer through to
   // eBPF.
-  if (outstandingEvents > 1000) {
+  if (outstandingEvents > 3000) {
+    DEBUG_PRINTF("[CUPTI] Flushing: outstandingEvents=%zu\n",
+                 outstandingEvents);
     cuptiActivityFlushAll(0);
   }
 }
@@ -339,7 +341,10 @@ static void bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
   DEBUG_PRINTF("[CUPTI] Processed %d activity records from buffer %p\n",
                recordCount, buffer);
 
-  outstandingEvents -= recordCount;
+  // Reset to 0 rather than decrement - one API callback can produce N
+  // activities so decrementing by recordCount can cause underflow (size_t wraps
+  // to huge value)
+  outstandingEvents = 0;
 
   // Free the buffer
   DEBUG_PRINTF("[CUPTI:bufferCompleted] Freeing buffer %p\n", buffer);
