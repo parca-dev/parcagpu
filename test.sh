@@ -7,6 +7,7 @@ cd "$(dirname "$0")"
 # Parse arguments
 USE_BPFTRACE=0
 ARCH="${ARCH:-amd64}"
+CUDA_MAJOR="${CUDA_MAJOR:-12}"
 for arg in "$@"; do
     case $arg in
         --bpftrace)
@@ -51,7 +52,7 @@ echo "=== Running test program ==="
 export LD_LIBRARY_PATH="$(pwd)/zig-out/lib:$LD_LIBRARY_PATH"
 export PARCAGPU_DEBUG=1
 # Use the CMake-built library with real CUPTI
-zig-out/bin/test_cupti_prof build/$ARCH/libparcagpucupti.so "$@"
+zig-out/bin/test_cupti_prof build/$CUDA_MAJOR/$ARCH/libparcagpucupti.so "$@"
 
 # If bpftrace was started, stop it and show results
 if [ "$USE_BPFTRACE" -eq 1 ]; then

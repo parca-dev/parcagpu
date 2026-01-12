@@ -5,14 +5,14 @@ CUDA_MAJOR ?= 12
 CUDA_FULL_VERSION ?= 12.9.1
 LIB_NAME = libparcagpucupti.so.$(CUDA_MAJOR)
 
-# Default target: build everything for native architecture
-all: cupti-all test-infra
+# Default target: build all CUDA versions (12 & 13) for both architectures and test infrastructure
+all: cupti-all-versions test-infra
 
 # Build libparcagpucupti.so for AMD64 using Docker
 cupti-amd64:
 	@echo "=== Building $(LIB_NAME) for AMD64 with Docker (CUDA $(CUDA_MAJOR)) ==="
 	@mkdir -p /tmp/parcagpu-build-amd64
-	@docker buildx use default
+	@docker buildx create --name parcagpu-builder --use --bootstrap 2>/dev/null || docker buildx use parcagpu-builder
 	@docker buildx build -f Dockerfile \
 		--build-arg CUDA_12_HEADERS=$(CUDA_12_HEADERS) \
 		--build-arg CUDA_13_HEADERS=$(CUDA_13_HEADERS) \
@@ -40,12 +40,28 @@ cupti-arm64:
 	@ln -sf $(LIB_NAME) build/$(CUDA_MAJOR)/arm64/libparcagpucupti.so
 	@echo "ARM64 library built: build/$(CUDA_MAJOR)/arm64/$(LIB_NAME)"
 
-# Build both architectures for current CUDA version
+# Build both architectures for current CUDA version (controlled by CUDA_MAJOR variable)
+# Example: make cupti-all CUDA_MAJOR=13
 cupti-all: cupti-amd64 cupti-arm64
 
-# Build runtime container with both CUDA versions for both architectures
-# Note: Builds but doesn't load into Docker (multi-platform images can't be loaded)
-# Use docker-push to push to a registry, or remove one platform to load locally
+# Build all local artifacts: CUDA 12 & 13 for both amd64 and arm64
+# This extracts the .so files to build/12/{amd64,arm64}/ and build/13/{amd64,arm64}/
+# Use this target when you want local build artifacts for testing
+cupti-all-versions:
+	@echo "=== Building all CUDA versions (12 and 13) for both architectures ==="
+	@$(MAKE) cupti-amd64 CUDA_MAJOR=12 CUDA_FULL_VERSION=12.9.1
+	@$(MAKE) cupti-arm64 CUDA_MAJOR=12 CUDA_FULL_VERSION=12.9.1
+	@$(MAKE) cupti-amd64 CUDA_MAJOR=13 CUDA_FULL_VERSION=13.0.2
+	@$(MAKE) cupti-arm64 CUDA_MAJOR=13 CUDA_FULL_VERSION=13.0.2
+	@echo "=== All artifacts built ==="
+	@echo "CUDA 12 amd64: build/12/amd64/libparcagpucupti.so.12"
+	@echo "CUDA 12 arm64: build/12/arm64/libparcagpucupti.so.12"
+	@echo "CUDA 13 amd64: build/13/amd64/libparcagpucupti.so.13"
+	@echo "CUDA 13 arm64: build/13/arm64/libparcagpucupti.so.13"
+
+# Build runtime container image with both CUDA versions for both architectures
+# Note: This builds a Docker image but doesn't extract local artifacts or load into Docker
+# Multi-platform images stay in buildx cache. Use docker-push to push to registry.
 cross:
 	@echo "=== Building runtime container for AMD64 and ARM64 (includes CUDA 12 and 13) ==="
 	@docker buildx create --name parcagpu-builder --use --bootstrap 2>/dev/null || docker buildx use parcagpu-builder
@@ -56,19 +72,6 @@ cross:
 		--platform linux/amd64,linux/arm64 \
 		.
 	@echo "Runtime container built for both platforms (cached, not loaded into Docker)"
-
-# Build all artifacts (CUDA 12 & 13 for both amd64 and arm64)
-cupti-all-versions:
-	@echo "=== Building all CUDA versions (12 and 13) for both architectures ==="
-	@$(MAKE) cupti-amd64 CUDA_MAJOR=12 CUDA_FULL_VERSION=12.9.1
-	@$(MAKE) cupti-arm64 CUDA_MAJOR=12 CUDA_FULL_VERSION=12.9.1
-	@$(MAKE) cupti-amd64 CUDA_MAJOR=13 CUDA_FULL_VERSION=13.0.2
-	@$(MAKE) cupti-arm64 CUDA_MAJOR=13 CUDA_FULL_VERSION=13.0.2
-	@echo "=== All artifacts built ==="
-	@echo "CUDA 12: build/12/amd64/libparcagpucupti.so.12"
-	@echo "CUDA 12: build/12/arm64/libparcagpucupti.so.12"
-	@echo "CUDA 13: build/13/amd64/libparcagpucupti.so.13"
-	@echo "CUDA 13: build/13/arm64/libparcagpucupti.so.13"
 
 # CUDA header image configuration
 # Can be overridden to use local images (e.g., make cupti-all CUDA_12_HEADERS=cuda-headers:12)
