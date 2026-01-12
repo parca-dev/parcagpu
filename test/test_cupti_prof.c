@@ -211,21 +211,35 @@ int main(int argc, char **argv) {
         if (i % 2 == 0 && i > 0) {
             for (int k = 0; k < 5; k++) {
                 uint32_t recCorrelationId = correlationId - 10 + k;
-                uint8_t *buffer;
+                uint8_t *activityData;
                 size_t validSize;
 
+                // Create activity data (this is temporary, not the actual buffer)
                 if (recCorrelationId % 3 == 0) {
                     // Graph launch: create buffer with 3 kernel activities sharing the same correlationId
-                    buffer = create_graph_kernel_activities_buffer(&validSize, recCorrelationId, 0, 1, graphId, 3);
-                    bufferCompletedCallback(NULL, 1, buffer, 32 * 1024, validSize);
+                    activityData = create_graph_kernel_activities_buffer(&validSize, recCorrelationId, 0, 1, graphId, 3);
                     graphId++;  // Different graphId for next graph
                 } else {
                     // Regular kernel launch: single kernel activity
-                    buffer = create_kernel_activity_buffer(&validSize, recCorrelationId, 0, 1, "mock_cuda_kernel_name");
-                    bufferCompletedCallback(NULL, 1, buffer, 32 * 1024, validSize);
+                    activityData = create_kernel_activity_buffer(&validSize, recCorrelationId, 0, 1, "mock_cuda_kernel_name");
                 }
 
-                free(buffer);
+                // Request a buffer from the callback (this will allocate it properly)
+                uint8_t *buffer;
+                size_t bufferSize;
+                size_t maxNumRecords;
+                if (bufferRequestedCallback) {
+                    bufferRequestedCallback(&buffer, &bufferSize, &maxNumRecords);
+
+                    // Copy the activity data into the buffer
+                    memcpy(buffer, activityData, validSize);
+
+                    // Now call bufferCompleted with the proper buffer (it will free it)
+                    bufferCompletedCallback(NULL, 1, buffer, bufferSize, validSize);
+                }
+
+                // Free the temporary activity data
+                free(activityData);
             }
         }
 

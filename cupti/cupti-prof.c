@@ -15,15 +15,7 @@
 static bool debug_enabled = false;
 
 // Activity buffer management
-#define NUM_BUFFERS 16
-typedef struct {
-  uint8_t *buffer;
-  int in_use; // 1 if CUPTI owns it, 0 if available
-} BufferInfo;
-
-static BufferInfo activityBuffers[NUM_BUFFERS] = {{NULL, 0}};
-
-static size_t activityBufferSize = 32 * 1024;
+static size_t activityBufferSize = 64 * 1024 * 1024; // 64MB
 
 // Global variables
 static CUpti_SubscriberHandle subscriber = 0;
@@ -62,7 +54,7 @@ void cleanup(void);
 
 // CUPTI initialization function required for CUDA_INJECTION64_PATH
 int InitializeInjection(void) {
-  fprintf(stderr, "[CUPTI] InitializeInjection called\n");
+  DEBUG_PRINTF("[CUPTI] InitializeInjection called\n");
   CUptiResult result;
 
   // Set flush period BEFORE enabling activities (in milliseconds)
@@ -269,37 +261,13 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
 // Buffer request callback
 static void bufferRequested(uint8_t **buffer, size_t *size,
                             size_t *maxNumRecords) {
-  // Find an available buffer that's not in use
-  for (int i = 0; i < NUM_BUFFERS; i++) {
-    if (!activityBuffers[i].in_use) {
-      // Allocate if needed
-      if (activityBuffers[i].buffer == NULL) {
-        activityBuffers[i].buffer = (uint8_t *)malloc(activityBufferSize);
-        DEBUG_PRINTF("[CUPTI:bufferRequested] Allocated new buffer[%d] at %p\n",
-                     i, activityBuffers[i].buffer);
-      }
-
-      // Mark as in use and return it
-      activityBuffers[i].in_use = 1;
-      *buffer = activityBuffers[i].buffer;
-      *size = activityBufferSize;
-      *maxNumRecords = 0; // Let CUPTI decide
-
-      DEBUG_PRINTF("[CUPTI:bufferRequested] Giving buffer[%d]=%p to CUPTI "
-                   "(marked in_use)\n",
-                   i, *buffer);
-      return;
-    }
-  }
-
-  // All buffers are in use - this shouldn't happen with enough buffers
-  // Allocate a temporary buffer that won't be reused
-  DEBUG_PRINTF("[CUPTI:bufferRequested] ERROR: All %d buffers in use! "
-               "Allocating temporary buffer\n",
-               NUM_BUFFERS);
-  *buffer = (uint8_t *)malloc(activityBufferSize);
+  // Allocate 64MB buffer aligned to 8 bytes
+  *buffer = (uint8_t *)aligned_alloc(8, activityBufferSize);
   *size = activityBufferSize;
-  *maxNumRecords = 0;
+  *maxNumRecords = 0; // Let CUPTI decide
+
+  DEBUG_PRINTF("[CUPTI:bufferRequested] Allocated buffer %p, size=%zu\n",
+               *buffer, *size);
 }
 
 // Buffer completion callback
@@ -373,16 +341,9 @@ static void bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
 
   outstandingEvents -= recordCount;
 
-  // Mark the buffer as available for reuse
-  for (int i = 0; i < NUM_BUFFERS; i++) {
-    if (activityBuffers[i].buffer == buffer) {
-      activityBuffers[i].in_use = 0;
-      DEBUG_PRINTF("[CUPTI:bufferCompleted] Buffer[%d]=%p marked as available "
-                   "(not in_use)\n",
-                   i, buffer);
-      break;
-    }
-  }
+  // Free the buffer
+  DEBUG_PRINTF("[CUPTI:bufferCompleted] Freeing buffer %p\n", buffer);
+  free(buffer);
 
   // Report any records dropped due to buffer overflow
   size_t dropped;
@@ -410,15 +371,6 @@ void cleanup(void) {
   if (subscriber) {
     cuptiUnsubscribe(subscriber);
     subscriber = 0;
-  }
-
-  // Free all activity buffers
-  for (int i = 0; i < NUM_BUFFERS; i++) {
-    if (activityBuffers[i].buffer) {
-      free(activityBuffers[i].buffer);
-      activityBuffers[i].buffer = NULL;
-      activityBuffers[i].in_use = 0;
-    }
   }
 
   DEBUG_PRINTF("[CUPTI] Cleanup completed\n");
