@@ -15,7 +15,13 @@
 static bool debug_enabled = false;
 
 // Activity buffer management
-static size_t activityBufferSize = 10 * 1024 * 1024;
+// A kernel activity is around 224 bytes so a 128kb buffer
+// will hold ~500 activities, we want to flush regularly since
+// we are a continuous profiler so we don't need a huge buffer
+// like most CUPTI profilers.  Also a small size avoid malloc
+// just going to mmap every time so the allocator should cache
+// and re-use these for us.
+static size_t activityBufferSize = 128 * 1024;
 
 // Global variables
 static CUpti_SubscriberHandle subscriber = 0;
@@ -45,10 +51,11 @@ static void init_debug(void) {
 static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
                                   CUpti_CallbackId cbid,
                                   const CUpti_CallbackData *cbdata);
-static void bufferRequested(uint8_t **buffer, size_t *size,
-                            size_t *maxNumRecords);
-static void bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
-                            size_t size, size_t validSize);
+static void parcagpuBufferRequested(uint8_t **buffer, size_t *size,
+                                    size_t *maxNumRecords);
+static void parcagpuBufferCompleted(CUcontext ctx, uint32_t streamId,
+                                    uint8_t *buffer, size_t size,
+                                    size_t validSize);
 
 void cleanup(void);
 
@@ -79,49 +86,35 @@ int InitializeInjection(void) {
     return 1; // Still return success to not break the injection
   }
 
-  // Try enabling driver API kernel launch callback like the example
-  result = cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
-                               CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel);
-  if (result != CUPTI_SUCCESS) {
-    const char *errstr;
-    cuptiGetResultString(result, &errstr);
-    fprintf(stderr, "[CUPTI] Failed to enable cuLaunchKernel callback: %s\n",
-            errstr);
-  }
-
-  // Enable runtime API callbacks for cudaLaunchKernel
-  result = cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
-                               CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000);
-  if (result != CUPTI_SUCCESS) {
-    const char *errstr;
-    cuptiGetResultString(result, &errstr);
-    fprintf(stderr, "[CUPTI] Failed to enable cudaLaunchKernel callback: %s\n",
-            errstr);
-  }
-
-  // Enable runtime API callbacks for cudaGraphLaunch
-  result = cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
-                               CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000);
-  if (result != CUPTI_SUCCESS) {
-    const char *errstr;
-    cuptiGetResultString(result, &errstr);
-    fprintf(stderr, "[CUPTI] Failed to enable cudaGraphLaunch callback: %s\n",
-            errstr);
-  }
-
-  // Enable runtime API callbacks for cudaGraphLaunch
-  result =
-      cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
-                          CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000);
-  if (result != CUPTI_SUCCESS) {
-    const char *errstr;
-    cuptiGetResultString(result, &errstr);
-    fprintf(stderr, "[CUPTI] Failed to enable cudaGraphLaunch callback: %s\n",
-            errstr);
+  // Enable all runtime API kernel launch callbacks
+  CUpti_CallbackId launchCallbacks[] = {
+      CUPTI_RUNTIME_TRACE_CBID_cudaLaunch_v3020,
+      CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000,
+      CUPTI_RUNTIME_TRACE_CBID_cudaLaunch_ptsz_v7000,
+      CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_ptsz_v7000,
+      CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernelExC_v11060,
+      CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernelExC_ptsz_v11060,
+      CUPTI_RUNTIME_TRACE_CBID_cudaLaunchCooperativeKernel_v9000,
+      CUPTI_RUNTIME_TRACE_CBID_cudaLaunchCooperativeKernel_ptsz_v9000,
+      CUPTI_RUNTIME_TRACE_CBID_cudaLaunchCooperativeKernelMultiDevice_v9000,
+      CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000,
+      CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000,
+  };
+  for (size_t i = 0; i < sizeof(launchCallbacks) / sizeof(launchCallbacks[0]);
+       i++) {
+    result = cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
+                                 launchCallbacks[i]);
+    if (result != CUPTI_SUCCESS) {
+      const char *errstr;
+      cuptiGetResultString(result, &errstr);
+      fprintf(stderr, "[CUPTI] Failed to enable runtime callback %d: %s\n",
+              launchCallbacks[i], errstr);
+    }
   }
 
   // Register activity buffer callbacks
-  result = cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted);
+  result = cuptiActivityRegisterCallbacks(parcagpuBufferRequested,
+                                          parcagpuBufferCompleted);
   if (result != CUPTI_SUCCESS) {
     const char *errstr;
     cuptiGetResultString(result, &errstr);
@@ -130,7 +123,6 @@ int InitializeInjection(void) {
     return 1; // Still return success to not break the injection
   }
 
-  // Enable multiple kernel activity recording types
   result = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
   if (result != CUPTI_SUCCESS) {
     const char *errstr;
@@ -141,53 +133,10 @@ int InitializeInjection(void) {
     DEBUG_PRINTF("[CUPTI] Enabled CONCURRENT_KERNEL activity\n");
   }
 
-  // This activity kind serializes execution and gives me errors on a T4:
-  // CUPTI_ERROR_NOT_COMPATIBLE But its not a fatal error so do it anyways
-  //   result = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_KERNEL);
-  //   if (result != CUPTI_SUCCESS) {
-  //     const char *errstr;
-  //     cuptiGetResultString(result, &errstr);
-  //     fprintf(stderr, "[CUPTI] Failed to enable kernel activity: %s\n",
-  //     errstr);
-  //   } else {
-  //     DEBUG_PRINTF("[CUPTI] Enabled KERNEL activity\n");
-  //   }
-
-  // Also try enabling runtime activities
-  //   result = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME);
-  //   if (result != CUPTI_SUCCESS) {
-  //     const char *errstr;
-  //     cuptiGetResultString(result, &errstr);
-  //     fprintf(stderr, "[CUPTI] Failed to enable runtime activity: %s\n",
-  //     errstr);
-  //   } else {
-  //     DEBUG_PRINTF("[CUPTI] Enabled RUNTIME activity\n");
-  //   }
-
-  // Try enabling graph activities
-  //   result = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_GRAPH_TRACE);
-  //   if (result != CUPTI_SUCCESS) {
-  //     const char *errstr;
-  //     cuptiGetResultString(result, &errstr);
-  //     fprintf(stderr, "[CUPTI] Failed to enable graph trace activity: %s\n",
-  //             errstr);
-  //   } else {
-  //     DEBUG_PRINTF("[CUPTI] Enabled GRAPH_TRACE activity\n");
-  //   }
-
   atexit(cleanup);
 
   DEBUG_PRINTF("[CUPTI] Successfully initialized CUPTI callbacks with external "
                "correlation and activity API\n");
-
-  // NOTE: If automatic flush still doesn't work, you can implement manual
-  // periodic flushing:
-  // 1. Create a background thread that calls cuptiActivityFlushAll(0)
-  // periodically
-  // 2. Or call cuptiActivityFlushAll(0) from your application at regular
-  // intervals
-  // 3. Or hook into CUDA synchronization points (cudaDeviceSynchronize, etc.)
-  // to flush
 
   return 1;
 }
@@ -210,45 +159,27 @@ static void print_backtrace(const char *prefix) {
   }
 }
 
-// Callback handler for both runtime and driver API
+// Callback handler for runtime API
 static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
                                   CUpti_CallbackId cbid,
                                   const CUpti_CallbackData *cbdata) {
-  if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
-    // We hook on EXIT because that makes our probe overhead not add to GPU
-    // launch latency and hopefully covers some of the overhead in the shadow of
-    // GPU async work.
-    if (cbdata->callbackSite == CUPTI_API_EXIT) {
-      // Probablistic gate should go here.
-      uint32_t correlationId = cbdata->correlationId;
-      // Call stub functions for uprobe attachment
-      const char *name = cbdata->functionName;
-      switch (cbid) {
-      case CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000:
-      case CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernelExC_v11060:
-        if (cbdata->symbolName) {
-          DEBUG_PRINTF("----------- %s\n", cbdata->symbolName);
-          name = cbdata->symbolName;
-        }
-      case CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000:
-      case CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000:
-        DEBUG_PRINTF("[CUPTI] Runtime API callback: cbid=%d, correlationId=%u, "
-                     "func=%s\n",
-                     cbid, correlationId, cbdata->functionName);
-        outstandingEvents++;
-        DTRACE_PROBE3(parcagpu, cuda_correlation, correlationId, cbid, name);
-        break;
-      default:
-        // Debug: print any other runtime API callback we see with backtrace
-        DEBUG_PRINTF(
-            "[CUPTI] Other Runtime API callback: cbid=%d, correlationId=%u\n",
-            cbid, correlationId);
-        // Print backtrace to see who's calling this
-        if (debug_enabled) {
-          print_backtrace("[CUPTI]");
-        }
-      }
-    }
+  if (domain != CUPTI_CB_DOMAIN_RUNTIME_API) {
+    return;
+  }
+
+  // We hook on EXIT because that makes our probe overhead not add to GPU
+  // launch latency and hopefully covers some of the overhead in the shadow of
+  // GPU async work.
+  if (cbdata->callbackSite == CUPTI_API_EXIT) {
+    uint32_t correlationId = cbdata->correlationId;
+    const char *name =
+        cbdata->symbolName ? cbdata->symbolName : cbdata->functionName;
+
+    DEBUG_PRINTF(
+        "[CUPTI] Runtime API callback: cbid=%d, correlationId=%u, func=%s\n",
+        cbid, correlationId, name);
+    outstandingEvents++;
+    DTRACE_PROBE3(parcagpu, cuda_correlation, correlationId, cbid, name);
   }
   // If we let too many events pile up it overwhelms the perf_event buffers,
   // just another reason to explore just passing the activity buffer through to
@@ -257,13 +188,13 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
     DEBUG_PRINTF("[CUPTI] Flushing: outstandingEvents=%zu\n",
                  outstandingEvents);
     cuptiActivityFlushAll(0);
+    outstandingEvents = 0;
   }
 }
 
 // Buffer request callback
-static void bufferRequested(uint8_t **buffer, size_t *size,
-                            size_t *maxNumRecords) {
-  // Allocate 64MB buffer aligned to 8 bytes
+static void parcagpuBufferRequested(uint8_t **buffer, size_t *size,
+                                    size_t *maxNumRecords) {
   *buffer = (uint8_t *)aligned_alloc(8, activityBufferSize);
   *size = activityBufferSize;
   *maxNumRecords = 0; // Let CUPTI decide
@@ -273,8 +204,9 @@ static void bufferRequested(uint8_t **buffer, size_t *size,
 }
 
 // Buffer completion callback
-static void bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
-                            size_t size, size_t validSize) {
+static void parcagpuBufferCompleted(CUcontext ctx, uint32_t streamId,
+                                    uint8_t *buffer, size_t size,
+                                    size_t validSize) {
   CUptiResult result;
   CUpti_Activity *record = NULL;
   int recordCount = 0;
@@ -295,15 +227,8 @@ static void bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
     }
 
     recordCount++;
-    switch (record->kind) {
-    case CUPTI_ACTIVITY_KIND_RUNTIME: {
-      CUpti_ActivityAPI *r = (CUpti_ActivityAPI *)record;
-      DEBUG_PRINTF("[CUPTI] Runtime activity: correlationId=%u, cbid=%d,\n",
-                   r->correlationId, r->cbid);
-      break;
-    }
-    case CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL:
-    case CUPTI_ACTIVITY_KIND_KERNEL: {
+    if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL ||
+        record->kind == CUPTI_ACTIVITY_KIND_KERNEL) {
       CUpti_ActivityKernel5 *k = (CUpti_ActivityKernel5 *)record;
 
       DEBUG_PRINTF("[CUPTI] Kernel activity: graphId=%u graphNodeId=%lu "
@@ -315,26 +240,6 @@ static void bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
       DTRACE_PROBE8(parcagpu, kernel_executed, k->start, k->end,
                     k->correlationId, k->deviceId, k->streamId, k->graphId,
                     k->graphNodeId, k->name);
-      break;
-    }
-    // case CUPTI_ACTIVITY_KIND_GRAPH_TRACE: {
-    //   CUpti_ActivityGraphTrace *g = (CUpti_ActivityGraphTrace *)record;
-
-    //   DEBUG_PRINTF(
-    //       "[CUPTI] Graph activity: graphId=%u, correlationId=%u, deviceId=%u,
-    //       " "streamId=%u, start=%lu, end=%lu, duration=%lu ns\n", g->graphId,
-    //       g->correlationId, g->deviceId, g->streamId, g->start, g->end,
-    //       g->end - g->start);
-    //   // Call stub function for uprobe attachment
-    //   uint64_t devCorrelationId =
-    //       g->correlationId | ((uint64_t)g->deviceId << 32);
-    //   DTRACE_PROBE5(parcagpu, graph_executed, g->start, g->end,
-    //                 devCorrelationId, g->streamId, g->graphId);
-    //   break;
-    // }
-    default:
-      DEBUG_PRINTF("[CUPTI] Activity record %d: kind=%d\n", recordCount,
-                   record->kind);
     }
   }
 
@@ -347,7 +252,7 @@ static void bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
   outstandingEvents = 0;
 
   // Free the buffer
-  DEBUG_PRINTF("[CUPTI:bufferCompleted] Freeing buffer %p\n", buffer);
+  DEBUG_PRINTF("[CUPTI] Freeing buffer %p\n", buffer);
   free(buffer);
 
   // Report any records dropped due to buffer overflow
