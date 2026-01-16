@@ -32,6 +32,10 @@ static size_t outstandingEvents = 0;
 // so we can skip driver EXIT probe when it matches (driver calls happen under runtime calls)
 static __thread uint32_t runtimeEnterCorrelationId = 0;
 
+// Rate limiting: no more than 1 probe per 500μs per thread
+static __thread uint64_t lastProbeTimeNs = 0;
+#define PROBE_MIN_INTERVAL_NS 500000 // 500μs
+
 static void init_debug(void) {
   static bool initialized = false;
   if (!initialized) {
@@ -236,6 +240,17 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
   } else {
     return;
   }
+
+  // Rate limit: no more than 1 probe per ms per thread
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  uint64_t nowNs = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+  if (nowNs - lastProbeTimeNs < PROBE_MIN_INTERVAL_NS) {
+    DEBUG_PRINTF("[CUPTI] Rate limited: skipping probe for correlationId=%u\n",
+                 correlationId);
+    return;
+  }
+  lastProbeTimeNs = nowNs;
 
   outstandingEvents++;
   DTRACE_PROBE3(parcagpu, cuda_correlation, correlationId, signedCbid, name);
