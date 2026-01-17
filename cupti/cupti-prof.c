@@ -29,17 +29,20 @@ static CUpti_SubscriberHandle subscriber = 0;
 static size_t outstandingEvents = 0;
 
 // Thread-local tracking: store correlation ID from runtime ENTER
-// so we can skip driver EXIT probe when it matches (driver calls happen under runtime calls)
+// so we can skip driver EXIT probe when it matches (driver calls happen under
+// runtime calls)
 static __thread uint32_t runtimeEnterCorrelationId = 0;
 
-// Rate limiting: no more than 1 probe per 500μs per thread
+// Rate limiting
 static __thread uint64_t lastProbeTimeNs = 0;
+static bool limiter_disabled = false;
 #define PROBE_MIN_INTERVAL_NS 500000 // 500μs
 
 static void init_debug(void) {
   static bool initialized = false;
   if (!initialized) {
     debug_enabled = getenv("PARCAGPU_DEBUG") != NULL;
+    limiter_disabled = getenv("PARCAGPU_LIMITER_DISABLE") != NULL;
     initialized = true;
   }
 }
@@ -221,9 +224,9 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
   if (domain == CUPTI_CB_DOMAIN_DRIVER_API) {
     // Skip if this driver call is under a runtime call (same correlation ID)
     if (correlationId == runtimeEnterCorrelationId) {
-      DEBUG_PRINTF(
-          "[CUPTI] Skipping driver EXIT correlationId=%u - runtime will handle\n",
-          correlationId);
+      DEBUG_PRINTF("[CUPTI] Skipping driver EXIT correlationId=%u - runtime "
+                   "will handle\n",
+                   correlationId);
       return;
     }
     // Pure driver call (no runtime wrapper) - use negative cbid
@@ -241,16 +244,30 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
     return;
   }
 
-  // Rate limit: no more than 1 probe per ms per thread
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  uint64_t nowNs = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-  if (nowNs - lastProbeTimeNs < PROBE_MIN_INTERVAL_NS) {
-    DEBUG_PRINTF("[CUPTI] Rate limited: skipping probe for correlationId=%u\n",
-                 correlationId);
-    return;
+  // Check if this is a graph launch (never rate limit these)
+  bool isGraphLaunch = false;
+  if (signedCbid < 0) {
+    // Driver API: cuGraphLaunch = 514, cuGraphLaunch_ptsz = 515
+    int driverCbid = -signedCbid;
+    isGraphLaunch = (driverCbid == 514 || driverCbid == 515);
+  } else {
+    // Runtime API: cudaGraphLaunch = 311, cudaGraphLaunch_ptsz = 312
+    isGraphLaunch = (signedCbid == 311 || signedCbid == 312);
   }
-  lastProbeTimeNs = nowNs;
+
+  // Rate limit probes (skip for graph launches)
+  if (!limiter_disabled && !isGraphLaunch) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t nowNs = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    if (nowNs - lastProbeTimeNs < PROBE_MIN_INTERVAL_NS) {
+      DEBUG_PRINTF(
+          "[CUPTI] Rate limited: skipping probe for correlationId=%u\n",
+          correlationId);
+      return;
+    }
+    lastProbeTimeNs = nowNs;
+  }
 
   outstandingEvents++;
   DTRACE_PROBE3(parcagpu, cuda_correlation, correlationId, signedCbid, name);
