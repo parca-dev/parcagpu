@@ -28,6 +28,10 @@ static CUpti_SubscriberHandle subscriber = 0;
 
 static size_t outstandingEvents = 0;
 
+// Thread-local tracking: store correlation ID from runtime ENTER
+// so we can skip driver EXIT probe when it matches (driver calls happen under runtime calls)
+static __thread uint32_t runtimeEnterCorrelationId = 0;
+
 static void init_debug(void) {
   static bool initialized = false;
   if (!initialized) {
@@ -87,7 +91,7 @@ int InitializeInjection(void) {
   }
 
   // Enable all runtime API kernel launch callbacks
-  CUpti_CallbackId launchCallbacks[] = {
+  CUpti_CallbackId runtimeCallbacks[] = {
       CUPTI_RUNTIME_TRACE_CBID_cudaLaunch_v3020,
       CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000,
       CUPTI_RUNTIME_TRACE_CBID_cudaLaunch_ptsz_v7000,
@@ -100,15 +104,42 @@ int InitializeInjection(void) {
       CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000,
       CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000,
   };
-  for (size_t i = 0; i < sizeof(launchCallbacks) / sizeof(launchCallbacks[0]);
+  for (size_t i = 0; i < sizeof(runtimeCallbacks) / sizeof(runtimeCallbacks[0]);
        i++) {
     result = cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
-                                 launchCallbacks[i]);
+                                 runtimeCallbacks[i]);
     if (result != CUPTI_SUCCESS) {
       const char *errstr;
       cuptiGetResultString(result, &errstr);
       fprintf(stderr, "[CUPTI] Failed to enable runtime callback %d: %s\n",
-              launchCallbacks[i], errstr);
+              runtimeCallbacks[i], errstr);
+    }
+  }
+
+  // Enable all driver API kernel launch callbacks
+  CUpti_CallbackId driverCallbacks[] = {
+      CUPTI_DRIVER_TRACE_CBID_cuLaunch,
+      CUPTI_DRIVER_TRACE_CBID_cuLaunchGrid,
+      CUPTI_DRIVER_TRACE_CBID_cuLaunchGridAsync,
+      CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel,
+      CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel_ptsz,
+      CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx,
+      CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx_ptsz,
+      CUPTI_DRIVER_TRACE_CBID_cuLaunchCooperativeKernel,
+      CUPTI_DRIVER_TRACE_CBID_cuLaunchCooperativeKernel_ptsz,
+      CUPTI_DRIVER_TRACE_CBID_cuLaunchCooperativeKernelMultiDevice,
+      CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch,
+      CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz,
+  };
+  for (size_t i = 0; i < sizeof(driverCallbacks) / sizeof(driverCallbacks[0]);
+       i++) {
+    result = cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
+                                 driverCallbacks[i]);
+    if (result != CUPTI_SUCCESS) {
+      const char *errstr;
+      cuptiGetResultString(result, &errstr);
+      fprintf(stderr, "[CUPTI] Failed to enable driver callback %d: %s\n",
+              driverCallbacks[i], errstr);
     }
   }
 
@@ -159,28 +190,55 @@ static void print_backtrace(const char *prefix) {
   }
 }
 
-// Callback handler for runtime API
+// Callback handler for driver and runtime API
 static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
                                   CUpti_CallbackId cbid,
                                   const CUpti_CallbackData *cbdata) {
-  if (domain != CUPTI_CB_DOMAIN_RUNTIME_API) {
+  uint32_t correlationId = cbdata->correlationId;
+
+  // Track runtime ENTER so we can skip driver EXIT when they match
+  if (domain == CUPTI_CB_DOMAIN_RUNTIME_API &&
+      cbdata->callbackSite == CUPTI_API_ENTER) {
+    runtimeEnterCorrelationId = correlationId;
     return;
   }
 
   // We hook on EXIT because that makes our probe overhead not add to GPU
   // launch latency and hopefully covers some of the overhead in the shadow of
   // GPU async work.
-  if (cbdata->callbackSite == CUPTI_API_EXIT) {
-    uint32_t correlationId = cbdata->correlationId;
-    const char *name =
-        cbdata->symbolName ? cbdata->symbolName : cbdata->functionName;
+  if (cbdata->callbackSite != CUPTI_API_EXIT) {
+    return;
+  }
 
+  const char *name =
+      cbdata->symbolName ? cbdata->symbolName : cbdata->functionName;
+  int signedCbid;
+
+  if (domain == CUPTI_CB_DOMAIN_DRIVER_API) {
+    // Skip if this driver call is under a runtime call (same correlation ID)
+    if (correlationId == runtimeEnterCorrelationId) {
+      DEBUG_PRINTF(
+          "[CUPTI] Skipping driver EXIT correlationId=%u - runtime will handle\n",
+          correlationId);
+      return;
+    }
+    // Pure driver call (no runtime wrapper) - use negative cbid
+    signedCbid = -(int)cbid;
+    DEBUG_PRINTF(
+        "[CUPTI] Driver API callback: cbid=%d, correlationId=%u, func=%s\n",
+        cbid, correlationId, name);
+  } else if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
+    signedCbid = (int)cbid;
+    runtimeEnterCorrelationId = 0; // Clear after use
     DEBUG_PRINTF(
         "[CUPTI] Runtime API callback: cbid=%d, correlationId=%u, func=%s\n",
         cbid, correlationId, name);
-    outstandingEvents++;
-    DTRACE_PROBE3(parcagpu, cuda_correlation, correlationId, cbid, name);
+  } else {
+    return;
   }
+
+  outstandingEvents++;
+  DTRACE_PROBE3(parcagpu, cuda_correlation, correlationId, signedCbid, name);
   // If we let too many events pile up it overwhelms the perf_event buffers,
   // just another reason to explore just passing the activity buffer through to
   // eBPF.
