@@ -1,0 +1,17 @@
+# Git metadata (especially important for proton submodule)
+.git/
+.gitmodules
+.github/
+
+# Build artifacts (in case they exist in directories we copy)
+build/
+build-*/
+*.o
+*.so
+*.so.*
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json

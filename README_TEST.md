@@ -13,9 +13,9 @@ make test
 ```
 
 This builds:
-- `cupti/build/libparcagpucupti.so` - Production library (CMake + real CUPTI)
-- `zig-out/lib/libcupti.so` - Mock CUPTI for test infrastructure
-- `zig-out/bin/test_cupti_prof` - Test program
+- `build/lib/libparcagpucupti.so` - Production library (CMake)
+- `build/lib/libcupti.so` - Mock CUPTI for test infrastructure
+- `build/bin/test_cupti_prof` - Test program
 
 ## Quick Start
 
@@ -39,7 +39,7 @@ This will:
 
 For extended testing or continuous probe monitoring:
 ```bash
-LD_LIBRARY_PATH=zig-out/lib zig-out/bin/test_cupti_prof zig-out/lib/libparcagpucupti.so --forever
+LD_LIBRARY_PATH=build/lib build/bin/test_cupti_prof build/lib/libparcagpucupti.so --forever
 ```
 
 This runs indefinitely at 1000 events/second until interrupted (Ctrl-C).

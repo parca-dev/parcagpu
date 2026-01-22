@@ -1,0 +1,118 @@
+name: Build
+
+on:
+  push:
+    branches: [main, proton]
+    tags: ['v*']
+  pull_request:
+    branches: [main, proton]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  CUDA_HEADERS: ghcr.io/parca-dev/cuda-headers:12
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build library (amd64)
+        run: |
+          mkdir -p build/amd64
+          docker buildx build -f Dockerfile \
+            --build-arg CUDA_HEADERS=${{ env.CUDA_HEADERS }} \
+            --target export \
+            --output type=local,dest=build/amd64 \
+            --platform linux/amd64 \
+            .
+
+      - name: Verify build artifacts
+        run: |
+          echo "=== Build artifacts ==="
+          ls -lh build/amd64/
+          file build/amd64/libparcagpucupti.so
+          readelf -n build/amd64/libparcagpucupti.so | grep -A2 "stapsdt" | head -20
+
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value={{date 'YYYYMMDD'}}-{{sha}},enable={{is_default_branch}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push multi-arch image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          build-args: |
+            CUDA_HEADERS=${{ env.CUDA_HEADERS }}
+          platforms: linux/amd64,linux/arm64
+          target: runtime
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release-binaries:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and extract binary for ${{ matrix.arch }}
+        run: |
+          mkdir -p build/${{ matrix.arch }}
+          docker buildx build -f Dockerfile \
+            --build-arg CUDA_HEADERS=${{ env.CUDA_HEADERS }} \
+            --target export \
+            --output type=local,dest=build/${{ matrix.arch }} \
+            --platform linux/${{ matrix.arch }} \
+            .
+          mv build/${{ matrix.arch }}/libparcagpucupti.so \
+             build/${{ matrix.arch }}/libparcagpucupti-${{ matrix.arch }}.so
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: build/${{ matrix.arch }}/libparcagpucupti-${{ matrix.arch }}.so
