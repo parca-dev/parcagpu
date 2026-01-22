@@ -134,6 +134,13 @@ CUptiResult cuptiActivityGetNumDroppedRecords(CUcontext context,
     return CUPTI_SUCCESS;
 }
 
+CUptiResult cuptiGetContextId(CUcontext context, uint32_t *contextId) {
+    (void)context;  // Mark as intentionally unused
+    // Return a fixed context ID for testing
+    *contextId = 1;
+    return CUPTI_SUCCESS;
+}
+
 CUptiResult cuptiUnsubscribe(CUpti_SubscriberHandle subscriber) {
     (void)subscriber;  // Mark as intentionally unused
     fprintf(stderr, "[MOCK_CUPTI] cuptiUnsubscribe()\n");
