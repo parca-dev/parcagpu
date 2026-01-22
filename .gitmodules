@@ -1,0 +1,3 @@
+[submodule "proton"]
+	path = proton
+	url = https://github.com/parca-dev/proton.git

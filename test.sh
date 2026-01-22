@@ -21,8 +21,12 @@ for arg in "$@"; do
 done
 
 echo ""
-echo "=== Building test infrastructure with Zig ==="
-zig build
+echo "=== Building test infrastructure with CMake ==="
+mkdir -p build-local
+cd build-local
+cmake ..
+make -j$(nproc)
+cd ..
 
 # Start bpftrace if requested
 if [ "$USE_BPFTRACE" -eq 1 ]; then
@@ -47,12 +51,12 @@ fi
 
 echo ""
 echo "=== Running test program ==="
-# Set LD_LIBRARY_PATH so the test can find libcupti.so at runtime
+# Set LD_LIBRARY_PATH so the test can find libcupti.so and libparcagpucupti.so at runtime
 # Set PARCAGPU_DEBUG to enable debug output
-export LD_LIBRARY_PATH="$(pwd)/zig-out/lib:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="$(pwd)/build-local/lib:$LD_LIBRARY_PATH"
 export PARCAGPU_DEBUG=1
-# Use the CMake-built library with real CUPTI
-zig-out/bin/test_cupti_prof build/$CUDA_MAJOR/$ARCH/libparcagpucupti.so "$@"
+# Run the test program with path to library
+./build-local/bin/test_cupti_prof build-local/lib/libparcagpucupti.so "$@"
 
 # If bpftrace was started, stop it and show results
 if [ "$USE_BPFTRACE" -eq 1 ]; then

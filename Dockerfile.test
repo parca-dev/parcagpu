@@ -9,20 +9,22 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /test
 
 # Create directory structure
-RUN mkdir -p cupti/build-amd64 zig-out/bin zig-out/lib
+RUN mkdir -p build/bin build/lib
 
 # Copy the built library
-COPY cupti/build-amd64/libparcagpucupti.so ./cupti/build-amd64/
+COPY build/lib/libparcagpucupti.so ./build/lib/
 
-# Copy the zig-built test files
-COPY zig-out/bin/test_cupti_prof ./zig-out/bin/
-COPY zig-out/lib/libcupti.so ./zig-out/lib/
-COPY zig-out/lib/libcupti.so.12 ./zig-out/lib/
+# Copy the test files
+COPY build/bin/test_cupti_prof ./build/bin/
+COPY build/lib/libcuda.so ./build/lib/
+COPY build/lib/libcuda.so.1 ./build/lib/
+COPY build/lib/libcupti.so ./build/lib/
+COPY build/lib/libcupti.so.12 ./build/lib/
 
 # Set environment
-ENV LD_LIBRARY_PATH=/test/zig-out/lib
+ENV LD_LIBRARY_PATH=/test/build/lib
 ENV PARCAGPU_DEBUG=1
 
 # Run tests by default
-ENTRYPOINT ["/test/zig-out/bin/test_cupti_prof", "/test/cupti/build-amd64/libparcagpucupti.so"]
+ENTRYPOINT ["/test/build/bin/test_cupti_prof", "/test/build/lib/libparcagpucupti.so"]
 CMD []

@@ -122,6 +122,14 @@ int main(int argc, char **argv) {
     if (run_forever) {
         fprintf(stderr, "Running in continuous mode (Ctrl-C to stop)\n");
     }
+
+    // Pre-load mock CUPTI with RTLD_GLOBAL so its symbols are available
+    // This ensures __cupti_*_callback symbols are in the global namespace
+    void *cupti_handle = dlopen("libcupti.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!cupti_handle) {
+        fprintf(stderr, "Warning: Could not pre-load libcupti.so: %s\n", dlerror());
+    }
+
     void *cupti_prof_handle = dlopen(lib_path, RTLD_NOW | RTLD_GLOBAL);
     if (!cupti_prof_handle) {
         fprintf(stderr, "Failed to load library: %s\n", dlerror());

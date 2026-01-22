@@ -1,52 +1,42 @@
 #!/usr/bin/env bpftrace
 
-/*
- * Simple CUPTI USDT Test
- * Tests the three parcagpu USDT probes
- */
-
-BEGIN
-{
-    printf("Simple CUPTI USDT Test Started\n");
-    printf("Monitoring parcagpu USDT probes...\n\n");
+BEGIN {
+    printf("Monitoring CUDA kernel executions via parcagpu USDT probes...\n");
+    printf("%-20s %-12s %-10s %-10s %-10s %-10s %-10s %-10s %s\n",
+           "TIME", "DURATION_NS", "CORR_ID", "DEVICE", "STREAM", "GRAPH", "NODE", "START", "KERNEL");
 }
 
-// Track graph launches
-// Arguments: start, end, correlationId|deviceId, streamId, graphId
-usdt:cupti/build/libparcagpucupti.so:parcagpu:graph_executed
-{
+usdt:*:parcagpu:kernel_executed {
     $start = arg0;
     $end = arg1;
-    printf("[%d] Graph executed:\n", pid);
-    printf("  start=%lu, end=%lu, duration=%lu ns\n", $start, $end, $end - $start);
-    $devId = arg2 >> 32;
-    $corId = (uint64)arg2 & 0xFFFFFFFF;
-    printf("  correlationId=%u, deviceId=%u, streamId=%u, graphId=%u\n",
-           $corId, $devId, arg3, arg4);
-    @graph_launches = count();
+    $duration = $end - $start;
+    $correlation_id = arg2;
+    $device_id = arg3;
+    $stream_id = arg4;
+    $graph_id = arg5;
+    $graph_node_id = arg6;
+    $kernel_name = str(arg7);
+
+    printf("%-20s %-12lu %-10u %-10u %-10u %-10u %-10lu %-10lu %s\n",
+           strftime("%H:%M:%S.%f", nsecs),
+           $duration,
+           $correlation_id,
+           $device_id,
+           $stream_id,
+           $graph_id,
+           $graph_node_id,
+           $start,
+           $kernel_name);
 }
 
-// Track kernel executions
-// Arguments: start, end, correlationId, deviceId, streamId, name (pointer)
-usdt:cupti/build/libparcagpucupti.so:parcagpu:kernel_executed
-{
-    $start = arg0;
-    $end = arg1;
-    printf("[%d] Kernel executed:\n", pid);
-    printf("  start=%lu, end=%lu, duration=%lu ns\n", $start, $end, $end - $start);
-    $devId = arg2 >>32;
-    $corId = (uint64)arg2 & 0xFFFFFFFF;		
-    printf("  correlationId=%u, deviceId=%u, streamId=%u\n",
-           $corId, $devId, arg3);
-    printf("  name=%s\n", str(arg4));
-    @kernel_executions = count();
+usdt:*:parcagpu:cuda_correlation {
+    $correlation_id = arg0;
+    $cbid = arg1;
+    $name = str(arg2);
+
+    printf("%-20s [CORR] %u: cbid=%u %s\n", strftime("%H:%M:%S.%f", nsecs),$correlation_id, $cbid, $name);
 }
 
-END
-{
-    printf("\n=== Summary ===\n");
-    printf("Graph executions: ");
-    print(@graph_launches);
-    printf("Kernel executions: ");
-    print(@kernel_executions);
+END {
+    printf("\nMonitoring complete.\n");
 }
