@@ -11,24 +11,22 @@ BEGIN
     printf("Monitoring parcagpu USDT probes...\n\n");
 }
 
-// Track graph launches
-// Arguments: start, end, correlationId|deviceId, streamId, graphId
-usdt:cupti/build/libparcagpucupti.so:parcagpu:graph_executed
+
+
+// Track CUDA API correlation events
+// Arguments: correlationId (uint32), signedCbid (int32), name (char*)
+usdt:*:parcagpu:cuda_correlation
 {
-    $start = arg0;
-    $end = arg1;
-    printf("[%d] Graph executed:\n", pid);
-    printf("  start=%lu, end=%lu, duration=%lu ns\n", $start, $end, $end - $start);
-    $devId = arg2 >> 32;
-    $corId = (uint64)arg2 & 0xFFFFFFFF;
-    printf("  correlationId=%u, deviceId=%u, streamId=%u, graphId=%u\n",
-           $corId, $devId, arg3, arg4);
-    @graph_launches = count();
+    $corId = (uint32)arg0;
+    $cbid = (int32)arg1;
+    printf("[%d] cuda_correlation: correlationId=%u, cbid=%d, name=%s\n",
+           pid, $corId, $cbid, str(arg2));
+    @cuda_correlations = count();
 }
 
 // Track kernel executions
 // Arguments: start, end, correlationId, deviceId, streamId, name (pointer)
-usdt:cupti/build/libparcagpucupti.so:parcagpu:kernel_executed
+usdt:*:parcagpu:kernel_executed
 {
     $start = arg0;
     $end = arg1;
@@ -45,8 +43,8 @@ usdt:cupti/build/libparcagpucupti.so:parcagpu:kernel_executed
 END
 {
     printf("\n=== Summary ===\n");
-    printf("Graph executions: ");
-    print(@graph_launches);
+    printf("CUDA correlations: ");
+    print(@cuda_correlations);
     printf("Kernel executions: ");
     print(@kernel_executions);
 }
