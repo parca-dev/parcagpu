@@ -1,4 +1,4 @@
-.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format
+.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug
 
 LIB_NAME = libparcagpucupti.so
 
@@ -48,12 +48,19 @@ cross:
 		.
 	@echo "Runtime container built for both platforms (cached, not loaded into Docker)"
 
-# Local build with CMake (for development/testing)
+# Local build with CMake (for development/testing) - default is Release with symbols
 local:
-	@echo "=== Building locally with CMake ==="
-	@cmake -B build-local -S . -DCMAKE_BUILD_TYPE=Debug
+	@echo "=== Building locally with CMake (RelWithDebInfo) ==="
+	@cmake -B build-local -S . -DCMAKE_BUILD_TYPE=RelWithDebInfo
 	@cmake --build build-local
 	@echo "Local build complete: build-local/lib/$(LIB_NAME)"
+
+# Debug build with CMake (full debug, no optimizations)
+debug:
+	@echo "=== Building debug version with CMake ==="
+	@cmake -B build-local -S . -DCMAKE_BUILD_TYPE=Debug
+	@cmake --build build-local
+	@echo "Debug build complete: build-local/lib/$(LIB_NAME)"
 
 # Run local tests
 test: local
