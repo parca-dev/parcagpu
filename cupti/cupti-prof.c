@@ -33,16 +33,45 @@ static size_t outstandingEvents = 0;
 // runtime calls)
 static __thread uint32_t runtimeEnterCorrelationId = 0;
 
-// Rate limiting
-static __thread uint64_t lastProbeTimeNs = 0;
-static bool limiter_disabled = false;
-#define PROBE_MIN_INTERVAL_NS 500000 // 500μs
+// Rate limiting - token bucket algorithm (configurable via PARCAGPU_RATE_LIMIT)
+static double rateLimitPerSec = 100.0;
+
+// Thread-local token bucket state
+static __thread uint64_t lastRefillNs = 0;
+static __thread double tokens = 0;
+
+// Returns true if the sample should be emitted, false if rate limited
+static bool rateLimiterTryAcquire(uint64_t nowNs) {
+  // Refill tokens based on elapsed time
+  if (lastRefillNs > 0) {
+    double elapsedSec = (nowNs - lastRefillNs) / 1e9;
+    tokens = tokens + elapsedSec * rateLimitPerSec;
+    if (tokens > rateLimitPerSec) {
+      tokens = rateLimitPerSec;
+    }
+  } else {
+    tokens = rateLimitPerSec; // Start with full bucket
+  }
+  lastRefillNs = nowNs;
+
+  if (tokens >= 1.0) {
+    tokens -= 1.0;
+    return true;
+  }
+  return false;
+}
 
 static void init_debug(void) {
   static bool initialized = false;
   if (!initialized) {
     debug_enabled = getenv("PARCAGPU_DEBUG") != NULL;
-    limiter_disabled = getenv("PARCAGPU_LIMITER_DISABLE") != NULL;
+    const char *rateEnv = getenv("PARCAGPU_RATE_LIMIT");
+    if (rateEnv != NULL) {
+      double rate = atof(rateEnv);
+      if (rate > 0) {
+        rateLimitPerSec = rate;
+      }
+    }
     initialized = true;
   }
 }
@@ -244,29 +273,15 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
     return;
   }
 
-  // Check if this is a graph launch (never rate limit these)
-  bool isGraphLaunch = false;
-  if (signedCbid < 0) {
-    // Driver API: cuGraphLaunch = 514, cuGraphLaunch_ptsz = 515
-    int driverCbid = -signedCbid;
-    isGraphLaunch = (driverCbid == 514 || driverCbid == 515);
-  } else {
-    // Runtime API: cudaGraphLaunch = 311, cudaGraphLaunch_ptsz = 312
-    isGraphLaunch = (signedCbid == 311 || signedCbid == 312);
-  }
-
-  // Rate limit probes (skip for graph launches)
-  if (!limiter_disabled && !isGraphLaunch) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint64_t nowNs = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-    if (nowNs - lastProbeTimeNs < PROBE_MIN_INTERVAL_NS) {
-      DEBUG_PRINTF(
-          "[CUPTI] Rate limited: skipping probe for correlationId=%u\n",
-          correlationId);
-      return;
-    }
-    lastProbeTimeNs = nowNs;
+  // Rate limit probes
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  uint64_t nowNs = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+  if (!rateLimiterTryAcquire(nowNs)) {
+    DEBUG_PRINTF(
+        "[CUPTI] Rate limited: skipping probe for correlationId=%u\n",
+        correlationId);
+    return;
   }
 
   outstandingEvents++;
