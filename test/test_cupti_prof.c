@@ -249,7 +249,7 @@ static void (*parcagpuCuptiCallback)(void *userdata, CUpti_CallbackDomain domain
 // Track which correlation IDs have had their callbacks executed
 //=============================================================================
 
-#define MAX_PENDING_ACTIVITIES 100000
+#define MAX_PENDING_ACTIVITIES 1000000
 
 typedef struct {
     uint32_t correlation_ids[MAX_PENDING_ACTIVITIES];
@@ -519,7 +519,11 @@ void *cupti_thread(void *arg) {
             }
         }
 
-        nanosleep(&sleep_time, NULL);
+        // Only sleep if queue is small - skip sleep when there's a backlog to process
+        size_t final_queue_size = get_queue_size();
+        if (final_queue_size < 1000) {
+            nanosleep(&sleep_time, NULL);
+        }
     }
 
     return NULL;
