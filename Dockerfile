@@ -30,13 +30,13 @@ WORKDIR /build/cupti
 COPY --from=cuda12-headers /usr/local/cuda /usr/local/cuda
 
 # Copy source code
-COPY cupti/cupti-prof.c cupti/CMakeLists.txt ./
+COPY cupti/cupti-prof.c cupti/correlation_filter.cpp cupti/correlation_filter.h cupti/CMakeLists.txt ./
 
 # Build the library for CUDA 12
 ENV CUDA_ROOT=/usr/local/cuda
 RUN mkdir -p build && \
     cd build && \
-    cmake -DCUDA_ROOT=${CUDA_ROOT} .. && \
+    cmake -DCUDA_ROOT=${CUDA_ROOT} -DCMAKE_BUILD_TYPE=RelWithDebInfo .. && \
     make VERBOSE=1 && \
     mv libparcagpucupti.so libparcagpucupti.so.12
 
@@ -58,7 +58,7 @@ WORKDIR /build/cupti
 COPY --from=cuda13-headers /usr/local/cuda /usr/local/cuda
 
 # Copy source code
-COPY cupti/cupti-prof.c cupti/CMakeLists.txt ./
+COPY cupti/cupti-prof.c cupti/correlation_filter.cpp cupti/correlation_filter.h cupti/CMakeLists.txt ./
 
 # Build the library for CUDA 13
 ENV CUDA_ROOT=/usr/local/cuda

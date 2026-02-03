@@ -11,6 +11,8 @@
 
 #include <cupti.h>
 
+#include "correlation_filter.h"
+
 // Debug logging control
 static bool debug_enabled = false;
 
@@ -60,6 +62,9 @@ static bool rateLimiterTryAcquire(uint64_t nowNs) {
   }
   return false;
 }
+
+// Correlation ID filter
+static CorrelationFilterHandle correlationFilter = NULL;
 
 static void init_debug(void) {
   static bool initialized = false;
@@ -200,6 +205,14 @@ int InitializeInjection(void) {
     DEBUG_PRINTF("[CUPTI] Enabled CONCURRENT_KERNEL activity\n");
   }
 
+  // Create correlation filter
+  correlationFilter = correlation_filter_create();
+  if (correlationFilter) {
+    DEBUG_PRINTF("[CUPTI] Correlation filter created and enabled\n");
+  } else {
+    fprintf(stderr, "[CUPTI] Warning: Failed to create correlation filter\n");
+  }
+
   atexit(cleanup);
 
   DEBUG_PRINTF("[CUPTI] Successfully initialized CUPTI callbacks with external "
@@ -236,6 +249,7 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
   if (domain == CUPTI_CB_DOMAIN_RUNTIME_API &&
       cbdata->callbackSite == CUPTI_API_ENTER) {
     runtimeEnterCorrelationId = correlationId;
+    DEBUG_PRINTF("[CUPTI] Runtime API ENTER: correlationId=%u\n", correlationId);
     return;
   }
 
@@ -243,6 +257,9 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
   // launch latency and hopefully covers some of the overhead in the shadow of
   // GPU async work.
   if (cbdata->callbackSite != CUPTI_API_EXIT) {
+    if (cbdata->callbackSite == CUPTI_API_ENTER && domain == CUPTI_CB_DOMAIN_DRIVER_API) {
+      DEBUG_PRINTF("[CUPTI] Driver API ENTER: correlationId=%u (will check on EXIT)\n", correlationId);
+    }
     return;
   }
 
@@ -253,22 +270,22 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
   if (domain == CUPTI_CB_DOMAIN_DRIVER_API) {
     // Skip if this driver call is under a runtime call (same correlation ID)
     if (correlationId == runtimeEnterCorrelationId) {
-      DEBUG_PRINTF("[CUPTI] Skipping driver EXIT correlationId=%u - runtime "
+      DEBUG_PRINTF("[CUPTI] Skipping driver EXIT correlationId=%u (runtimeEnter=%u) - runtime "
                    "will handle\n",
-                   correlationId);
+                   correlationId, runtimeEnterCorrelationId);
       return;
     }
     // Pure driver call (no runtime wrapper) - use negative cbid
     signedCbid = -(int)cbid;
     DEBUG_PRINTF(
-        "[CUPTI] Driver API callback: cbid=%d, correlationId=%u, func=%s\n",
-        cbid, correlationId, name);
+        "[CUPTI] Driver API EXIT callback: cbid=%d, correlationId=%u, runtimeEnter=%u, func=%s\n",
+        cbid, correlationId, runtimeEnterCorrelationId, name);
   } else if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
     signedCbid = (int)cbid;
-    runtimeEnterCorrelationId = 0; // Clear after use
     DEBUG_PRINTF(
-        "[CUPTI] Runtime API callback: cbid=%d, correlationId=%u, func=%s\n",
-        cbid, correlationId, name);
+        "[CUPTI] Runtime API EXIT callback: cbid=%d, correlationId=%u, runtimeEnter=%u, func=%s\n",
+        cbid, correlationId, runtimeEnterCorrelationId, name);
+    runtimeEnterCorrelationId = 0; // Clear after use
   } else {
     return;
   }
@@ -286,6 +303,14 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
 
   outstandingEvents++;
   DTRACE_PROBE3(parcagpu, cuda_correlation, correlationId, signedCbid, name);
+
+  // Insert correlation ID into filter so we can match it later in activity buffer
+  if (correlationFilter) {
+    correlation_filter_insert(correlationFilter, correlationId);
+    DEBUG_PRINTF("[CUPTI] Inserted correlationId=%u into filter (size=%zu)\n",
+                 correlationId, correlation_filter_size(correlationFilter));
+  }
+
   // If we let too many events pile up it overwhelms the perf_event buffers,
   // just another reason to explore just passing the activity buffer through to
   // eBPF.
@@ -342,9 +367,26 @@ static void parcagpuBufferCompleted(CUcontext ctx, uint32_t streamId,
                    k->graphId, k->graphNodeId, k->name, k->correlationId,
                    k->deviceId, k->streamId, k->start, k->end,
                    k->end - k->start);
-      DTRACE_PROBE8(parcagpu, kernel_executed, k->start, k->end,
-                    k->correlationId, k->deviceId, k->streamId, k->graphId,
-                    k->graphNodeId, k->name);
+
+      // Check if this correlation ID is in our filter
+      bool should_fire = true;
+      if (correlationFilter) {
+        should_fire = correlation_filter_check_and_remove(correlationFilter, k->correlationId);
+        if (!should_fire) {
+          DEBUG_PRINTF("[CUPTI] Filtered out correlationId=%u (not tracked)\n",
+                       k->correlationId);
+        } else {
+          DEBUG_PRINTF("[CUPTI] Matched correlationId=%u - firing kernel_executed (filter size=%zu)\n",
+                       k->correlationId, correlation_filter_size(correlationFilter));
+        }
+      }
+
+      // Only fire probe if correlation ID was tracked (or filter disabled)
+      if (should_fire) {
+        DTRACE_PROBE8(parcagpu, kernel_executed, k->start, k->end,
+                      k->correlationId, k->deviceId, k->streamId, k->graphId,
+                      k->graphNodeId, k->name);
+      }
     }
   }
 
@@ -386,6 +428,16 @@ void cleanup(void) {
   if (subscriber) {
     cuptiUnsubscribe(subscriber);
     subscriber = 0;
+  }
+
+  // Destroy correlation filter
+  if (correlationFilter) {
+    size_t remaining = correlation_filter_size(correlationFilter);
+    if (remaining > 0) {
+      DEBUG_PRINTF("[CUPTI] Warning: %zu correlation IDs still in filter at cleanup\n", remaining);
+    }
+    correlation_filter_destroy(correlationFilter);
+    correlationFilter = NULL;
   }
 
   DEBUG_PRINTF("[CUPTI] Cleanup completed\n");
