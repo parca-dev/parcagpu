@@ -8,6 +8,11 @@ LIB_NAME = libparcagpucupti.so.$(CUDA_MAJOR)
 # Default target: build all CUDA versions (12 & 13) for both architectures and test infrastructure
 all: cupti-all-versions test-infra
 
+local:
+	mkdir -p build && \
+    cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -B build -S cupti && \
+    cd build && make -j$(nproc)
+
 # Build libparcagpucupti.so for AMD64 using Docker
 cupti-amd64:
 	@echo "=== Building $(LIB_NAME) for AMD64 with Docker (CUDA $(CUDA_MAJOR)) ==="
@@ -104,21 +109,28 @@ push-cuda-headers:
 		.
 	@echo "CUDA header images pushed to $(CUDA_HEADERS_REGISTRY):12 and :13"
 
-# Build test infrastructure with Zig
+# Build test infrastructure with CMake
 test-infra:
-	@echo "=== Building test infrastructure with Zig ==="
-	@zig build
+	@echo "=== Building test infrastructure with CMake ==="
+	@mkdir -p test/build
+	@cd test/build && cmake .. && make
 
 # Run tests (using AMD64 library)
 test: cupti-amd64 test-infra
 	@./test.sh
 
+# Run advanced test (8 GPUs @ 2500 launches/s, multi-threaded)
+test-advanced: cupti-amd64 test-infra
+	@echo "=== Running advanced test (8 GPUs @ 2500 launches/s) ==="
+	@cd test/build && LD_LIBRARY_PATH=.:$$LD_LIBRARY_PATH \
+		./test_cupti_prof ../../build/$(CUDA_MAJOR)/amd64/libparcagpucupti.so \
+		--threads=4 --num-gpus=8 --launch-rate=2500 --duration=10
+
 # Clean build artifacts
 clean:
 	@echo "=== Cleaning build artifacts ==="
 	@rm -rf cupti/build cupti/build-amd64 cupti/build-arm64 build
-	@rm -rf zig-out
-	@rm -rf .zig-cache
+	@rm -rf test/build
 	@echo "Clean complete"
 
 # Build and push multi-arch Docker images to ghcr.io
