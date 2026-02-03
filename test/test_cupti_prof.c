@@ -1,12 +1,16 @@
 #define _POSIX_C_SOURCE 199309L
 #define _XOPEN_SOURCE 600
 #include <dlfcn.h>
+#include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <stdint.h>
@@ -22,6 +26,7 @@ typedef struct {
     int launch_rate;          // Kernel launches per second per GPU
     int graph_rate;           // Graph launches per second per GPU
     int num_gpus;             // Number of GPUs to simulate
+    int num_procs;            // Number of processes to fork (default: 1)
     const char *kernel_names; // Path to kernel names file
     uint64_t duration;        // Run for N seconds (default: 5)
 } TestConfig;
@@ -30,11 +35,18 @@ void print_usage(const char *prog) {
     fprintf(stderr, "Usage: %s <library_path> [options]\n", prog);
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  --threads=N           Number of application threads (default: 1)\n");
-    fprintf(stderr, "  --launch-rate=N       Kernel launches per second per GPU (default: 1000)\n");
+    fprintf(stderr, "                        Total rate is distributed across threads\n");
+    fprintf(stderr, "  --launch-rate=N       Total launches per second per GPU (default: 1000)\n");
+    fprintf(stderr, "                        Total rate = launch-rate * num-gpus\n");
     fprintf(stderr, "  --graph-rate=N        Graph launches per second per GPU (default: 0)\n");
+    fprintf(stderr, "                        Must be <= launch-rate (subset, not additive)\n");
+    fprintf(stderr, "                        Regular kernels = launch-rate - graph-rate\n");
     fprintf(stderr, "  --num-gpus=N          Number of GPUs to simulate (default: 1)\n");
+    fprintf(stderr, "  --procs=N             Number of processes to fork (default: 1)\n");
+    fprintf(stderr, "                        Each process runs independently (multiplies rate)\n");
     fprintf(stderr, "  --kernel-names=FILE   Path to kernel names file (default: generated)\n");
-    fprintf(stderr, "  --duration=N          Run for N seconds (default: 5)\n");
+    fprintf(stderr, "  --duration=N[s|m|h]   Run for N seconds/minutes/hours (default: 5s)\n");
+    fprintf(stderr, "                        Examples: 30s, 5m, 2h\n");
     fprintf(stderr, "  --help, -h            Show this help message\n");
     fprintf(stderr, "\nExamples:\n");
     fprintf(stderr, "  # Simple test (backward compatible)\n");
@@ -45,12 +57,40 @@ void print_usage(const char *prog) {
     fprintf(stderr, "  %s ./libparcagpucupti.so --threads=4 --num-gpus=8 --launch-rate=2500 --duration=10\n\n", prog);
 }
 
+// Parse duration string with optional unit suffix (s/m/h)
+// Examples: "5" or "5s" = 5 seconds, "10m" = 10 minutes, "2h" = 2 hours
+uint64_t parse_duration(const char *str) {
+    char *endptr;
+    long value = strtol(str, &endptr, 10);
+
+    if (value < 0) {
+        fprintf(stderr, "Invalid duration: %s (must be positive)\n", str);
+        exit(1);
+    }
+
+    // Check for unit suffix
+    if (*endptr == '\0' || *endptr == 's') {
+        // No suffix or 's' suffix = seconds
+        return (uint64_t)value;
+    } else if (*endptr == 'm') {
+        // Minutes
+        return (uint64_t)value * 60;
+    } else if (*endptr == 'h') {
+        // Hours
+        return (uint64_t)value * 3600;
+    } else {
+        fprintf(stderr, "Invalid duration unit: %s (use s, m, or h)\n", str);
+        exit(1);
+    }
+}
+
 TestConfig parse_args(int argc, char **argv, const char **lib_path) {
     TestConfig config = {
         .threads = 1,
         .launch_rate = 1000,
         .graph_rate = 0,
         .num_gpus = 1,
+        .num_procs = 1,
         .kernel_names = NULL,
         .duration = 5
     };
@@ -76,15 +116,24 @@ TestConfig parse_args(int argc, char **argv, const char **lib_path) {
             config.graph_rate = atoi(argv[i] + 13);
         } else if (strncmp(argv[i], "--num-gpus=", 11) == 0) {
             config.num_gpus = atoi(argv[i] + 11);
+        } else if (strncmp(argv[i], "--procs=", 8) == 0) {
+            config.num_procs = atoi(argv[i] + 8);
         } else if (strncmp(argv[i], "--kernel-names=", 15) == 0) {
             config.kernel_names = argv[i] + 15;
         } else if (strncmp(argv[i], "--duration=", 11) == 0) {
-            config.duration = atoi(argv[i] + 11);
+            config.duration = parse_duration(argv[i] + 11);
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
             exit(1);
         }
+    }
+
+    // Validate graph_rate
+    if (config.graph_rate > config.launch_rate) {
+        fprintf(stderr, "Error: graph_rate (%d) cannot exceed launch_rate (%d)\n",
+                config.graph_rate, config.launch_rate);
+        exit(1);
     }
 
     return config;
@@ -329,17 +378,27 @@ void *worker_thread(void *arg) {
     // Wait for all threads to be ready
     pthread_barrier_wait(args->start_barrier);
 
-    uint64_t sleep_ns = 1000000000ULL / args->config->launch_rate;
+    // Calculate per-thread launch rate
+    // Total rate = launch_rate * num_gpus, distributed across threads
+    uint64_t per_thread_rate = (args->config->launch_rate * args->config->num_gpus) / args->config->threads;
+    uint64_t sleep_ns = 1000000000ULL / per_thread_rate;
     struct timespec sleep_time = {0, (long)sleep_ns};
 
     uint64_t iterations = 0;
-    uint64_t max_iterations = args->config->duration * args->config->launch_rate;
+    uint64_t max_iterations = args->config->duration * per_thread_rate;
 
     while (!atomic_load(args->should_stop) && iterations < max_iterations) {
         // Generate 5 kernel launches per iteration
         for (int j = 0; j < 5; j++) {
             uint32_t correlationId = atomic_fetch_add(args->global_correlation_id, 1);
-            bool is_graph = (args->config->graph_rate > 0 && correlationId % 3 == 0);
+
+            // Determine if this should be a graph launch based on the graph_rate ratio
+            // Example: if graph_rate=100 and launch_rate=1000, then 1 in 10 launches is a graph
+            bool is_graph = false;
+            if (args->config->graph_rate > 0) {
+                // Use modulo to create a deterministic pattern
+                is_graph = (correlationId % (uint32_t)args->config->launch_rate) < (uint32_t)args->config->graph_rate;
+            }
             bool is_runtime = (correlationId % 2 == 0); // 50% runtime, 50% driver
 
             if (is_graph) {
@@ -373,7 +432,9 @@ void *cupti_thread(void *arg) {
     // Wait for all threads to be ready
     pthread_barrier_wait(args->start_barrier);
 
-    uint32_t graphId = 1000;
+    // Pool of reusable graphExecIds (small numbers that can be reused)
+    uint32_t next_graph_exec_id = 1;
+    const uint32_t MAX_GRAPH_EXEC_ID = 100;
     struct timespec sleep_time = {0, 10000000}; // 10ms - simulates flush period
 
     while (!atomic_load(args->should_stop)) {
@@ -401,28 +462,55 @@ void *cupti_thread(void *arg) {
                 uint64_t duration = generate_kernel_duration_ns(args->config->launch_rate);
                 uint32_t gpu_id = correlationId % args->config->num_gpus;
 
-                // Create activity record directly in the buffer
-                CUpti_ActivityKernel5 *kernel = (CUpti_ActivityKernel5 *)(buffer + offset);
-                kernel->kind = CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL;
-                kernel->correlationId = correlationId;
-                kernel->deviceId = gpu_id;
-                kernel->streamId = 1;
-                kernel->start = now;
-                kernel->end = now + duration;
+                // Determine if this should be a graph launch based on the graph_rate ratio
+                bool is_graph = false;
+                if (args->config->graph_rate > 0) {
+                    is_graph = (correlationId % (uint32_t)args->config->launch_rate) < (uint32_t)args->config->graph_rate;
+                }
 
-                bool is_graph = (args->config->graph_rate > 0 && correlationId % 3 == 0);
                 if (is_graph) {
-                    kernel->graphId = graphId++;
-                    kernel->graphNodeId = 100;
-                    kernel->name = "graph_kernel";
+                    // Graph launches generate multiple kernel activities (10-200)
+                    // All share the same correlationId and graphExecId
+                    uint32_t num_kernels = 10 + (rand() % 191); // Random between 10 and 200
+                    uint32_t graph_exec_id = next_graph_exec_id;
+
+                    // Rotate through the pool of graphExecIds
+                    next_graph_exec_id++;
+                    if (next_graph_exec_id > MAX_GRAPH_EXEC_ID) {
+                        next_graph_exec_id = 1;
+                    }
+
+                    // Generate multiple kernel activities for this graph launch
+                    for (uint32_t i = 0; i < num_kernels && offset + recordSize <= bufferSize; i++) {
+                        CUpti_ActivityKernel5 *kernel = (CUpti_ActivityKernel5 *)(buffer + offset);
+                        kernel->kind = CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL;
+                        kernel->correlationId = correlationId;
+                        kernel->deviceId = gpu_id;
+                        kernel->streamId = 1;
+                        kernel->start = now + (i * 1000); // Stagger start times slightly
+                        kernel->end = kernel->start + duration;
+                        kernel->graphId = graph_exec_id;
+                        kernel->graphNodeId = i; // Increment for each kernel in the graph
+                        kernel->name = "graph_kernel";
+
+                        offset += recordSize;
+                    }
                 } else {
+                    // Regular kernel launch - single activity
+                    CUpti_ActivityKernel5 *kernel = (CUpti_ActivityKernel5 *)(buffer + offset);
+                    kernel->kind = CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL;
+                    kernel->correlationId = correlationId;
+                    kernel->deviceId = gpu_id;
+                    kernel->streamId = 1;
+                    kernel->start = now;
+                    kernel->end = now + duration;
                     kernel->graphId = 0;
                     kernel->graphNodeId = 0;
                     kernel->name = get_next_kernel_name(args->kernel_names);
                     if (!kernel->name) kernel->name = "mock_kernel";
-                }
 
-                offset += recordSize;
+                    offset += recordSize;
+                }
             }
 
             // Complete the buffer (simulates CUPTI calling the completion callback)
@@ -445,8 +533,10 @@ void run_test(TestConfig *config, KernelNameList *kernel_names) {
     fprintf(stderr, "\n=== Starting test ===\n");
     fprintf(stderr, "Threads: %d worker%s + 1 CUPTI thread\n",
             config->threads, config->threads == 1 ? "" : "s");
-    fprintf(stderr, "Total launch rate: %d launches/s (%d per worker)\n",
-            config->threads * config->launch_rate, config->launch_rate);
+    int total_rate = config->launch_rate * config->num_gpus;
+    int per_thread_rate = total_rate / config->threads;
+    fprintf(stderr, "Total launch rate: %d launches/s (%d per GPU, %d per thread)\n",
+            total_rate, config->launch_rate, per_thread_rate);
     fprintf(stderr, "GPUs: %d\n", config->num_gpus);
     fprintf(stderr, "Duration: %lu seconds\n", config->duration);
 
@@ -539,8 +629,37 @@ int main(int argc, char **argv) {
     const char *lib_path;
     TestConfig config = parse_args(argc, argv, &lib_path);
 
-    fprintf(stderr, "Loading library: %s\n", lib_path);
-    fprintf(stderr, "Configuration:\n");
+    // Fork multiple processes if requested
+    pid_t *child_pids = NULL;
+    int proc_id = 0;
+    if (config.num_procs > 1) {
+        child_pids = malloc((config.num_procs - 1) * sizeof(pid_t));
+        for (int i = 1; i < config.num_procs; i++) {
+            pid_t pid = fork();
+            if (pid < 0) {
+                fprintf(stderr, "Failed to fork process %d: %s\n", i, strerror(errno));
+                // Kill already forked children
+                for (int j = 0; j < i - 1; j++) {
+                    kill(child_pids[j], SIGTERM);
+                }
+                return 1;
+            } else if (pid == 0) {
+                // Child process - prevent fork bomb by setting num_procs to 1
+                proc_id = i;
+                config.num_procs = 1;
+                free(child_pids);
+                child_pids = NULL;
+                break;
+            } else {
+                // Parent process
+                child_pids[i - 1] = pid;
+            }
+        }
+    }
+
+    fprintf(stderr, "[Process %d] Loading library: %s\n", proc_id, lib_path);
+    fprintf(stderr, "[Process %d] Configuration:\n", proc_id);
+    fprintf(stderr, "  Processes: %d\n", config.num_procs);
     fprintf(stderr, "  Threads: %d\n", config.threads);
     fprintf(stderr, "  Launch rate: %d/s per GPU\n", config.launch_rate);
     fprintf(stderr, "  Graph rate: %d/s per GPU\n", config.graph_rate);
@@ -617,7 +736,27 @@ int main(int argc, char **argv) {
     if (buffer_completed_cb_ptr) *buffer_completed_cb_ptr = NULL;
 
     dlclose(cupti_prof_handle);
-    fprintf(stderr, "Cleanup complete.\n");
+    fprintf(stderr, "[Process %d] Cleanup complete.\n", proc_id);
+
+    // If parent process, wait for all children to complete
+    if (child_pids != NULL) {
+        fprintf(stderr, "[Process 0] Waiting for %d child processes to complete...\n", config.num_procs - 1);
+        for (int i = 0; i < config.num_procs - 1; i++) {
+            int status;
+            pid_t pid = waitpid(child_pids[i], &status, 0);
+            if (pid > 0) {
+                if (WIFEXITED(status)) {
+                    fprintf(stderr, "[Process 0] Child process %d (PID %d) exited with status %d\n",
+                            i + 1, pid, WEXITSTATUS(status));
+                } else if (WIFSIGNALED(status)) {
+                    fprintf(stderr, "[Process 0] Child process %d (PID %d) terminated by signal %d\n",
+                            i + 1, pid, WTERMSIG(status));
+                }
+            }
+        }
+        free(child_pids);
+        fprintf(stderr, "[Process 0] All child processes completed.\n");
+    }
 
     _exit(0);
 }
