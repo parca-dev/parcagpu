@@ -20,11 +20,22 @@ set_target_properties(cupti PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
-# Create versioned symlink for CUDA 12
+# Detect CUDA major version from CUPTI library
+execute_process(
+    COMMAND bash -c "ls ${CUDA_ROOT}/lib64/libcupti.so.* 2>/dev/null | grep -oE 'libcupti\\.so\\.[0-9]+$' | head -1 | grep -oE '[0-9]+$'"
+    OUTPUT_VARIABLE CUDA_MAJOR_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT CUDA_MAJOR_VERSION)
+    set(CUDA_MAJOR_VERSION "12")
+endif()
+message(STATUS "Detected CUDA major version: ${CUDA_MAJOR_VERSION}")
+
+# Create versioned symlink matching installed CUDA
 add_custom_command(TARGET cupti POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E create_symlink
     $<TARGET_FILE_NAME:cupti>
-    ${CMAKE_CURRENT_BINARY_DIR}/libcupti.so.12
+    ${CMAKE_CURRENT_BINARY_DIR}/libcupti.so.${CUDA_MAJOR_VERSION}
 )
 
 # Test executable
