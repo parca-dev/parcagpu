@@ -1,134 +1,744 @@
 #define _POSIX_C_SOURCE 199309L
+#define _XOPEN_SOURCE 600
 #include <dlfcn.h>
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <cuda.h>
 #include <cupti.h>
 
-// Forward declarations for functions we'll call from the library
+//=============================================================================
+// Configuration
+//=============================================================================
+
+typedef struct {
+    int threads;              // Number of application threads
+    int launch_rate;          // Kernel launches per second per GPU
+    int graph_rate;           // Graph launches per second per GPU
+    int num_gpus;             // Number of GPUs to simulate
+    int num_procs;            // Number of processes to fork (default: 1)
+    const char *kernel_names; // Path to kernel names file
+    uint64_t duration;        // Run for N seconds (default: 5)
+} TestConfig;
+
+void print_usage(const char *prog) {
+    fprintf(stderr, "Usage: %s <library_path> [options]\n", prog);
+    fprintf(stderr, "\nOptions:\n");
+    fprintf(stderr, "  --threads=N           Number of application threads (default: 1)\n");
+    fprintf(stderr, "                        Total rate is distributed across threads\n");
+    fprintf(stderr, "  --launch-rate=N       Total launches per second per GPU (default: 1000)\n");
+    fprintf(stderr, "                        Total rate = launch-rate * num-gpus\n");
+    fprintf(stderr, "  --graph-rate=N        Graph launches per second per GPU (default: 0)\n");
+    fprintf(stderr, "                        Must be <= launch-rate (subset, not additive)\n");
+    fprintf(stderr, "                        Regular kernels = launch-rate - graph-rate\n");
+    fprintf(stderr, "  --num-gpus=N          Number of GPUs to simulate (default: 1)\n");
+    fprintf(stderr, "  --procs=N             Number of processes to fork (default: 1)\n");
+    fprintf(stderr, "                        Each process runs independently (multiplies rate)\n");
+    fprintf(stderr, "  --kernel-names=FILE   Path to kernel names file (default: generated)\n");
+    fprintf(stderr, "  --duration=N[s|m|h]   Run for N seconds/minutes/hours (default: 5s)\n");
+    fprintf(stderr, "                        Examples: 30s, 5m, 2h\n");
+    fprintf(stderr, "  --help, -h            Show this help message\n");
+    fprintf(stderr, "\nExamples:\n");
+    fprintf(stderr, "  # Simple test (backward compatible)\n");
+    fprintf(stderr, "  %s ./libparcagpucupti.so\n\n", prog);
+    fprintf(stderr, "  # 8 GPUs at 2500 launches/s per GPU for 10 seconds\n");
+    fprintf(stderr, "  %s ./libparcagpucupti.so --num-gpus=8 --launch-rate=2500 --duration=10\n\n", prog);
+    fprintf(stderr, "  # Multi-threaded test\n");
+    fprintf(stderr, "  %s ./libparcagpucupti.so --threads=4 --num-gpus=8 --launch-rate=2500 --duration=10\n\n", prog);
+}
+
+// Parse duration string with optional unit suffix (s/m/h)
+// Examples: "5" or "5s" = 5 seconds, "10m" = 10 minutes, "2h" = 2 hours
+uint64_t parse_duration(const char *str) {
+    char *endptr;
+    long value = strtol(str, &endptr, 10);
+
+    if (value < 0) {
+        fprintf(stderr, "Invalid duration: %s (must be positive)\n", str);
+        exit(1);
+    }
+
+    // Check for unit suffix
+    if (*endptr == '\0' || *endptr == 's') {
+        // No suffix or 's' suffix = seconds
+        return (uint64_t)value;
+    } else if (*endptr == 'm') {
+        // Minutes
+        return (uint64_t)value * 60;
+    } else if (*endptr == 'h') {
+        // Hours
+        return (uint64_t)value * 3600;
+    } else {
+        fprintf(stderr, "Invalid duration unit: %s (use s, m, or h)\n", str);
+        exit(1);
+    }
+}
+
+TestConfig parse_args(int argc, char **argv, const char **lib_path) {
+    TestConfig config = {
+        .threads = 1,
+        .launch_rate = 1000,
+        .graph_rate = 0,
+        .num_gpus = 1,
+        .num_procs = 1,
+        .kernel_names = NULL,
+        .duration = 5
+    };
+
+    // Check for help first (can be first arg)
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            exit(0);
+        }
+    }
+
+    // First arg is library path (required)
+    *lib_path = argc > 1 ? argv[1] : "./libparcagpucupti.so";
+
+    // Parse remaining args starting from index 2
+    for (int i = 2; i < argc; i++) {
+        if (strncmp(argv[i], "--threads=", 10) == 0) {
+            config.threads = atoi(argv[i] + 10);
+        } else if (strncmp(argv[i], "--launch-rate=", 14) == 0) {
+            config.launch_rate = atoi(argv[i] + 14);
+        } else if (strncmp(argv[i], "--graph-rate=", 13) == 0) {
+            config.graph_rate = atoi(argv[i] + 13);
+        } else if (strncmp(argv[i], "--num-gpus=", 11) == 0) {
+            config.num_gpus = atoi(argv[i] + 11);
+        } else if (strncmp(argv[i], "--procs=", 8) == 0) {
+            config.num_procs = atoi(argv[i] + 8);
+        } else if (strncmp(argv[i], "--kernel-names=", 15) == 0) {
+            config.kernel_names = argv[i] + 15;
+        } else if (strncmp(argv[i], "--duration=", 11) == 0) {
+            config.duration = parse_duration(argv[i] + 11);
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            print_usage(argv[0]);
+            exit(1);
+        }
+    }
+
+    // Validate graph_rate
+    if (config.graph_rate > config.launch_rate) {
+        fprintf(stderr, "Error: graph_rate (%d) cannot exceed launch_rate (%d)\n",
+                config.graph_rate, config.launch_rate);
+        exit(1);
+    }
+
+    return config;
+}
+
+//=============================================================================
+// Kernel Names
+//=============================================================================
+
+typedef struct {
+    char **names;
+    size_t count;
+    atomic_size_t next_index;
+} KernelNameList;
+
+KernelNameList *load_kernel_names(const char *filepath) {
+    FILE *f = fopen(filepath, "r");
+    if (!f) {
+        fprintf(stderr, "Failed to open kernel names file: %s\n", filepath);
+        return NULL;
+    }
+
+    KernelNameList *list = malloc(sizeof(KernelNameList));
+    list->names = NULL;
+    list->count = 0;
+    atomic_init(&list->next_index, 0);
+
+    char chunk[256];
+    char *line = NULL;
+    size_t line_len = 0;
+    size_t line_cap = 0;
+    size_t capacity = 16;
+    list->names = malloc(capacity * sizeof(char *));
+
+    while (fgets(chunk, sizeof(chunk), f)) {
+        size_t chunk_len = strlen(chunk);
+
+        /* Ensure we have enough space in the accumulated line buffer */
+        if (line_len + chunk_len + 1 > line_cap) {
+            size_t new_cap = line_cap ? line_cap * 2 : 256;
+            while (new_cap < line_len + chunk_len + 1) {
+                new_cap *= 2;
+            }
+            char *new_line = realloc(line, new_cap);
+            if (!new_line) {
+                /* Allocation failure: clean up and abort */
+                free(line);
+                fclose(f);
+                free(list->names);
+                free(list);
+                return NULL;
+            }
+            line = new_line;
+            line_cap = new_cap;
+        }
+
+        memcpy(line + line_len, chunk, chunk_len);
+        line_len += chunk_len;
+
+        /* If this chunk ends with a newline, we have a complete line */
+        if (line_len > 0 && line[line_len - 1] == '\n') {
+            line[--line_len] = '\0'; /* Remove newline */
+
+            if (line_len > 0) {
+                if (list->count >= capacity) {
+                    capacity *= 2;
+                    list->names = realloc(list->names, capacity * sizeof(char *));
+                }
+                list->names[list->count++] = strdup(line);
+            }
+
+            /* Reset for the next line */
+            line_len = 0;
+        }
+    }
+
+    /* Handle the case where the last line does not end with a newline */
+    if (line_len > 0) {
+        line[line_len] = '\0';
+        if (line_len > 0) {
+            if (list->count >= capacity) {
+                capacity *= 2;
+                list->names = realloc(list->names, capacity * sizeof(char *));
+            }
+            list->names[list->count++] = strdup(line);
+        }
+    }
+
+    free(line);
+    fclose(f);
+
+    if (list->count == 0) {
+        free(list->names);
+        free(list);
+        return NULL;
+    }
+
+    fprintf(stderr, "Loaded %zu kernel names from %s\n", list->count, filepath);
+    return list;
+}
+
+const char *get_next_kernel_name(KernelNameList *list) {
+    if (!list || list->count == 0) {
+        return "mock_kernel";
+    }
+
+    size_t idx = atomic_fetch_add(&list->next_index, 1) % list->count;
+    return list->names[idx];
+}
+
+void free_kernel_names(KernelNameList *list) {
+    if (!list) return;
+
+    for (size_t i = 0; i < list->count; i++) {
+        free(list->names[i]);
+    }
+    free(list->names);
+    free(list);
+}
+
+//=============================================================================
+// Timestamp Generation
+//=============================================================================
+
+static inline uint64_t get_current_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static inline uint64_t generate_kernel_duration_ns(int launch_rate_per_gpu) {
+    uint64_t max_duration_ns = 1000000000ULL / launch_rate_per_gpu;
+    uint64_t min_duration_ns = 5000ULL; // 5μs
+    if (max_duration_ns <= min_duration_ns) {
+        return min_duration_ns;
+    }
+    // Random duration between 5μs and max
+    return min_duration_ns + (rand() % (max_duration_ns - min_duration_ns));
+}
+
+//=============================================================================
+// Global State
+//=============================================================================
+
 typedef int (*InitializeInjectionFunc)(void);
 
-// Global callback functions that will be registered by InitializeInjection
+// Callback pointers (set by InitializeInjection)
 static void (*bufferRequestedCallback)(uint8_t **buffer, size_t *size, size_t *maxNumRecords) = NULL;
 static void (*bufferCompletedCallback)(CUcontext ctx, uint32_t streamId, uint8_t *buffer, size_t size, size_t validSize) = NULL;
 static void (*parcagpuCuptiCallback)(void *userdata, CUpti_CallbackDomain domain, CUpti_CallbackId cbid, const CUpti_CallbackData *cbdata) = NULL;
 
-// Helper to create activity buffer with kernel records
-static uint8_t *create_kernel_activity_buffer(size_t *validSize,
-                                               uint32_t correlationId, uint32_t deviceId,
-                                               uint32_t streamId, const char *kernelName) {
-    // Allocate buffer large enough for one kernel record
-    size_t bufferSize = sizeof(CUpti_ActivityKernel5) + 256;
-    uint8_t *buffer = (uint8_t *)malloc(bufferSize);
-    memset(buffer, 0, bufferSize);
+//=============================================================================
+// Launched Kernels Queue
+// Track which correlation IDs have had their callbacks executed
+//=============================================================================
 
-    CUpti_ActivityKernel5 *kernel = (CUpti_ActivityKernel5 *)buffer;
-    kernel->kind = CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL;
-    kernel->correlationId = correlationId;
-    kernel->deviceId = deviceId;
-    kernel->streamId = streamId;
-    kernel->graphId = 0;  // Not a graph launch
-    kernel->graphNodeId = 0;
-    kernel->start = 1000000000UL + (correlationId * 1000000UL);
-    kernel->end = kernel->start + 500000UL;
+#define MAX_PENDING_ACTIVITIES 1000000
 
-    // Copy kernel name
-    char *namePtr = (char *)(buffer + sizeof(CUpti_ActivityKernel5));
-    strncpy(namePtr, kernelName, 255);
-    kernel->name = namePtr;
+typedef struct {
+    uint32_t correlation_ids[MAX_PENDING_ACTIVITIES];
+    size_t write_idx;
+    size_t read_idx;
+    pthread_mutex_t mutex;
+} LaunchedKernelsQueue;
 
-    *validSize = sizeof(CUpti_ActivityKernel5);
-    return buffer;
+static LaunchedKernelsQueue launched_queue;
+
+void init_launched_queue(void) {
+    launched_queue.write_idx = 0;
+    launched_queue.read_idx = 0;
+    pthread_mutex_init(&launched_queue.mutex, NULL);
 }
 
-// Helper to create activity buffer with multiple kernel records for a graph launch
-// This simulates how real graph launches work: N kernel activities with the same
-// correlationId (matching the cudaGraphLaunch) and the same graphId
-static uint8_t *create_graph_kernel_activities_buffer(size_t *validSize,
-                                                       uint32_t correlationId,
-                                                       uint32_t deviceId,
-                                                       uint32_t streamId,
-                                                       uint32_t graphId,
-                                                       int numKernels) {
-    // Allocate buffer large enough for multiple kernel records
-    size_t recordSize = sizeof(CUpti_ActivityKernel5);
-    size_t namesSize = numKernels * 256;
-    size_t bufferSize = (recordSize * numKernels) + namesSize;
-    uint8_t *buffer = (uint8_t *)malloc(bufferSize);
-    memset(buffer, 0, bufferSize);
+void enqueue_launched_kernel(uint32_t correlation_id) {
+    pthread_mutex_lock(&launched_queue.mutex);
+    size_t next_write = (launched_queue.write_idx + 1) % MAX_PENDING_ACTIVITIES;
+    if (next_write != launched_queue.read_idx) {
+        launched_queue.correlation_ids[launched_queue.write_idx] = correlation_id;
+        launched_queue.write_idx = next_write;
+    } else {
+        fprintf(stderr, "WARNING: Launched kernels queue full, dropping correlation ID %u\n", correlation_id);
+    }
+    pthread_mutex_unlock(&launched_queue.mutex);
+}
 
-    // Create multiple kernel records with the SAME correlationId but different graphNodeIds
-    uint64_t baseTime = 1000000000UL + (correlationId * 1000000UL);
-    for (int i = 0; i < numKernels; i++) {
-        CUpti_ActivityKernel5 *kernel = (CUpti_ActivityKernel5 *)(buffer + (i * recordSize));
-        kernel->kind = CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL;
-        kernel->correlationId = correlationId;  // SAME correlationId for all kernels in the graph
-        kernel->deviceId = deviceId;
-        kernel->streamId = streamId;
-        kernel->graphId = graphId;  // Same graphId for all kernels in this graph
-        kernel->graphNodeId = 100 + i;  // Different node IDs
-        kernel->start = baseTime + (i * 100000UL);  // Slightly offset start times
-        kernel->end = kernel->start + 50000UL;
+bool dequeue_launched_kernel(uint32_t *correlation_id) {
+    pthread_mutex_lock(&launched_queue.mutex);
+    if (launched_queue.read_idx == launched_queue.write_idx) {
+        pthread_mutex_unlock(&launched_queue.mutex);
+        return false;
+    }
+    *correlation_id = launched_queue.correlation_ids[launched_queue.read_idx];
+    launched_queue.read_idx = (launched_queue.read_idx + 1) % MAX_PENDING_ACTIVITIES;
+    pthread_mutex_unlock(&launched_queue.mutex);
+    return true;
+}
 
-        // Copy kernel name
-        char *namePtr = (char *)(buffer + (numKernels * recordSize) + (i * 256));
-        snprintf(namePtr, 255, "graph_kernel_%d", i);
-        kernel->name = namePtr;
+size_t get_queue_size(void) {
+    pthread_mutex_lock(&launched_queue.mutex);
+    size_t size;
+    if (launched_queue.write_idx >= launched_queue.read_idx) {
+        size = launched_queue.write_idx - launched_queue.read_idx;
+    } else {
+        size = MAX_PENDING_ACTIVITIES - launched_queue.read_idx + launched_queue.write_idx;
+    }
+    pthread_mutex_unlock(&launched_queue.mutex);
+    return size;
+}
+
+//=============================================================================
+// Callback Simulation
+//=============================================================================
+
+// Counter for simulating dropped graph launches (for testing fallback cleanup)
+static atomic_uint_least32_t graph_launch_counter = ATOMIC_VAR_INIT(0);
+
+void simulate_runtime_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbid, bool should_generate_activities) {
+    CUpti_CallbackData cbdata = {0};
+
+    if (!parcagpuCuptiCallback) {
+        fprintf(stderr, "ERROR: parcagpuCuptiCallback is NULL!\n");
+        return;
     }
 
-    *validSize = recordSize * numKernels;
-    return buffer;
+    // RUNTIME ENTER callback
+    cbdata.callbackSite = CUPTI_API_ENTER;
+    cbdata.correlationId = correlationId;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API, cbid, &cbdata);
+
+    // DRIVER ENTER callback (runtime internally calls driver)
+    cbdata.callbackSite = CUPTI_API_ENTER;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
+                         CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, &cbdata);
+
+    // DRIVER EXIT callback
+    cbdata.callbackSite = CUPTI_API_EXIT;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
+                         CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, &cbdata);
+
+    // RUNTIME EXIT callback
+    cbdata.callbackSite = CUPTI_API_EXIT;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API, cbid, &cbdata);
+
+    // Enqueue this correlation ID for activity generation (unless simulating dropped activities)
+    if (should_generate_activities) {
+        enqueue_launched_kernel(correlationId);
+    }
 }
 
-// Helper to create activity buffer with graph records
-static uint8_t *create_graph_activity_buffer(size_t *validSize,
-                                              uint32_t correlationId, uint32_t deviceId,
-                                              uint32_t streamId, uint32_t graphId) {
-    size_t bufferSize = sizeof(CUpti_ActivityGraphTrace);
-    uint8_t *buffer = (uint8_t *)malloc(bufferSize);
-    memset(buffer, 0, bufferSize);
+void simulate_driver_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbid, bool should_generate_activities) {
+    CUpti_CallbackData cbdata = {0};
 
-    CUpti_ActivityGraphTrace *graph = (CUpti_ActivityGraphTrace *)buffer;
-    graph->kind = CUPTI_ACTIVITY_KIND_GRAPH_TRACE;
-    graph->correlationId = correlationId;
-    graph->deviceId = deviceId;
-    graph->streamId = streamId;
-    graph->graphId = graphId;
-    graph->start = 1000000000UL + (correlationId * 1000000UL);
-    graph->end = graph->start + 300000UL;
+    if (!parcagpuCuptiCallback) {
+        fprintf(stderr, "ERROR: parcagpuCuptiCallback is NULL!\n");
+        return;
+    }
 
-    *validSize = sizeof(CUpti_ActivityGraphTrace);
-    return buffer;
+    // DRIVER ENTER callback
+    cbdata.callbackSite = CUPTI_API_ENTER;
+    cbdata.correlationId = correlationId;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API, cbid, &cbdata);
+
+    // DRIVER EXIT callback
+    cbdata.callbackSite = CUPTI_API_EXIT;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API, cbid, &cbdata);
+
+    // Enqueue this correlation ID for activity generation (unless simulating dropped activities)
+    if (should_generate_activities) {
+        enqueue_launched_kernel(correlationId);
+    }
 }
 
-int main(int argc, char **argv) {
-    const char *lib_path = argc > 1 ? argv[1] : "./libparcagpucupti.so";
-    bool run_forever = false;
+//=============================================================================
+// Multi-threaded Test Infrastructure
+//=============================================================================
 
-    // Check for --forever flag
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--forever") == 0) {
-            run_forever = true;
-            break;
+typedef struct {
+    TestConfig *config;
+    KernelNameList *kernel_names;
+    int thread_id;
+    atomic_uint_least32_t *global_correlation_id;
+    atomic_bool *should_stop;
+    pthread_barrier_t *start_barrier;
+} WorkerThreadArgs;
+
+// Worker thread simulates kernel launches
+void *worker_thread(void *arg) {
+    WorkerThreadArgs *args = (WorkerThreadArgs *)arg;
+
+    // Wait for all threads to be ready
+    pthread_barrier_wait(args->start_barrier);
+
+    // Calculate per-thread launch rate
+    // Total rate = launch_rate * num_gpus, distributed across threads
+    uint64_t per_thread_rate = (args->config->launch_rate * args->config->num_gpus) / args->config->threads;
+    uint64_t sleep_ns = 1000000000ULL / per_thread_rate;
+    struct timespec sleep_time = {0, (long)sleep_ns};
+
+    uint64_t iterations = 0;
+    uint64_t max_iterations = args->config->duration * per_thread_rate;
+
+    while (!atomic_load(args->should_stop) && iterations < max_iterations) {
+        // Generate 5 kernel launches per iteration
+        for (int j = 0; j < 5; j++) {
+            uint32_t correlationId = atomic_fetch_add(args->global_correlation_id, 1);
+
+            // Determine if this should be a graph launch based on the graph_rate ratio
+            // Example: if graph_rate=100 and launch_rate=1000, then 1 in 10 launches is a graph
+            bool is_graph = false;
+            if (args->config->graph_rate > 0) {
+                // Use modulo to create a deterministic pattern
+                is_graph = (correlationId % (uint32_t)args->config->launch_rate) < (uint32_t)args->config->graph_rate;
+            }
+            bool is_runtime = (correlationId % 2 == 0); // 50% runtime, 50% driver
+
+            // For graph launches, simulate dropped activities (every 100th graph launch)
+            // This tests the fallback cleanup logic for entries that never see kernels
+            bool should_generate_activities = true;
+            if (is_graph) {
+                uint32_t graph_count = atomic_fetch_add(&graph_launch_counter, 1);
+                if ((graph_count % 100) == 0) {
+                    should_generate_activities = false;
+                    fprintf(stderr, "[TEST] Simulating dropped graph launch for correlationId=%u (graph #%u)\n",
+                            correlationId, graph_count);
+                }
+            }
+
+            if (is_graph) {
+                if (is_runtime) {
+                    simulate_runtime_kernel_launch(correlationId, CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000, should_generate_activities);
+                } else {
+                    simulate_driver_kernel_launch(correlationId, CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch, should_generate_activities);
+                }
+            } else {
+                if (is_runtime) {
+                    simulate_runtime_kernel_launch(correlationId, CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000, true);
+                } else {
+                    simulate_driver_kernel_launch(correlationId, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, true);
+                }
+            }
+        }
+
+        nanosleep(&sleep_time, NULL);
+        iterations++;
+    }
+
+    return NULL;
+}
+
+// Dedicated CUPTI thread processes activity buffers
+// Simulates CUPTI's periodic flush behavior by batching multiple activities into buffers
+// Only generates activities for correlation IDs that have had callbacks executed
+void *cupti_thread(void *arg) {
+    WorkerThreadArgs *args = (WorkerThreadArgs *)arg;
+
+    // Wait for all threads to be ready
+    pthread_barrier_wait(args->start_barrier);
+
+    // Pool of reusable graphExecIds (small numbers that can be reused)
+    uint32_t next_graph_exec_id = 1;
+    const uint32_t MAX_GRAPH_EXEC_ID = 100;
+    struct timespec sleep_time = {0, 10000000}; // 10ms - simulates flush period
+
+    while (!atomic_load(args->should_stop)) {
+        size_t queue_size = get_queue_size();
+
+        // Only flush if we have pending activities
+        if (queue_size > 0 && bufferRequestedCallback && bufferCompletedCallback) {
+            // Request a buffer from the profiler (simulates CUPTI requesting a buffer)
+            uint8_t *buffer;
+            size_t bufferSize;
+            size_t maxNumRecords;
+            bufferRequestedCallback(&buffer, &bufferSize, &maxNumRecords);
+
+            // Fill the buffer with activity records for launched kernels
+            size_t offset = 0;
+            size_t recordSize = sizeof(CUpti_ActivityKernel5);
+
+            // Dequeue and process as many launched kernels as will fit in the buffer
+            uint32_t correlationId;
+            while (dequeue_launched_kernel(&correlationId) &&
+                   offset + recordSize <= bufferSize &&
+                   !atomic_load(args->should_stop)) {
+
+                uint64_t now = get_current_time_ns();
+                uint64_t duration = generate_kernel_duration_ns(args->config->launch_rate);
+                uint32_t gpu_id = correlationId % args->config->num_gpus;
+
+                // Determine if this should be a graph launch based on the graph_rate ratio
+                bool is_graph = false;
+                if (args->config->graph_rate > 0) {
+                    is_graph = (correlationId % (uint32_t)args->config->launch_rate) < (uint32_t)args->config->graph_rate;
+                }
+
+                if (is_graph) {
+                    // Graph launches generate multiple kernel activities (10-200)
+                    // All share the same correlationId and graphExecId
+                    uint32_t num_kernels = 10 + (rand() % 191); // Random between 10 and 200
+                    uint32_t graph_exec_id = next_graph_exec_id;
+
+                    // Rotate through the pool of graphExecIds
+                    next_graph_exec_id++;
+                    if (next_graph_exec_id > MAX_GRAPH_EXEC_ID) {
+                        next_graph_exec_id = 1;
+                    }
+
+                    // Generate multiple kernel activities for this graph launch
+                    for (uint32_t i = 0; i < num_kernels && offset + recordSize <= bufferSize; i++) {
+                        CUpti_ActivityKernel5 *kernel = (CUpti_ActivityKernel5 *)(buffer + offset);
+                        kernel->kind = CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL;
+                        kernel->correlationId = correlationId;
+                        kernel->deviceId = gpu_id;
+                        kernel->streamId = 1;
+                        kernel->start = now + (i * 1000); // Stagger start times slightly
+                        kernel->end = kernel->start + duration;
+                        kernel->graphId = graph_exec_id;
+                        kernel->graphNodeId = i; // Increment for each kernel in the graph
+                        kernel->name = "graph_kernel";
+
+                        offset += recordSize;
+                    }
+                } else {
+                    // Regular kernel launch - single activity
+                    CUpti_ActivityKernel5 *kernel = (CUpti_ActivityKernel5 *)(buffer + offset);
+                    kernel->kind = CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL;
+                    kernel->correlationId = correlationId;
+                    kernel->deviceId = gpu_id;
+                    kernel->streamId = 1;
+                    kernel->start = now;
+                    kernel->end = now + duration;
+                    kernel->graphId = 0;
+                    kernel->graphNodeId = 0;
+                    kernel->name = get_next_kernel_name(args->kernel_names);
+                    if (!kernel->name) kernel->name = "mock_kernel";
+
+                    offset += recordSize;
+                }
+            }
+
+            // Complete the buffer (simulates CUPTI calling the completion callback)
+            if (offset > 0) {
+                bufferCompletedCallback(NULL, 1, buffer, bufferSize, offset);
+            }
+        }
+
+        // Only sleep if queue is small - skip sleep when there's a backlog to process
+        size_t final_queue_size = get_queue_size();
+        if (final_queue_size < 1000) {
+            nanosleep(&sleep_time, NULL);
         }
     }
 
-    fprintf(stderr, "Loading library: %s\n", lib_path);
-    if (run_forever) {
-        fprintf(stderr, "Running in continuous mode (Ctrl-C to stop)\n");
+    return NULL;
+}
+
+//=============================================================================
+// Test Runner
+//=============================================================================
+
+void run_test(TestConfig *config, KernelNameList *kernel_names) {
+    fprintf(stderr, "\n=== Starting test ===\n");
+    fprintf(stderr, "Threads: %d worker%s + 1 CUPTI thread\n",
+            config->threads, config->threads == 1 ? "" : "s");
+    int total_rate = config->launch_rate * config->num_gpus;
+    int per_thread_rate = total_rate / config->threads;
+    fprintf(stderr, "Total launch rate: %d launches/s (%d per GPU, %d per thread)\n",
+            total_rate, config->launch_rate, per_thread_rate);
+    fprintf(stderr, "GPUs: %d\n", config->num_gpus);
+    fprintf(stderr, "Duration: %lu seconds\n", config->duration);
+
+    // Initialize the launched kernels queue
+    init_launched_queue();
+
+    atomic_uint_least32_t global_correlation_id;
+    atomic_init(&global_correlation_id, 1);
+
+    atomic_bool should_stop;
+    atomic_init(&should_stop, false);
+
+    // Create barrier for synchronized start (workers + CUPTI thread)
+    pthread_barrier_t start_barrier;
+    pthread_barrier_init(&start_barrier, NULL, config->threads + 1);
+
+    // Create worker threads
+    WorkerThreadArgs *worker_args = malloc(config->threads * sizeof(WorkerThreadArgs));
+    pthread_t *worker_threads = malloc(config->threads * sizeof(pthread_t));
+
+    for (int i = 0; i < config->threads; i++) {
+        worker_args[i].config = config;
+        worker_args[i].kernel_names = kernel_names;
+        worker_args[i].thread_id = i;
+        worker_args[i].global_correlation_id = &global_correlation_id;
+        worker_args[i].should_stop = &should_stop;
+        worker_args[i].start_barrier = &start_barrier;
+
+        if (pthread_create(&worker_threads[i], NULL, worker_thread, &worker_args[i]) != 0) {
+            fprintf(stderr, "Failed to create worker thread %d\n", i);
+            atomic_store(&should_stop, true);
+            for (int j = 0; j < i; j++) {
+                pthread_join(worker_threads[j], NULL);
+            }
+            free(worker_args);
+            free(worker_threads);
+            pthread_barrier_destroy(&start_barrier);
+            return;
+        }
     }
+
+    // Create CUPTI thread
+    pthread_t cupti_pthread;
+    WorkerThreadArgs cupti_args = {
+        .config = config,
+        .kernel_names = kernel_names,
+        .thread_id = -1,
+        .global_correlation_id = &global_correlation_id,
+        .should_stop = &should_stop,
+        .start_barrier = &start_barrier
+    };
+
+    if (pthread_create(&cupti_pthread, NULL, cupti_thread, &cupti_args) != 0) {
+        fprintf(stderr, "Failed to create CUPTI thread\n");
+        atomic_store(&should_stop, true);
+        for (int i = 0; i < config->threads; i++) {
+            pthread_join(worker_threads[i], NULL);
+        }
+        free(worker_args);
+        free(worker_threads);
+        pthread_barrier_destroy(&start_barrier);
+        return;
+    }
+
+    fprintf(stderr, "All threads started, running for %lu seconds...\n", config->duration);
+
+    // Wait for duration then signal stop
+    sleep(config->duration);
+    atomic_store(&should_stop, true);
+
+    // Wait for all threads to complete
+    for (int i = 0; i < config->threads; i++) {
+        pthread_join(worker_threads[i], NULL);
+    }
+    pthread_join(cupti_pthread, NULL);
+
+    uint32_t total_events = atomic_load(&global_correlation_id) - 1;
+    fprintf(stderr, "Test completed. Generated %u events\n", total_events);
+
+    free(worker_args);
+    free(worker_threads);
+    pthread_barrier_destroy(&start_barrier);
+}
+
+//=============================================================================
+// Main
+//=============================================================================
+
+int main(int argc, char **argv) {
+    const char *lib_path;
+    TestConfig config = parse_args(argc, argv, &lib_path);
+
+    // Fork multiple processes if requested
+    pid_t *child_pids = NULL;
+    int proc_id = 0;
+    if (config.num_procs > 1) {
+        child_pids = malloc((config.num_procs - 1) * sizeof(pid_t));
+        for (int i = 1; i < config.num_procs; i++) {
+            pid_t pid = fork();
+            if (pid < 0) {
+                fprintf(stderr, "Failed to fork process %d: %s\n", i, strerror(errno));
+                // Kill already forked children
+                for (int j = 0; j < i - 1; j++) {
+                    kill(child_pids[j], SIGTERM);
+                }
+                return 1;
+            } else if (pid == 0) {
+                // Child process - prevent fork bomb by setting num_procs to 1
+                proc_id = i;
+                config.num_procs = 1;
+                free(child_pids);
+                child_pids = NULL;
+                break;
+            } else {
+                // Parent process
+                child_pids[i - 1] = pid;
+            }
+        }
+    }
+
+    fprintf(stderr, "[Process %d] Loading library: %s\n", proc_id, lib_path);
+    fprintf(stderr, "[Process %d] Configuration:\n", proc_id);
+    fprintf(stderr, "  Processes: %d\n", config.num_procs);
+    fprintf(stderr, "  Threads: %d\n", config.threads);
+    fprintf(stderr, "  Launch rate: %d/s per GPU\n", config.launch_rate);
+    fprintf(stderr, "  Graph rate: %d/s per GPU\n", config.graph_rate);
+    fprintf(stderr, "  Num GPUs: %d\n", config.num_gpus);
+    fprintf(stderr, "  Duration: %lu seconds\n", config.duration);
+    if (config.kernel_names) {
+        fprintf(stderr, "  Kernel names: %s\n", config.kernel_names);
+    }
+
     void *cupti_prof_handle = dlopen(lib_path, RTLD_NOW | RTLD_GLOBAL);
     if (!cupti_prof_handle) {
         fprintf(stderr, "Failed to load library: %s\n", dlerror());
         return 1;
     }
 
-    // Get InitializeInjection function
     InitializeInjectionFunc initFunc = (InitializeInjectionFunc)dlsym(cupti_prof_handle, "InitializeInjection");
     if (!initFunc) {
         fprintf(stderr, "Failed to find InitializeInjection: %s\n", dlerror());
@@ -136,144 +746,81 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Call InitializeInjection first to register callbacks
     fprintf(stderr, "Calling InitializeInjection...\n");
     int result = initFunc();
     fprintf(stderr, "InitializeInjection returned: %d\n", result);
 
-    // Now get pointers to the global callback variables from mock CUPTI
+    // Get callback pointers from mock CUPTI
     void **runtime_api_cb_ptr = (void **)dlsym(RTLD_DEFAULT, "__cupti_runtime_api_callback");
     void **buffer_requested_cb_ptr = (void **)dlsym(RTLD_DEFAULT, "__cupti_buffer_requested_callback");
     void **buffer_completed_cb_ptr = (void **)dlsym(RTLD_DEFAULT, "__cupti_buffer_completed_callback");
 
-    fprintf(stderr, "Looking for callbacks: runtime=%p, requested=%p, completed=%p\n",
-            (void *)runtime_api_cb_ptr, (void *)buffer_requested_cb_ptr, (void *)buffer_completed_cb_ptr);
-
-    // Dereference to get the actual callback functions
     if (runtime_api_cb_ptr) {
         parcagpuCuptiCallback = (void (*)(void *, CUpti_CallbackDomain, CUpti_CallbackId, const CUpti_CallbackData *))*runtime_api_cb_ptr;
-        fprintf(stderr, "Got runtime callback: %p\n", (void *)parcagpuCuptiCallback);
     }
     if (buffer_requested_cb_ptr) {
         bufferRequestedCallback = (void (*)(uint8_t **, size_t *, size_t *))*buffer_requested_cb_ptr;
     }
     if (buffer_completed_cb_ptr) {
         bufferCompletedCallback = (void (*)(CUcontext, uint32_t, uint8_t *, size_t, size_t))*buffer_completed_cb_ptr;
-        fprintf(stderr, "Got buffer completed callback: %p\n", (void *)bufferCompletedCallback);
     }
 
-    // Check if we have the callback pointers
     if (!parcagpuCuptiCallback || !bufferCompletedCallback) {
         fprintf(stderr, "Warning: Could not get callback pointers from mock CUPTI.\n");
-        fprintf(stderr, "Test will run but won't be able to simulate full callback flow.\n");
-        fprintf(stderr, "The library is loaded and InitializeInjection was called successfully.\n");
-
-        // Sleep for a bit to keep the library loaded
-        fprintf(stderr, "Keeping library loaded for 5 seconds...\n");
-        sleep(5);
-
         dlclose(cupti_prof_handle);
         return 0;
     }
 
-    // Now simulate CUPTI callbacks
-    fprintf(stderr, "\n=== Starting test simulation (1000 events/second) ===\n");
-    fprintf(stderr, "Graph launches will have 3 kernel activities each with the same correlationId\n");
-
-    uint32_t correlationId = 1;
-    uint32_t graphId = 1000;  // Start with graphId 1000
-    struct timespec sleep_time = {0, 1000000}; // 1ms sleep = 1000 events/second
-
-    for (int i = 0; run_forever || i < 100; i++) {
-        // Simulate a batch of kernel launches
-        for (int j = 0; j < 5; j++) {
-            CUpti_CallbackData cbdata = {0};
-            cbdata.callbackSite = CUPTI_API_EXIT;
-            cbdata.correlationId = correlationId;
-
-            // Alternate between kernel and graph launches
-            if (correlationId % 3 == 0) {
-                // Graph launch - this will have multiple kernel activities with same correlationId
-                parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API,
-                                   CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000,
-                                   &cbdata);
-            } else {
-                // Regular kernel launch - this will have one kernel activity
-                parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API,
-                                   CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000,
-                                   &cbdata);
-            }
-
-            correlationId++;
-        }
-
-        // After every 2 batches, simulate buffer completion with activity records
-        if (i % 2 == 0 && i > 0) {
-            for (int k = 0; k < 5; k++) {
-                uint32_t recCorrelationId = correlationId - 10 + k;
-                uint8_t *activityData;
-                size_t validSize;
-
-                // Create activity data (this is temporary, not the actual buffer)
-                if (recCorrelationId % 3 == 0) {
-                    // Graph launch: create buffer with 3 kernel activities sharing the same correlationId
-                    activityData = create_graph_kernel_activities_buffer(&validSize, recCorrelationId, 0, 1, graphId, 3);
-                    graphId++;  // Different graphId for next graph
-                } else {
-                    // Regular kernel launch: single kernel activity
-                    activityData = create_kernel_activity_buffer(&validSize, recCorrelationId, 0, 1, "mock_cuda_kernel_name");
-                }
-
-                // Request a buffer from the callback (this will allocate it properly)
-                uint8_t *buffer;
-                size_t bufferSize;
-                size_t maxNumRecords;
-                if (bufferRequestedCallback) {
-                    bufferRequestedCallback(&buffer, &bufferSize, &maxNumRecords);
-
-                    // Copy the activity data into the buffer
-                    memcpy(buffer, activityData, validSize);
-
-                    // Now call bufferCompleted with the proper buffer (it will free it)
-                    bufferCompletedCallback(NULL, 1, buffer, bufferSize, validSize);
-                }
-
-                // Free the temporary activity data
-                free(activityData);
-            }
-        }
-
-        nanosleep(&sleep_time, NULL);
-
-        // Print status periodically when running forever
-        if (run_forever && i % 100 == 0) {
-            fprintf(stderr, "[Status] Generated %d events so far...\n", correlationId - 1);
+    // Load kernel names if specified
+    KernelNameList *kernel_names = NULL;
+    if (config.kernel_names) {
+        kernel_names = load_kernel_names(config.kernel_names);
+        if (!kernel_names) {
+            fprintf(stderr, "Warning: Failed to load kernel names, using generated names\n");
         }
     }
 
-    if (!run_forever) {
-        fprintf(stderr, "\n=== Test completed. Generated ~%d events ===\n", correlationId - 1);
-    }
-    fprintf(stderr, "Library will be unloaded, triggering cleanup...\n");
+    // Initialize random seed for duration generation
+    srand(time(NULL));
 
-    // Call cleanup explicitly before closing the library to avoid atexit handler issues
+    // Run test
+    run_test(&config, kernel_names);
+
+    // Cleanup
+    free_kernel_names(kernel_names);
+
     typedef void (*CleanupFunc)(void);
     CleanupFunc cleanup = (CleanupFunc)dlsym(cupti_prof_handle, "cleanup");
     if (cleanup) {
         cleanup();
     }
 
-    // Clear the callback pointers before closing to avoid crashes during cleanup
     if (runtime_api_cb_ptr) *runtime_api_cb_ptr = NULL;
     if (buffer_requested_cb_ptr) *buffer_requested_cb_ptr = NULL;
     if (buffer_completed_cb_ptr) *buffer_completed_cb_ptr = NULL;
 
     dlclose(cupti_prof_handle);
-    fprintf(stderr, "Cleanup complete.\n");
+    fprintf(stderr, "[Process %d] Cleanup complete.\n", proc_id);
 
-    // Note: We use _exit instead of return to avoid the atexit handler registered
-    // by the library from being called after we've already closed it with dlclose.
-    // The cleanup() function is now idempotent, so in real usage (where the library
-    // isn't dynamically closed) the atexit handler works correctly.
+    // If parent process, wait for all children to complete
+    if (child_pids != NULL) {
+        fprintf(stderr, "[Process 0] Waiting for %d child processes to complete...\n", config.num_procs - 1);
+        for (int i = 0; i < config.num_procs - 1; i++) {
+            int status;
+            pid_t pid = waitpid(child_pids[i], &status, 0);
+            if (pid > 0) {
+                if (WIFEXITED(status)) {
+                    fprintf(stderr, "[Process 0] Child process %d (PID %d) exited with status %d\n",
+                            i + 1, pid, WEXITSTATUS(status));
+                } else if (WIFSIGNALED(status)) {
+                    fprintf(stderr, "[Process 0] Child process %d (PID %d) terminated by signal %d\n",
+                            i + 1, pid, WTERMSIG(status));
+                }
+            }
+        }
+        free(child_pids);
+        fprintf(stderr, "[Process 0] All child processes completed.\n");
+    }
+
     _exit(0);
 }
