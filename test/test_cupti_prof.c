@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <cuda.h>
+#include <cuda_runtime.h>
 #include <cupti.h>
 
 //=============================================================================
@@ -350,59 +351,172 @@ size_t get_queue_size(void) {
 // Counter for simulating dropped graph launches (for testing fallback cleanup)
 static atomic_uint_least32_t graph_launch_counter = ATOMIC_VAR_INIT(0);
 
-void simulate_runtime_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbid, bool should_generate_activities) {
-    CUpti_CallbackData cbdata = {0};
+//-----------------------------------------------------------------------------
+// Fake CUDA API functions to make stack traces look realistic
+// These functions exist solely to appear in the call stack when the profiler
+// captures a stack sample during a kernel/graph launch callback.
+//-----------------------------------------------------------------------------
 
+// Prevent inlining so these functions appear in the stack
+#define NOINLINE __attribute__((noinline))
+
+// Thread-local storage for passing data to fake CUDA API functions
+static __thread uint32_t tls_correlation_id;
+static __thread CUpti_CallbackData tls_cbdata;
+static __thread bool tls_should_generate_activities;
+
+// Driver API kernel launch - calls the callback with cuLaunchKernel in the stack
+NOINLINE CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
+                                  unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY,
+                                  unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream,
+                                  void **kernelParams, void **extra) {
+    (void)f; (void)gridDimX; (void)gridDimY; (void)gridDimZ;
+    (void)blockDimX; (void)blockDimY; (void)blockDimZ;
+    (void)sharedMemBytes; (void)hStream; (void)kernelParams; (void)extra;
+
+    // DRIVER ENTER callback
+    tls_cbdata.callbackSite = CUPTI_API_ENTER;
+    tls_cbdata.correlationId = tls_correlation_id;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
+                         CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, &tls_cbdata);
+
+    // DRIVER EXIT callback
+    tls_cbdata.callbackSite = CUPTI_API_EXIT;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
+                         CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, &tls_cbdata);
+
+    return CUDA_SUCCESS;
+}
+
+// Driver API graph launch - calls the callback with cuGraphLaunch in the stack
+NOINLINE CUresult cuGraphLaunch(CUgraphExec hGraphExec, CUstream hStream) {
+    (void)hGraphExec; (void)hStream;
+
+    // DRIVER ENTER callback
+    tls_cbdata.callbackSite = CUPTI_API_ENTER;
+    tls_cbdata.correlationId = tls_correlation_id;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
+                         CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch, &tls_cbdata);
+
+    // DRIVER EXIT callback
+    tls_cbdata.callbackSite = CUPTI_API_EXIT;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
+                         CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch, &tls_cbdata);
+
+    // Enqueue for activity generation
+    if (tls_should_generate_activities) {
+        enqueue_launched_kernel(tls_correlation_id);
+    }
+
+    return CUDA_SUCCESS;
+}
+
+// Runtime API kernel launch - calls the callback with cudaLaunchKernel in the stack
+NOINLINE cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
+                                       void **args, size_t sharedMem, cudaStream_t stream) {
+    (void)func; (void)gridDim; (void)blockDim; (void)args; (void)sharedMem; (void)stream;
+
+    // RUNTIME ENTER callback
+    tls_cbdata.callbackSite = CUPTI_API_ENTER;
+    tls_cbdata.correlationId = tls_correlation_id;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API,
+                         CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000, &tls_cbdata);
+
+    // Runtime internally calls driver - call through cuLaunchKernel so it appears in stack
+    cuLaunchKernel(NULL, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL);
+
+    // RUNTIME EXIT callback
+    tls_cbdata.callbackSite = CUPTI_API_EXIT;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API,
+                         CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000, &tls_cbdata);
+
+    return cudaSuccess;
+}
+
+// Runtime API graph launch - calls the callback with cudaGraphLaunch in the stack
+NOINLINE cudaError_t cudaGraphLaunch(cudaGraphExec_t graphExec, cudaStream_t stream) {
+    (void)graphExec; (void)stream;
+
+    // RUNTIME ENTER callback
+    tls_cbdata.callbackSite = CUPTI_API_ENTER;
+    tls_cbdata.correlationId = tls_correlation_id;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API,
+                         CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000, &tls_cbdata);
+
+    // Runtime internally calls driver - use inline driver callback with cuGraphLaunch cbid
+    // (We don't call cuGraphLaunch here to avoid double-queueing)
+    tls_cbdata.callbackSite = CUPTI_API_ENTER;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
+                         CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch, &tls_cbdata);
+
+    tls_cbdata.callbackSite = CUPTI_API_EXIT;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
+                         CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch, &tls_cbdata);
+
+    // RUNTIME EXIT callback
+    tls_cbdata.callbackSite = CUPTI_API_EXIT;
+    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API,
+                         CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000, &tls_cbdata);
+
+    // Enqueue for activity generation
+    if (tls_should_generate_activities) {
+        enqueue_launched_kernel(tls_correlation_id);
+    }
+
+    return cudaSuccess;
+}
+
+//-----------------------------------------------------------------------------
+// Simulation functions that call through the fake CUDA APIs
+//-----------------------------------------------------------------------------
+
+void simulate_runtime_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbid, bool should_generate_activities) {
     if (!parcagpuCuptiCallback) {
         fprintf(stderr, "ERROR: parcagpuCuptiCallback is NULL!\n");
         return;
     }
 
-    // RUNTIME ENTER callback
-    cbdata.callbackSite = CUPTI_API_ENTER;
-    cbdata.correlationId = correlationId;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API, cbid, &cbdata);
+    // Set up thread-local data for the fake CUDA API functions
+    tls_correlation_id = correlationId;
+    memset(&tls_cbdata, 0, sizeof(tls_cbdata));
+    tls_should_generate_activities = should_generate_activities;
 
-    // DRIVER ENTER callback (runtime internally calls driver)
-    cbdata.callbackSite = CUPTI_API_ENTER;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
-                         CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, &cbdata);
-
-    // DRIVER EXIT callback
-    cbdata.callbackSite = CUPTI_API_EXIT;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
-                         CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, &cbdata);
-
-    // RUNTIME EXIT callback
-    cbdata.callbackSite = CUPTI_API_EXIT;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API, cbid, &cbdata);
-
-    // Enqueue this correlation ID for activity generation (unless simulating dropped activities)
-    if (should_generate_activities) {
-        enqueue_launched_kernel(correlationId);
+    if (cbid == CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000) {
+        // Graph launch - call through cudaGraphLaunch
+        cudaGraphLaunch(NULL, NULL);
+    } else {
+        // Kernel launch - call through cudaLaunchKernel
+        dim3 grid = {1, 1, 1};
+        dim3 block = {1, 1, 1};
+        cudaLaunchKernel(NULL, grid, block, NULL, 0, NULL);
+        // Enqueue for activity generation
+        if (should_generate_activities) {
+            enqueue_launched_kernel(correlationId);
+        }
     }
 }
 
 void simulate_driver_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbid, bool should_generate_activities) {
-    CUpti_CallbackData cbdata = {0};
-
     if (!parcagpuCuptiCallback) {
         fprintf(stderr, "ERROR: parcagpuCuptiCallback is NULL!\n");
         return;
     }
 
-    // DRIVER ENTER callback
-    cbdata.callbackSite = CUPTI_API_ENTER;
-    cbdata.correlationId = correlationId;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API, cbid, &cbdata);
+    // Set up thread-local data for the fake CUDA API functions
+    tls_correlation_id = correlationId;
+    memset(&tls_cbdata, 0, sizeof(tls_cbdata));
+    tls_should_generate_activities = should_generate_activities;
 
-    // DRIVER EXIT callback
-    cbdata.callbackSite = CUPTI_API_EXIT;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API, cbid, &cbdata);
-
-    // Enqueue this correlation ID for activity generation (unless simulating dropped activities)
-    if (should_generate_activities) {
-        enqueue_launched_kernel(correlationId);
+    if (cbid == CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch) {
+        // Graph launch - call through cuGraphLaunch
+        cuGraphLaunch(NULL, NULL);
+    } else {
+        // Kernel launch - call through cuLaunchKernel
+        cuLaunchKernel(NULL, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL);
+        // Enqueue for activity generation
+        if (should_generate_activities) {
+            enqueue_launched_kernel(correlationId);
+        }
     }
 }
 
@@ -551,7 +665,8 @@ void *cupti_thread(void *arg) {
                         kernel->end = kernel->start + duration;
                         kernel->graphId = graph_exec_id;
                         kernel->graphNodeId = i; // Increment for each kernel in the graph
-                        kernel->name = "graph_kernel";
+                        kernel->name = get_next_kernel_name(args->kernel_names);
+                        if (!kernel->name) kernel->name = "mock_kernel";
 
                         offset += recordSize;
                     }
