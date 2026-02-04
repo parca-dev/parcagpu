@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(parcagpucupti C)
+project(parcagpucupti C CXX)
 
 # CUDA root directory (can be overridden via -DCUDA_ROOT=...)
 if(NOT DEFINED CUDA_ROOT)
@@ -20,18 +20,20 @@ set(CUDAToolkit_INCLUDE_DIRS
 # Add CUDA library directory to link directories
 link_directories(${CUDA_LIBDIR})
 
-# Create shared library
-add_library(parcagpucupti SHARED cupti-prof.c)
+# Create shared library with both C and C++ sources
+add_library(parcagpucupti SHARED cupti-prof.c correlation_filter.cpp)
 
 # Set properties
 set_target_properties(parcagpucupti PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED ON
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
     POSITION_INDEPENDENT_CODE ON
 )
 
-# Add debug symbols
-target_compile_options(parcagpucupti PRIVATE -g)
+# Add debug symbols and disable C++ exceptions
+target_compile_options(parcagpucupti PRIVATE -g -fno-exceptions)
 
 # Include directories
 target_include_directories(parcagpucupti PRIVATE
