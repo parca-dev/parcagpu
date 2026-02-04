@@ -161,27 +161,68 @@ KernelNameList *load_kernel_names(const char *filepath) {
     list->count = 0;
     atomic_init(&list->next_index, 0);
 
-    char line[256];
+    char chunk[256];
+    char *line = NULL;
+    size_t line_len = 0;
+    size_t line_cap = 0;
     size_t capacity = 16;
     list->names = malloc(capacity * sizeof(char *));
 
-    while (fgets(line, sizeof(line), f)) {
-        // Remove newline
-        size_t len = strlen(line);
-        if (len > 0 && line[len-1] == '\n') {
-            line[len-1] = '\0';
+    while (fgets(chunk, sizeof(chunk), f)) {
+        size_t chunk_len = strlen(chunk);
+
+        /* Ensure we have enough space in the accumulated line buffer */
+        if (line_len + chunk_len + 1 > line_cap) {
+            size_t new_cap = line_cap ? line_cap * 2 : 256;
+            while (new_cap < line_len + chunk_len + 1) {
+                new_cap *= 2;
+            }
+            char *new_line = realloc(line, new_cap);
+            if (!new_line) {
+                /* Allocation failure: clean up and abort */
+                free(line);
+                fclose(f);
+                free(list->names);
+                free(list);
+                return NULL;
+            }
+            line = new_line;
+            line_cap = new_cap;
         }
 
-        if (strlen(line) == 0) continue;
+        memcpy(line + line_len, chunk, chunk_len);
+        line_len += chunk_len;
 
-        if (list->count >= capacity) {
-            capacity *= 2;
-            list->names = realloc(list->names, capacity * sizeof(char *));
+        /* If this chunk ends with a newline, we have a complete line */
+        if (line_len > 0 && line[line_len - 1] == '\n') {
+            line[--line_len] = '\0'; /* Remove newline */
+
+            if (line_len > 0) {
+                if (list->count >= capacity) {
+                    capacity *= 2;
+                    list->names = realloc(list->names, capacity * sizeof(char *));
+                }
+                list->names[list->count++] = strdup(line);
+            }
+
+            /* Reset for the next line */
+            line_len = 0;
         }
-
-        list->names[list->count++] = strdup(line);
     }
 
+    /* Handle the case where the last line does not end with a newline */
+    if (line_len > 0) {
+        line[line_len] = '\0';
+        if (line_len > 0) {
+            if (list->count >= capacity) {
+                capacity *= 2;
+                list->names = realloc(list->names, capacity * sizeof(char *));
+            }
+            list->names[list->count++] = strdup(line);
+        }
+    }
+
+    free(line);
     fclose(f);
 
     if (list->count == 0) {
