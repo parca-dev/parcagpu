@@ -306,7 +306,10 @@ size_t get_queue_size(void) {
 // Callback Simulation
 //=============================================================================
 
-void simulate_runtime_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbid) {
+// Counter for simulating dropped graph launches (for testing fallback cleanup)
+static atomic_uint_least32_t graph_launch_counter = ATOMIC_VAR_INIT(0);
+
+void simulate_runtime_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbid, bool should_generate_activities) {
     CUpti_CallbackData cbdata = {0};
 
     if (!parcagpuCuptiCallback) {
@@ -333,11 +336,13 @@ void simulate_runtime_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbi
     cbdata.callbackSite = CUPTI_API_EXIT;
     parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API, cbid, &cbdata);
 
-    // Enqueue this correlation ID for activity generation
-    enqueue_launched_kernel(correlationId);
+    // Enqueue this correlation ID for activity generation (unless simulating dropped activities)
+    if (should_generate_activities) {
+        enqueue_launched_kernel(correlationId);
+    }
 }
 
-void simulate_driver_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbid) {
+void simulate_driver_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbid, bool should_generate_activities) {
     CUpti_CallbackData cbdata = {0};
 
     if (!parcagpuCuptiCallback) {
@@ -354,8 +359,10 @@ void simulate_driver_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbid
     cbdata.callbackSite = CUPTI_API_EXIT;
     parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API, cbid, &cbdata);
 
-    // Enqueue this correlation ID for activity generation
-    enqueue_launched_kernel(correlationId);
+    // Enqueue this correlation ID for activity generation (unless simulating dropped activities)
+    if (should_generate_activities) {
+        enqueue_launched_kernel(correlationId);
+    }
 }
 
 //=============================================================================
@@ -401,17 +408,29 @@ void *worker_thread(void *arg) {
             }
             bool is_runtime = (correlationId % 2 == 0); // 50% runtime, 50% driver
 
+            // For graph launches, simulate dropped activities (every 100th graph launch)
+            // This tests the fallback cleanup logic for entries that never see kernels
+            bool should_generate_activities = true;
+            if (is_graph) {
+                uint32_t graph_count = atomic_fetch_add(&graph_launch_counter, 1);
+                if ((graph_count % 100) == 0) {
+                    should_generate_activities = false;
+                    fprintf(stderr, "[TEST] Simulating dropped graph launch for correlationId=%u (graph #%u)\n",
+                            correlationId, graph_count);
+                }
+            }
+
             if (is_graph) {
                 if (is_runtime) {
-                    simulate_runtime_kernel_launch(correlationId, CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000);
+                    simulate_runtime_kernel_launch(correlationId, CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000, should_generate_activities);
                 } else {
-                    simulate_driver_kernel_launch(correlationId, CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch);
+                    simulate_driver_kernel_launch(correlationId, CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch, should_generate_activities);
                 }
             } else {
                 if (is_runtime) {
-                    simulate_runtime_kernel_launch(correlationId, CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000);
+                    simulate_runtime_kernel_launch(correlationId, CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000, true);
                 } else {
-                    simulate_driver_kernel_launch(correlationId, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel);
+                    simulate_driver_kernel_launch(correlationId, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, true);
                 }
             }
         }
