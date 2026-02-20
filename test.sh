@@ -6,7 +6,12 @@ cd "$(dirname "$0")"
 
 # Parse arguments
 USE_BPFTRACE=0
-ARCH="${ARCH:-amd64}"
+# Auto-detect architecture
+case "$(uname -m)" in
+    aarch64|arm64) DEFAULT_ARCH="arm64" ;;
+    *)             DEFAULT_ARCH="amd64" ;;
+esac
+ARCH="${ARCH:-$DEFAULT_ARCH}"
 CUDA_MAJOR="${CUDA_MAJOR:-12}"
 for arg in "$@"; do
     case $arg in
@@ -23,7 +28,7 @@ done
 echo ""
 echo "=== Building test infrastructure with CMake ==="
 mkdir -p test/build
-cd test/build && cmake .. && make && cd ../..
+cd test/build && cmake .. -DCUDA_MAJOR_VERSION="${CUDA_MAJOR}" && make && cd ../..
 
 # Start bpftrace if requested
 if [ "$USE_BPFTRACE" -eq 1 ]; then
@@ -52,8 +57,8 @@ echo "=== Running test program ==="
 # Set PARCAGPU_DEBUG externally to enable debug output
 # Set PARCAGPU_RATE_LIMIT externally to override default (100/s)
 export LD_LIBRARY_PATH="$(pwd)/test/build:$LD_LIBRARY_PATH"
-# Use the CMake-built library with real CUPTI
-test/build/test_cupti_prof build/libparcagpucupti.so --kernel-names=kernel_names.txt "$@"
+# Use the CMake-built library with mock CUPTI
+test/build/test_cupti_prof "build/${CUDA_MAJOR}/${ARCH}/libparcagpucupti.so" --kernel-names=kernel_names.txt "$@"
 
 # If bpftrace was started, stop it and show results
 if [ "$USE_BPFTRACE" -eq 1 ]; then
