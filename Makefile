@@ -113,7 +113,7 @@ push-cuda-headers:
 test-infra:
 	@echo "=== Building test infrastructure with CMake ==="
 	@mkdir -p test/build
-	@cd test/build && cmake .. && make
+	@cd test/build && cmake .. -DCUDA_MAJOR_VERSION=$(CUDA_MAJOR) && make
 
 # Run tests (using AMD64 library)
 test: cupti-amd64 test-infra

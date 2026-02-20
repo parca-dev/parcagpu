@@ -20,16 +20,20 @@ set_target_properties(cupti PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
-# Detect CUDA major version from CUPTI library
-execute_process(
-    COMMAND bash -c "ls ${CUDA_ROOT}/lib64/libcupti.so.* 2>/dev/null | grep -oE 'libcupti\\.so\\.[0-9]+$' | head -1 | grep -oE '[0-9]+$'"
-    OUTPUT_VARIABLE CUDA_MAJOR_VERSION
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-if(NOT CUDA_MAJOR_VERSION)
-    set(CUDA_MAJOR_VERSION "12")
+# CUDA major version - prefer explicitly passed value, fall back to detection
+if(NOT DEFINED CUDA_MAJOR_VERSION)
+    execute_process(
+        COMMAND bash -c "ls ${CUDA_ROOT}/lib64/libcupti.so.* 2>/dev/null | grep -oE 'libcupti\\.so\\.[0-9]+$' | head -1 | grep -oE '[0-9]+$'"
+        OUTPUT_VARIABLE CUDA_MAJOR_VERSION
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(NOT CUDA_MAJOR_VERSION)
+        set(CUDA_MAJOR_VERSION "12")
+    endif()
+    message(STATUS "Detected CUDA major version: ${CUDA_MAJOR_VERSION}")
+else()
+    message(STATUS "Using specified CUDA major version: ${CUDA_MAJOR_VERSION}")
 endif()
-message(STATUS "Detected CUDA major version: ${CUDA_MAJOR_VERSION}")
 
 # Create versioned symlink matching installed CUDA
 add_custom_command(TARGET cupti POST_BUILD
