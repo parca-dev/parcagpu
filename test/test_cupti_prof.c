@@ -30,6 +30,7 @@ typedef struct {
     int num_procs;            // Number of processes to fork (default: 1)
     const char *kernel_names; // Path to kernel names file
     uint64_t duration;        // Run for N seconds (default: 5)
+    bool stress;              // Stress mode: no sleeps, fire as fast as possible
 } TestConfig;
 
 void print_usage(const char *prog) {
@@ -48,6 +49,7 @@ void print_usage(const char *prog) {
     fprintf(stderr, "  --kernel-names=FILE   Path to kernel names file (default: generated)\n");
     fprintf(stderr, "  --duration=N[s|m|h]   Run for N seconds/minutes/hours (default: 5s)\n");
     fprintf(stderr, "                        Examples: 30s, 5m, 2h\n");
+    fprintf(stderr, "  --stress              No sleeps, fire events as fast as possible\n");
     fprintf(stderr, "  --help, -h            Show this help message\n");
     fprintf(stderr, "\nExamples:\n");
     fprintf(stderr, "  # Simple test (backward compatible)\n");
@@ -93,7 +95,8 @@ TestConfig parse_args(int argc, char **argv, const char **lib_path) {
         .num_gpus = 1,
         .num_procs = 1,
         .kernel_names = NULL,
-        .duration = 5
+        .duration = 5,
+        .stress = false
     };
 
     // Check for help first (can be first arg)
@@ -123,6 +126,8 @@ TestConfig parse_args(int argc, char **argv, const char **lib_path) {
             config.kernel_names = argv[i] + 15;
         } else if (strncmp(argv[i], "--duration=", 11) == 0) {
             config.duration = parse_duration(argv[i] + 11);
+        } else if (strcmp(argv[i], "--stress") == 0) {
+            config.stress = true;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -590,7 +595,8 @@ void *worker_thread(void *arg) {
             }
         }
 
-        nanosleep(&sleep_time, NULL);
+        if (!args->config->stress)
+            nanosleep(&sleep_time, NULL);
         iterations++;
     }
 
@@ -695,9 +701,11 @@ void *cupti_thread(void *arg) {
         }
 
         // Only sleep if queue is small - skip sleep when there's a backlog to process
-        size_t final_queue_size = get_queue_size();
-        if (final_queue_size < 1000) {
-            nanosleep(&sleep_time, NULL);
+        if (!args->config->stress) {
+            size_t final_queue_size = get_queue_size();
+            if (final_queue_size < 1000) {
+                nanosleep(&sleep_time, NULL);
+            }
         }
     }
 

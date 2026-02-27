@@ -1,4 +1,4 @@
-.PHONY: all clean test cupti-amd64 cupti-arm64 cupti-all cupti-all-versions cross test-infra docker-push push-cuda-headers docker-test-build docker-test-run format
+.PHONY: all clean test cupti-amd64 cupti-arm64 cupti-all cupti-all-versions cross test-infra docker-push push-cuda-headers docker-test-build docker-test-run format bpf-test test-multi
 
 # CUDA version configuration
 CUDA_MAJOR ?= 12
@@ -131,6 +131,7 @@ clean:
 	@echo "=== Cleaning build artifacts ==="
 	@rm -rf cupti/build cupti/build-amd64 cupti/build-arm64 build
 	@rm -rf test/build
+	@rm -f test/bpf/activity_parser test/bpf/activityparser_*.go test/bpf/activityparser_*.o
 	@echo "Clean complete"
 
 # Build and push multi-arch Docker images to ghcr.io
@@ -165,6 +166,41 @@ docker-test-build: cupti-amd64 test-infra
 docker-test-run: docker-test-build
 	@echo "=== Running tests in container ==="
 	@docker run --rm parcagpu-test:latest $(ARGS)
+
+# Build the BPF activity parser test program
+# Requires: clang, libbpf-dev, bpftool (for vmlinux.h), Go 1.21+
+bpf-test:
+	@echo "=== Building BPF activity parser test ==="
+	@if [ ! -f test/bpf/vmlinux.h ]; then \
+		echo "Generating vmlinux.h from kernel BTF..."; \
+		bpftool btf dump file /sys/kernel/btf/vmlinux format c > test/bpf/vmlinux.h; \
+	fi
+	@cd test/bpf && go generate ./... && CGO_ENABLED=0 go build -o activity_parser .
+	@echo "BPF test built: test/bpf/activity_parser"
+
+# Run test_cupti_prof and BPF activity parser in parallel.
+# The BPF test attaches to the test program's PID and logs kernel activities.
+# Requires root (sudo) for BPF.
+test-multi: cupti-amd64 test-infra bpf-test
+	@echo "=== Running test with BPF activity parser ==="
+	@case "$$(uname -m)" in \
+		aarch64|arm64) ARCH=arm64 ;; \
+		*) ARCH=amd64 ;; \
+	esac; \
+	LIB_PATH="build/$(CUDA_MAJOR)/$${ARCH}/libparcagpucupti.so"; \
+	export LD_LIBRARY_PATH="$$(pwd)/test/build:$$LD_LIBRARY_PATH"; \
+	test/build/test_cupti_prof "$${LIB_PATH}" --kernel-names=kernel_names.txt --duration=10 & \
+	TEST_PID=$$!; \
+	sleep 1; \
+	echo "test_cupti_prof PID: $${TEST_PID}"; \
+	echo "Starting BPF activity parser (requires root)..."; \
+	sudo test/bpf/activity_parser -pid $${TEST_PID} -lib "$$(pwd)/$${LIB_PATH}" -v & \
+	BPF_PID=$$!; \
+	wait $${TEST_PID}; \
+	TEST_EXIT=$$?; \
+	sleep 1; \
+	sudo kill $${BPF_PID} 2>/dev/null; wait $${BPF_PID} 2>/dev/null; \
+	echo "=== test-multi completed (test exit: $${TEST_EXIT}) ==="
 
 format:
 	clang-format -i -style=file cupti/*.[ch]

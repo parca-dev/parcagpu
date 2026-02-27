@@ -360,6 +360,13 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
   }
 }
 
+// Out-of-line USDT probe site for activity batches.
+// Single call site ensures one probe location in the ELF .note.stapsdt section.
+__attribute__((noinline)) void parcagpuActivityBatch(const void **ptrs,
+                                                     uint32_t count) {
+  DTRACE_PROBE2(parcagpu, activity_batch, ptrs, count);
+}
+
 // Buffer request callback
 static void parcagpuBufferRequested(uint8_t **buffer, size_t *size,
                                     size_t *maxNumRecords) {
@@ -379,6 +386,14 @@ static void parcagpuBufferCompleted(CUcontext ctx, uint32_t streamId,
   CUpti_Activity *record = NULL;
   int recordCount = 0;
   static int calls = 0;
+
+  // Batch probe: collect pointers to activity records and pass them to
+  // BPF/USDT every ACTIVITY_BATCH_SIZE records. Stack-allocated array
+  // of pointers — no heap allocation, no copying, version-independent.
+  // BPF consumers filter by activity kind (kernel, memcpy, etc.).
+#define ACTIVITY_BATCH_SIZE 128
+  const void *batchPtrs[ACTIVITY_BATCH_SIZE];
+  uint32_t batchCount = 0;
 
   DEBUG_PRINTF("[CUPTI] bufferCompleted called: buffer=%p validSize=%zu (%d)\n",
                buffer, validSize, calls++);
@@ -457,7 +472,19 @@ static void parcagpuBufferCompleted(CUcontext ctx, uint32_t streamId,
                       k->graphNodeId, k->name);
       }
     }
+
+    // Collect pointer for batch probe (all activity kinds).
+    // BPF consumers inspect the kind field to filter types they care about.
+    batchPtrs[batchCount++] = record;
+    if (batchCount < ACTIVITY_BATCH_SIZE)
+      continue;
+
+    parcagpuActivityBatch(batchPtrs, batchCount);
+    batchCount = 0;
   }
+
+  if (batchCount > 0)
+    parcagpuActivityBatch(batchPtrs, batchCount);
 
   DEBUG_PRINTF("[CUPTI] Processed %d activity records from buffer %p\n",
                recordCount, buffer);
