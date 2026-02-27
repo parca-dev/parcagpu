@@ -1,0 +1,3 @@
+[submodule "vendor/opentelemetry-ebpf-profiler"]
+	path = vendor/opentelemetry-ebpf-profiler
+	url = https://github.com/parca-dev/opentelemetry-ebpf-profiler.git
