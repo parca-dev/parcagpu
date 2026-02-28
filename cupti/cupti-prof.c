@@ -66,7 +66,8 @@ static bool rateLimiterTryAcquire(uint64_t nowNs) {
 // Correlation ID filter (for regular kernel launches)
 static CorrelationFilterHandle correlationFilter = NULL;
 
-// Graph correlation map (for graph launches with multiple kernels per correlation ID)
+// Graph correlation map (for graph launches with multiple kernels per
+// correlation ID)
 static GraphCorrelationMapHandle graphCorrelationMap = NULL;
 
 // Buffer processing cycle counter (for graph map state machine)
@@ -224,7 +225,8 @@ int InitializeInjection(void) {
   if (graphCorrelationMap) {
     DEBUG_PRINTF("[CUPTI] Graph correlation map created and enabled\n");
   } else {
-    fprintf(stderr, "[CUPTI] Warning: Failed to create graph correlation map\n");
+    fprintf(stderr,
+            "[CUPTI] Warning: Failed to create graph correlation map\n");
   }
 
   atexit(cleanup);
@@ -263,7 +265,8 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
   if (domain == CUPTI_CB_DOMAIN_RUNTIME_API &&
       cbdata->callbackSite == CUPTI_API_ENTER) {
     runtimeEnterCorrelationId = correlationId;
-    DEBUG_PRINTF("[CUPTI] Runtime API ENTER: correlationId=%u\n", correlationId);
+    DEBUG_PRINTF("[CUPTI] Runtime API ENTER: correlationId=%u\n",
+                 correlationId);
     return;
   }
 
@@ -271,8 +274,11 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
   // launch latency and hopefully covers some of the overhead in the shadow of
   // GPU async work.
   if (cbdata->callbackSite != CUPTI_API_EXIT) {
-    if (cbdata->callbackSite == CUPTI_API_ENTER && domain == CUPTI_CB_DOMAIN_DRIVER_API) {
-      DEBUG_PRINTF("[CUPTI] Driver API ENTER: correlationId=%u (will check on EXIT)\n", correlationId);
+    if (cbdata->callbackSite == CUPTI_API_ENTER &&
+        domain == CUPTI_CB_DOMAIN_DRIVER_API) {
+      DEBUG_PRINTF(
+          "[CUPTI] Driver API ENTER: correlationId=%u (will check on EXIT)\n",
+          correlationId);
     }
     return;
   }
@@ -284,21 +290,22 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
   if (domain == CUPTI_CB_DOMAIN_DRIVER_API) {
     // Skip if this driver call is under a runtime call (same correlation ID)
     if (correlationId == runtimeEnterCorrelationId) {
-      DEBUG_PRINTF("[CUPTI] Skipping driver EXIT correlationId=%u (runtimeEnter=%u) - runtime "
+      DEBUG_PRINTF("[CUPTI] Skipping driver EXIT correlationId=%u "
+                   "(runtimeEnter=%u) - runtime "
                    "will handle\n",
                    correlationId, runtimeEnterCorrelationId);
       return;
     }
     // Pure driver call (no runtime wrapper) - use negative cbid
     signedCbid = -(int)cbid;
-    DEBUG_PRINTF(
-        "[CUPTI] Driver API EXIT callback: cbid=%d, correlationId=%u, runtimeEnter=%u, func=%s\n",
-        cbid, correlationId, runtimeEnterCorrelationId, name);
+    DEBUG_PRINTF("[CUPTI] Driver API EXIT callback: cbid=%d, correlationId=%u, "
+                 "runtimeEnter=%u, func=%s\n",
+                 cbid, correlationId, runtimeEnterCorrelationId, name);
   } else if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
     signedCbid = (int)cbid;
-    DEBUG_PRINTF(
-        "[CUPTI] Runtime API EXIT callback: cbid=%d, correlationId=%u, runtimeEnter=%u, func=%s\n",
-        cbid, correlationId, runtimeEnterCorrelationId, name);
+    DEBUG_PRINTF("[CUPTI] Runtime API EXIT callback: cbid=%d, "
+                 "correlationId=%u, runtimeEnter=%u, func=%s\n",
+                 cbid, correlationId, runtimeEnterCorrelationId, name);
     runtimeEnterCorrelationId = 0; // Clear after use
   } else {
     return;
@@ -309,9 +316,8 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
   clock_gettime(CLOCK_MONOTONIC, &ts);
   uint64_t nowNs = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
   if (!rateLimiterTryAcquire(nowNs)) {
-    DEBUG_PRINTF(
-        "[CUPTI] Rate limited: skipping probe for correlationId=%u\n",
-        correlationId);
+    DEBUG_PRINTF("[CUPTI] Rate limited: skipping probe for correlationId=%u\n",
+                 correlationId);
     return;
   }
 
@@ -330,8 +336,9 @@ static void parcagpuCuptiCallback(void *userdata, CUpti_CallbackDomain domain,
     // Graph launch - will generate multiple kernels with same correlation ID
     if (graphCorrelationMap) {
       graph_correlation_map_insert(graphCorrelationMap, correlationId);
-      DEBUG_PRINTF("[CUPTI] Inserted correlationId=%u into graph map (size=%zu)\n",
-                   correlationId, graph_correlation_map_size(graphCorrelationMap));
+      DEBUG_PRINTF(
+          "[CUPTI] Inserted correlationId=%u into graph map (size=%zu)\n",
+          correlationId, graph_correlation_map_size(graphCorrelationMap));
     }
   } else {
     // Regular kernel launch - single kernel per correlation ID
@@ -380,7 +387,8 @@ static void parcagpuBufferCompleted(CUcontext ctx, uint32_t streamId,
   uint32_t currentCycle = bufferCycle++;
   if (graphCorrelationMap) {
     graph_correlation_map_cycle_start(graphCorrelationMap, currentCycle);
-    DEBUG_PRINTF("[CUPTI] Started graph correlation map cycle %u\n", currentCycle);
+    DEBUG_PRINTF("[CUPTI] Started graph correlation map cycle %u\n",
+                 currentCycle);
   }
 
   while (1) {
@@ -414,23 +422,30 @@ static void parcagpuBufferCompleted(CUcontext ctx, uint32_t streamId,
           should_fire = graph_correlation_map_check_and_mark_seen(
               graphCorrelationMap, k->correlationId, currentCycle);
           if (!should_fire) {
-            DEBUG_PRINTF("[CUPTI] Filtered out graph correlationId=%u (not tracked)\n",
-                         k->correlationId);
+            DEBUG_PRINTF(
+                "[CUPTI] Filtered out graph correlationId=%u (not tracked)\n",
+                k->correlationId);
           } else {
-            DEBUG_PRINTF("[CUPTI] Matched graph correlationId=%u - firing kernel_executed (map size=%zu)\n",
-                         k->correlationId, graph_correlation_map_size(graphCorrelationMap));
+            DEBUG_PRINTF("[CUPTI] Matched graph correlationId=%u - firing "
+                         "kernel_executed (map size=%zu)\n",
+                         k->correlationId,
+                         graph_correlation_map_size(graphCorrelationMap));
           }
         }
       } else {
         // Regular kernel - check regular correlation filter
         if (correlationFilter) {
-          should_fire = correlation_filter_check_and_remove(correlationFilter, k->correlationId);
+          should_fire = correlation_filter_check_and_remove(correlationFilter,
+                                                            k->correlationId);
           if (!should_fire) {
-            DEBUG_PRINTF("[CUPTI] Filtered out correlationId=%u (not tracked)\n",
-                         k->correlationId);
+            DEBUG_PRINTF(
+                "[CUPTI] Filtered out correlationId=%u (not tracked)\n",
+                k->correlationId);
           } else {
-            DEBUG_PRINTF("[CUPTI] Matched correlationId=%u - firing kernel_executed (filter size=%zu)\n",
-                         k->correlationId, correlation_filter_size(correlationFilter));
+            DEBUG_PRINTF("[CUPTI] Matched correlationId=%u - firing "
+                         "kernel_executed (filter size=%zu)\n",
+                         k->correlationId,
+                         correlation_filter_size(correlationFilter));
           }
         }
       }
@@ -453,14 +468,17 @@ static void parcagpuBufferCompleted(CUcontext ctx, uint32_t streamId,
 
     size_t map_size = 0;
     size_t oldest_age = 0;
-    graph_correlation_map_get_stats(graphCorrelationMap, &map_size, &oldest_age);
+    graph_correlation_map_get_stats(graphCorrelationMap, &map_size,
+                                    &oldest_age);
 
-    DEBUG_PRINTF("[CUPTI] Ended graph correlation map cycle %u (map size=%zu, oldest_age=%zu cycles)\n",
+    DEBUG_PRINTF("[CUPTI] Ended graph correlation map cycle %u (map size=%zu, "
+                 "oldest_age=%zu cycles)\n",
                  currentCycle, map_size, oldest_age);
 
     // Log warning if we have old entries (potential leaked graph launches)
     if (oldest_age > 50 && currentCycle % 10 == 0) {
-      DEBUG_PRINTF("[CUPTI] WARNING: Graph map has entries aged %zu cycles (may be dropped launches)\n",
+      DEBUG_PRINTF("[CUPTI] WARNING: Graph map has entries aged %zu cycles "
+                   "(may be dropped launches)\n",
                    oldest_age);
     }
   }
@@ -506,7 +524,9 @@ void cleanup(void) {
   if (correlationFilter) {
     size_t remaining = correlation_filter_size(correlationFilter);
     if (remaining > 0) {
-      DEBUG_PRINTF("[CUPTI] Warning: %zu correlation IDs still in filter at cleanup\n", remaining);
+      DEBUG_PRINTF(
+          "[CUPTI] Warning: %zu correlation IDs still in filter at cleanup\n",
+          remaining);
     }
     correlation_filter_destroy(correlationFilter);
     correlationFilter = NULL;
@@ -516,7 +536,9 @@ void cleanup(void) {
   if (graphCorrelationMap) {
     size_t remaining = graph_correlation_map_size(graphCorrelationMap);
     if (remaining > 0) {
-      DEBUG_PRINTF("[CUPTI] Warning: %zu correlation IDs still in graph map at cleanup\n", remaining);
+      DEBUG_PRINTF("[CUPTI] Warning: %zu correlation IDs still in graph map at "
+                   "cleanup\n",
+                   remaining);
     }
     graph_correlation_map_destroy(graphCorrelationMap);
     graphCorrelationMap = NULL;
