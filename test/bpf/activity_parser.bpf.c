@@ -18,8 +18,9 @@
 
 // usdt_compat.h provides macros and guards so the otel-ebpf-profiler
 // usdt headers compile in our vmlinux.h-based environment.
-#include "usdt_args.h"
 #include "usdt_compat.h"
+
+#include "usdt_args.h"
 
 #include "cupti_activity_bpf.h"
 
