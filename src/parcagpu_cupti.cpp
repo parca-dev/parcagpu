@@ -90,7 +90,7 @@ public:
 
     // Enable runtime and driver API callbacks (using Proton's utilities)
     proton::setRuntimeCallbacks(subscriber, /*enable=*/true);
-    proton::setDriverCallbacks(subscriber, /*enable=*/true);
+    proton::setLaunchCallbacks(subscriber, /*enable=*/true);
 
     // Enable resource callbacks only if PC sampling is enabled
     if (pcSamplingEnabled) {
@@ -134,7 +134,7 @@ public:
     // Disable all callbacks (using Proton's utilities)
     if (subscriber) {
       proton::setRuntimeCallbacks(subscriber, /*enable=*/false);
-      proton::setDriverCallbacks(subscriber, /*enable=*/false);
+      proton::setLaunchCallbacks(subscriber, /*enable=*/false);
       if (pcSamplingEnabled) {
         proton::setResourceCallbacks(subscriber, /*enable=*/false);
       }
