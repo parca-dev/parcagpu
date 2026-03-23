@@ -1,4 +1,4 @@
-.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug
+.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug bpf-test test-multi
 
 LIB_NAME = libparcagpucupti.so
 
@@ -65,7 +65,8 @@ debug:
 # Run local tests
 test: local
 	@echo "=== Running tests ==="
-	@cd build-local && ctest --output-on-failure
+	@LD_LIBRARY_PATH="$(CURDIR)/build-local/lib:$$LD_LIBRARY_PATH" \
+		./build-local/bin/test_cupti_prof build-local/lib/libparcagpucupti.so --duration=5
 
 # Clean build artifacts
 clean:
@@ -102,6 +103,37 @@ docker-test-build: build-amd64
 docker-test-run: docker-test-build
 	@echo "=== Running tests in container ==="
 	@docker run --rm parcagpu-test:latest $(ARGS)
+
+# Build the BPF activity parser test program
+# Requires: clang, libbpf-dev, bpftool (for vmlinux.h), Go 1.21+
+bpf-test:
+	@echo "=== Building BPF activity parser test ==="
+	@if [ ! -f test/bpf/vmlinux.h ]; then \
+		echo "Generating vmlinux.h from kernel BTF..."; \
+		bpftool btf dump file /sys/kernel/btf/vmlinux format c > test/bpf/vmlinux.h; \
+	fi
+	@cd test/bpf && go generate ./... && CGO_ENABLED=0 go build -o activity_parser .
+	@echo "BPF test built: test/bpf/activity_parser"
+
+# Run test_cupti_prof and BPF activity parser in parallel.
+# The BPF test attaches to the activity_batch USDT probe and logs kernel activities.
+# Requires root (sudo) for BPF.
+test-multi: local bpf-test
+	@echo "=== Running test with BPF activity parser ==="
+	@LIB_PATH="build-local/lib/libparcagpucupti.so"; \
+	export LD_LIBRARY_PATH="$(CURDIR)/build-local/lib:$$LD_LIBRARY_PATH"; \
+	./build-local/bin/test_cupti_prof "$${LIB_PATH}" --kernel-names=kernel_names.txt --duration=10 & \
+	TEST_PID=$$!; \
+	sleep 1; \
+	echo "test_cupti_prof PID: $${TEST_PID}"; \
+	echo "Starting BPF activity parser (requires root)..."; \
+	sudo test/bpf/activity_parser -pid $${TEST_PID} -lib "$$(pwd)/$${LIB_PATH}" -v & \
+	BPF_PID=$$!; \
+	wait $${TEST_PID}; \
+	TEST_EXIT=$$?; \
+	sleep 1; \
+	sudo kill $${BPF_PID} 2>/dev/null; wait $${BPF_PID} 2>/dev/null; \
+	echo "=== test-multi completed (test exit: $${TEST_EXIT}) ==="
 
 format:
 	@echo "=== Formatting source files ==="

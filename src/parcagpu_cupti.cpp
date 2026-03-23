@@ -87,6 +87,19 @@ void init_debug() {
     }                                                                          \
   } while (0)
 
+// Out-of-line USDT probe site for activity batches.
+// Single call site ensures one probe location in the ELF .note.stapsdt section.
+static constexpr int ACTIVITY_BATCH_SIZE = 128;
+
+} // namespace parcagpu
+
+__attribute__((noinline)) void parcagpuActivityBatch(const void **ptrs,
+                                                     uint32_t count) {
+  DTRACE_PROBE2(parcagpu, activity_batch, ptrs, count);
+}
+
+namespace parcagpu {
+
 // Simplified profiler using Proton's patterns
 class CuptiProfiler : public proton::Singleton<CuptiProfiler> {
 public:
@@ -213,6 +226,12 @@ private:
     int recordCount = 0;
     int filteredCount = 0;
 
+    // Batch probe: collect pointers to activity records and pass them to
+    // BPF/USDT every ACTIVITY_BATCH_SIZE records. Stack-allocated array
+    // of pointers — no heap allocation, no copying, version-independent.
+    const void *batchPtrs[ACTIVITY_BATCH_SIZE];
+    uint32_t batchCount = 0;
+
     DEBUG_PRINTF(
         "[PARCAGPU] completeBuffer called: buffer=%p validSize=%zu\n",
         buffer, validSize);
@@ -273,6 +292,19 @@ private:
                      record->kind);
         break;
       }
+
+      // Collect pointer for batch probe (all activity kinds).
+      // BPF consumers inspect the kind field to filter types they care about.
+      batchPtrs[batchCount++] = record;
+      if (batchCount >= ACTIVITY_BATCH_SIZE) {
+        parcagpuActivityBatch(batchPtrs, batchCount);
+        batchCount = 0;
+      }
+    }
+
+    // Flush remaining batch
+    if (batchCount > 0) {
+      parcagpuActivityBatch(batchPtrs, batchCount);
     }
 
     // End cycle - cleanup completed graph entries
@@ -280,6 +312,10 @@ private:
 
     DEBUG_PRINTF("[PARCAGPU] Processed %d activity records (%d filtered) from buffer %p\n",
                  recordCount, filteredCount, buffer);
+
+    // Reset to 0 rather than decrement - one API callback can produce N
+    // activities so decrementing by recordCount can cause underflow
+    CuptiProfiler::instance().outstandingEvents = 0;
 
     // Free the buffer (Proton's pattern)
     std::free(buffer);

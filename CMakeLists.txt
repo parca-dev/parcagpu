@@ -117,8 +117,17 @@ if(BUILD_TESTS)
     target_include_directories(test_cupti_prof PRIVATE
         ${CUDA_INCLUDE_DIR}
     )
+    # Link against mock libraries so their symbols are globally visible.
+    # This lets Proton's dlopen(RTLD_NOLOAD) find them, and lets the test
+    # access __cupti_runtime_api_callback etc. via dlsym(RTLD_DEFAULT).
+    # --no-as-needed forces the linker to keep them even though the test
+    # only accesses their symbols via dlsym, not direct references.
     target_link_libraries(test_cupti_prof
         dl
+        -Wl,--no-as-needed
+        cuda_mock
+        cupti_mock
+        -Wl,--as-needed
     )
     set_target_properties(test_cupti_prof PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
