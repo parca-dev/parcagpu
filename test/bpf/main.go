@@ -34,7 +34,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-//go:generate bpf2go -cc clang -cflags "-O2 -g -Wall -target bpf -D__TARGET_ARCH_x86 -D__x86_64__ -I../../vendor/opentelemetry-ebpf-profiler/support/ebpf" activityParser activity_parser.bpf.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target $GOARCH -cflags "-I../../vendor/opentelemetry-ebpf-profiler/support/ebpf" activityParser activity_parser.bpf.c
 
 // KernelEvent matches struct kernel_event in the BPF program.
 type KernelEvent struct {

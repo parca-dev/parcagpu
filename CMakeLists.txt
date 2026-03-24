@@ -28,6 +28,11 @@ message(STATUS "Using Proton from: ${PROTON_DIR}")
 
 # Find CUDA headers (allow fallback to manual path for header-only builds)
 if(NOT DEFINED CUDA_INCLUDE_DIR)
+    # Prefer /usr/local/cuda over system-installed CUDA packages, which may
+    # ship older headers (e.g. CUDA 12.0) missing symbols that Proton needs.
+    if(NOT DEFINED CUDAToolkit_ROOT AND EXISTS "/usr/local/cuda/include/cuda.h")
+        set(CUDAToolkit_ROOT "/usr/local/cuda")
+    endif()
     find_package(CUDAToolkit QUIET)
     if(CUDAToolkit_FOUND)
         set(CUDA_INCLUDE_DIR ${CUDAToolkit_INCLUDE_DIRS})

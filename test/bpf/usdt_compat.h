@@ -8,7 +8,8 @@
 #ifndef USDT_COMPAT_H
 #define USDT_COMPAT_H
 
-// Skip vendor bpfdefs.h and types.h — we already have everything from vmlinux.h.
+// Skip vendor bpfdefs.h and types.h — we already have everything from
+// vmlinux.h.
 #define OPTI_BPFDEFS_H
 #define OPTI_TYPES_H
 
@@ -25,5 +26,11 @@ typedef struct bpf_map_def {
   unsigned int max_entries;
   unsigned int map_flags;
 } bpf_map_def;
+
+// Hack: even with -target arm64 bpf2go doesn't invoke clang so that __arch64__
+// is defined, but __TARGET_ARCH_arm64 is
+#if defined(__TARGET_ARCH_arm64)
+#define __aarch64__
+#endif
 
 #endif // USDT_COMPAT_H
