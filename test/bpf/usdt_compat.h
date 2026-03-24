@@ -27,9 +27,13 @@ typedef struct bpf_map_def {
   unsigned int map_flags;
 } bpf_map_def;
 
-// Hack: even with -target arm64 bpf2go doesn't invoke clang so that __arch64__
-// is defined, but __TARGET_ARCH_arm64 is
-#if defined(__TARGET_ARCH_arm64)
+// bpf2go passes -target bpfel (not the real platform triple), so the
+// usual compiler builtins (__x86_64__, __aarch64__) are never set.
+// Bridge from bpf2go's __TARGET_ARCH_* defines to the builtins that
+// usdt_args.h checks for pt_regs layout.
+#if defined(__TARGET_ARCH_x86)
+#define __x86_64__
+#elif defined(__TARGET_ARCH_arm64)
 #define __aarch64__
 #endif
 
