@@ -1,6 +1,6 @@
-#include "parcagpu_pc_sampling.h"
 #include "Driver/GPU/CudaApi.h"
 #include "Driver/GPU/CuptiApi.h"
+#include "parcagpu_pc_sampling.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,15 +17,6 @@ namespace parcagpu {
 // Debug logging (reuse from main file)
 extern bool debug_enabled;
 extern void init_debug();
-
-#define DEBUG_PRINTF(...)                                                      \
-  do {                                                                         \
-    parcagpu::init_debug();                                                    \
-    if (parcagpu::debug_enabled) {                                             \
-      fprintf(stderr, "[PARCAGPU:PCSampling] ");                               \
-      fprintf(stderr, __VA_ARGS__);                                            \
-    }                                                                          \
-  } while (0)
 
 namespace {
 
@@ -126,7 +117,7 @@ void doubleCheckedLock(CheckFn check, std::mutex &mutex, ActionFn action) {
 }
 
 // Helper to get PARCAGPU's custom sampling frequency from environment
-uint32_t getParcaGPUSamplingFrequency() {
+uint32_t getGPUSamplingFrequency() {
   // Default frequency for PARCAGPU is 18 (Proton uses 10)
   constexpr uint32_t PARCAGPU_DEFAULT_FREQUENCY = 18;
 
@@ -138,9 +129,13 @@ uint32_t getParcaGPUSamplingFrequency() {
       samplingPeriod = factor;
       DEBUG_PRINTF("Using PARCAGPU_SAMPLING_FACTOR=%u\n", samplingPeriod);
     } else if (factor != 0) { // 0 is handled in isSupported()
-      fprintf(stderr, "[PARCAGPU] Warning: PARCAGPU_SAMPLING_FACTOR=%d out of range [5,31], using default %u\n",
+      fprintf(stderr,
+              "[PARCAGPU] Warning: PARCAGPU_SAMPLING_FACTOR=%d out of range "
+              "[5,31], using default %u\n",
               factor, PARCAGPU_DEFAULT_FREQUENCY);
     }
+  } else {
+    return 0;
   }
   return samplingPeriod;
 }
@@ -251,9 +246,10 @@ CUpti_PCSamplingConfigurationInfo ConfigureData::configureSamplingPeriod() {
       CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD;
 
   // Use PARCAGPU's custom sampling frequency
-  uint32_t frequency = getParcaGPUSamplingFrequency();
+  uint32_t frequency = getGPUSamplingFrequency();
 
-  samplingPeriodInfo.attributeData.samplingPeriodData.samplingPeriod = frequency;
+  samplingPeriodInfo.attributeData.samplingPeriodData.samplingPeriod =
+      frequency;
   return samplingPeriodInfo;
 }
 
@@ -299,8 +295,8 @@ void ConfigureData::initialize(CUcontext context) {
   this->context = context;
   proton::cupti::getContextId<true>(context, &contextId);
 
-  DEBUG_PRINTF("Initializing PC sampling for context %p (id %u)\n",
-               context, contextId);
+  DEBUG_PRINTF("Initializing PC sampling for context %p (id %u)\n", context,
+               contextId);
 
   configurationInfos.emplace_back(configureStallReasons());
   configurationInfos.emplace_back(configureSamplingPeriod());
@@ -319,9 +315,9 @@ void ConfigureData::initialize(CUcontext context) {
 
 bool PCSampling::isSupported() {
   // Check PARCAGPU_SAMPLING_FACTOR - 0 means disabled
-  const char *sampling_factor_env = getenv("PARCAGPU_SAMPLING_FACTOR");
-  if (sampling_factor_env && atoi(sampling_factor_env) == 0) {
-    DEBUG_PRINTF("PC sampling disabled via PARCAGPU_SAMPLING_FACTOR=0\n");
+  int sampling_factor = getGPUSamplingFrequency();
+  if (sampling_factor == 0) {
+    DEBUG_PRINTF("PC sampling not enabled via PARCAGPU_SAMPLING_FACTOR\n");
     return false;
   }
 
@@ -333,7 +329,8 @@ bool PCSampling::isSupported() {
     int major = driverVersion / 1000;
     int minor = (driverVersion % 1000) / 10;
     int patch = driverVersion % 10;
-    DEBUG_PRINTF("PC sampling not supported: CUDA driver version %d.%d.%d < required 12.8.1\n",
+    DEBUG_PRINTF("PC sampling not supported: CUDA driver version %d.%d.%d < "
+                 "required 12.8.1\n",
                  major, minor, patch);
     return false;
   }
@@ -341,7 +338,8 @@ bool PCSampling::isSupported() {
   int major = driverVersion / 1000;
   int minor = (driverVersion % 1000) / 10;
   int patch = driverVersion % 10;
-  DEBUG_PRINTF("PC sampling supported: CUDA driver version %d.%d.%d\n", major, minor, patch);
+  DEBUG_PRINTF("PC sampling supported: CUDA driver version %d.%d.%d\n", major,
+               minor, patch);
   return true;
 }
 
@@ -357,19 +355,19 @@ void PCSampling::initialize(CUcontext context) {
   uint32_t contextId = 0;
   proton::cupti::getContextId<true>(context, &contextId);
 
-  doubleCheckedLock([&]() { return !contextInitialized.contain(contextId); },
-                    contextMutex,
-                    [&]() {
-                      enablePCSampling(context);
-                      getConfigureData(contextId)->initialize(context);
+  doubleCheckedLock(
+      [&]() { return !contextInitialized.contain(contextId); }, contextMutex,
+      [&]() {
+        enablePCSampling(context);
+        getConfigureData(contextId)->initialize(context);
 
-                      contextInitialized.insert(contextId);
-                      DEBUG_PRINTF("PC sampling started in continuous mode for context %u\n", contextId);
-                    });
+        contextInitialized.insert(contextId);
+        DEBUG_PRINTF("PC sampling started in continuous mode for context %u\n",
+                     contextId);
+      });
 }
 
-void PCSampling::processPCSamplingData(ConfigureData *configureData,
-                                                uint32_t correlationId) {
+void PCSampling::processPCSamplingData(ConfigureData *configureData) {
   auto *pcSamplingData = &configureData->pcSamplingData;
 
   // Collect data in rounds
@@ -407,9 +405,8 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData,
         totalSamples += stallReason->samples;
 
         // Check if this is a "not_issued" stall (not really stalled)
-        bool isNotIssued =
-            configureData->notIssuedStallReasonIndices.count(
-                stallReason->pcSamplingStallReasonIndex) > 0;
+        bool isNotIssued = configureData->notIssuedStallReasonIndices.count(
+                               stallReason->pcSamplingStallReasonIndex) > 0;
 
         if (!isNotIssued) {
           stalledSamples += stallReason->samples;
@@ -420,9 +417,10 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData,
       std::string fullPath = lineInfo.fileName.size()
                                  ? lineInfo.dirName + "/" + lineInfo.fileName
                                  : "";
-      STAP_PROBE8(parcagpu, pc_sample_summary, correlationId, pcData->functionIndex,
+      STAP_PROBE7(parcagpu, pc_sample_summary, pcData->functionIndex,
                   pcData->pcOffset, totalSamples, stalledSamples,
-                  fullPath.c_str(), lineInfo.lineNumber, lineInfo.functionName.c_str());
+                  fullPath.c_str(), lineInfo.lineNumber,
+                  lineInfo.functionName.c_str());
 
       // Emit detailed stall reason probes
       for (size_t j = 0; j < pcData->stallReasonCount; ++j) {
@@ -438,8 +436,9 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData,
           }
         }
 
-        STAP_PROBE6(parcagpu, pc_stall_reason, correlationId, pcData->functionIndex,
-                    pcData->pcOffset, stallReasonIndex, stallReasonName, stallReason->samples);
+        STAP_PROBE5(parcagpu, pc_stall_reason, pcData->functionIndex,
+                    pcData->pcOffset, stallReasonIndex, stallReasonName,
+                    stallReason->samples);
       }
     }
 
@@ -453,20 +452,21 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData,
   }
 }
 
-void PCSampling::collectData(CUcontext context, uint32_t correlationId) {
+void PCSampling::collectData(CUcontext context) {
   uint32_t contextId = 0;
   proton::cupti::getContextId<true>(context, &contextId);
 
   if (!contextInitialized.contain(contextId)) {
-    DEBUG_PRINTF("Context %u not initialized, skipping data collection\n", contextId);
+    DEBUG_PRINTF("Context %u not initialized, skipping data collection\n",
+                 contextId);
     return;
   }
 
   auto *configureData = getConfigureData(contextId);
-  DEBUG_PRINTF("Collecting PC sampling data for correlation %u\n", correlationId);
+  DEBUG_PRINTF("Collecting PC sampling data for context %u\n", contextId);
 
   // Collect data without stopping - continuous mode
-  processPCSamplingData(configureData, correlationId);
+  processPCSamplingData(configureData);
 }
 
 void PCSampling::finalize(CUcontext context) {
@@ -483,14 +483,14 @@ void PCSampling::finalize(CUcontext context) {
 }
 
 void PCSampling::loadModule(const char *cubin, size_t cubinSize) {
-  auto cubinCrc =  getCubinCrc(cubin, cubinSize);
+  auto cubinCrc = getCubinCrc(cubin, cubinSize);
   auto *cubinData = getCubinData(cubinCrc);
 
   if (cubinCrcToCubinData.contain(cubinCrc)) {
     // Increment reference count
     cubinCrcToCubinData[cubinCrc].second++;
-    DEBUG_PRINTF("Module 0x%lx loaded (refcount=%zu)\n",
-                 cubinCrc, cubinCrcToCubinData[cubinCrc].second);
+    DEBUG_PRINTF("Module 0x%lx loaded (refcount=%zu)\n", cubinCrc,
+                 cubinCrcToCubinData[cubinCrc].second);
   } else {
     // New module
     cubinData->cubinCrc = cubinCrc;

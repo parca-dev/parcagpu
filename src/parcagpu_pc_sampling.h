@@ -19,6 +19,17 @@
 #include "Utility/Set.h"
 #include "Utility/Singleton.h"
 
+#define DEBUG_PRINTF(...)                                                      \
+  do {                                                                         \
+    parcagpu::init_debug();                                                    \
+    if (parcagpu::debug_enabled) {                                             \
+      struct timespec ts;                                                      \
+      clock_gettime(CLOCK_REALTIME, &ts);                                      \
+      fprintf(stderr, "[%ld.%09ld] ", ts.tv_sec, ts.tv_nsec);                  \
+      fprintf(stderr, __VA_ARGS__);                                            \
+    }                                                                          \
+  } while (0)
+
 namespace parcagpu {
 
 // Use Proton's CubinData directly
@@ -83,7 +94,7 @@ public:
   static bool isSupported();
 
   void initialize(CUcontext context);
-  void collectData(CUcontext context, uint32_t correlationId);
+  void collectData(CUcontext context);
   void finalize(CUcontext context);
   void loadModule(const char *cubin, size_t cubinSize);
   void unloadModule(const char *cubin, size_t cubinSize);
@@ -91,8 +102,7 @@ public:
 private:
   ConfigureData *getConfigureData(uint32_t contextId);
   CubinData *getCubinData(uint64_t cubinCrc);
-  void processPCSamplingData(ConfigureData *configureData,
-                             uint32_t correlationId);
+  void processPCSamplingData(ConfigureData *configureData);
 
   proton::ThreadSafeMap<uint32_t, ConfigureData> contextIdToConfigureData;
   proton::ThreadSafeMap<size_t, std::pair<CubinData, size_t>>

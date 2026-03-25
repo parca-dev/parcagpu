@@ -30,7 +30,8 @@ static GraphCorrelationMap g_graphCorrelationMap;
 static std::atomic<uint32_t> g_bufferCycle{0};
 
 // Thread-local tracking: store correlation ID from runtime ENTER
-// so we can skip driver EXIT probe when it matches (driver calls happen under runtime calls)
+// so we can skip driver EXIT probe when it matches (driver calls happen under
+// runtime calls)
 thread_local uint32_t runtimeEnterCorrelationId = 0;
 
 // Token bucket rate limiter (configurable via PARCAGPU_RATE_LIMIT)
@@ -76,17 +77,6 @@ void init_debug() {
   }
 }
 
-#define DEBUG_PRINTF(...)                                                      \
-  do {                                                                         \
-    parcagpu::init_debug();                                                    \
-    if (parcagpu::debug_enabled) {                                             \
-      struct timespec ts;                                                      \
-      clock_gettime(CLOCK_REALTIME, &ts);                                      \
-      fprintf(stderr, "[%ld.%09ld] ", ts.tv_sec, ts.tv_nsec);                  \
-      fprintf(stderr, __VA_ARGS__);                                            \
-    }                                                                          \
-  } while (0)
-
 // Out-of-line USDT probe site for activity batches.
 // Single call site ensures one probe location in the ELF .note.stapsdt section.
 static constexpr int ACTIVITY_BATCH_SIZE = 128;
@@ -95,7 +85,7 @@ static constexpr int ACTIVITY_BATCH_SIZE = 128;
 
 __attribute__((noinline)) void parcagpuActivityBatch(const void **ptrs,
                                                      uint32_t count) {
-  DTRACE_PROBE2(parcagpu, activity_batch, ptrs, count);
+  STAP_PROBE2(parcagpu, activity_batch, ptrs, count);
 }
 
 namespace parcagpu {
@@ -121,14 +111,16 @@ public:
     if (pcSamplingEnabled) {
       DEBUG_PRINTF("[PARCAGPU] PC sampling enabled (continuous mode)\n");
     } else {
-      DEBUG_PRINTF("[PARCAGPU] PC sampling disabled, using kernel activity only\n");
+      DEBUG_PRINTF(
+          "[PARCAGPU] PC sampling disabled, using kernel activity only\n");
     }
 
     // Subscribe to callbacks
-    auto result = proton::cupti::subscribe<true>(&subscriber, callbackHandler,
-                                            nullptr);
+    auto result =
+        proton::cupti::subscribe<true>(&subscriber, callbackHandler, nullptr);
     if (result != CUPTI_SUCCESS) {
-      DEBUG_PRINTF("[PARCAGPU] Failed to subscribe to callbacks: error %d\n", result);
+      DEBUG_PRINTF("[PARCAGPU] Failed to subscribe to callbacks: error %d\n",
+                   result);
       return false;
     }
 
@@ -145,7 +137,9 @@ public:
     result = proton::cupti::activityRegisterCallbacks<true>(allocBuffer,
                                                             completeBuffer);
     if (result != CUPTI_SUCCESS) {
-      DEBUG_PRINTF("[PARCAGPU] Failed to register activity callbacks: error %d\n", result);
+      DEBUG_PRINTF(
+          "[PARCAGPU] Failed to register activity callbacks: error %d\n",
+          result);
       return false;
     }
 
@@ -153,7 +147,9 @@ public:
     result = proton::cupti::activityEnable<true>(
         CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
     if (result != CUPTI_SUCCESS) {
-      DEBUG_PRINTF("[PARCAGPU] Failed to enable concurrent kernel activity: error %d\n", result);
+      DEBUG_PRINTF(
+          "[PARCAGPU] Failed to enable concurrent kernel activity: error %d\n",
+          result);
     } else {
       DEBUG_PRINTF("[PARCAGPU] Enabled CONCURRENT_KERNEL activity\n");
     }
@@ -220,8 +216,8 @@ private:
                  *buffer, *bufferSize);
   }
 
-  static void completeBuffer(CUcontext ctx, uint32_t streamId,
-                              uint8_t *buffer, size_t size, size_t validSize) {
+  static void completeBuffer(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
+                             size_t size, size_t validSize) {
     CUpti_Activity *record = nullptr;
     int recordCount = 0;
     int filteredCount = 0;
@@ -232,21 +228,21 @@ private:
     const void *batchPtrs[ACTIVITY_BATCH_SIZE];
     uint32_t batchCount = 0;
 
-    DEBUG_PRINTF(
-        "[PARCAGPU] completeBuffer called: buffer=%p validSize=%zu\n",
-        buffer, validSize);
+    DEBUG_PRINTF("[PARCAGPU] completeBuffer called: buffer=%p validSize=%zu\n",
+                 buffer, validSize);
 
     // Start a new buffer cycle for graph correlation tracking
     uint32_t cycle = g_bufferCycle.fetch_add(1);
     g_graphCorrelationMap.cycle_start(cycle);
 
     while (true) {
-      CUptiResult result =
-          proton::cupti::activityGetNextRecord<false>(buffer, validSize, &record);
+      CUptiResult result = proton::cupti::activityGetNextRecord<false>(
+          buffer, validSize, &record);
       if (result == CUPTI_ERROR_MAX_LIMIT_REACHED) {
         break;
       } else if (result != CUPTI_SUCCESS) {
-        DEBUG_PRINTF("[PARCAGPU] Error reading activity record: error %d\n", result);
+        DEBUG_PRINTF("[PARCAGPU] Error reading activity record: error %d\n",
+                     result);
         break;
       }
 
@@ -260,7 +256,8 @@ private:
         bool shouldEmit = false;
         if (k->graphId != 0) {
           // Graph kernel - check graph correlation map
-          shouldEmit = g_graphCorrelationMap.check_and_mark_seen(k->correlationId, cycle);
+          shouldEmit = g_graphCorrelationMap.check_and_mark_seen(
+              k->correlationId, cycle);
         } else {
           // Regular kernel - check and remove from correlation filter
           shouldEmit = g_correlationFilter.check_and_remove(k->correlationId);
@@ -310,20 +307,26 @@ private:
     // End cycle - cleanup completed graph entries
     g_graphCorrelationMap.cycle_end();
 
-    DEBUG_PRINTF("[PARCAGPU] Processed %d activity records (%d filtered) from buffer %p\n",
+    DEBUG_PRINTF("[PARCAGPU] Processed %d activity records (%d filtered) from "
+                 "buffer %p\n",
                  recordCount, filteredCount, buffer);
 
     // Reset to 0 rather than decrement - one API callback can produce N
     // activities so decrementing by recordCount can cause underflow
     CuptiProfiler::instance().outstandingEvents = 0;
 
+    // Drain PC sampling data on the buffer-completion thread (off the
+    // application's launch path).
+    if (CuptiProfiler::instance().pcSamplingEnabled && ctx != nullptr) {
+      parcagpu::PCSampling::instance().collectData(ctx);
+    }
+
     // Free the buffer (Proton's pattern)
     std::free(buffer);
   }
 
   static void callbackHandler(void *userdata, CUpti_CallbackDomain domain,
-                              CUpti_CallbackId cbid,
-                              const void *cbdata_void) {
+                              CUpti_CallbackId cbid, const void *cbdata_void) {
     auto &profiler = CuptiProfiler::instance();
 
     if (domain == CUPTI_CB_DOMAIN_RESOURCE) {
@@ -338,23 +341,25 @@ private:
       switch (cbid) {
       case CUPTI_CBID_RESOURCE_MODULE_LOADED: {
         const CUpti_ModuleResourceData *modData =
-            static_cast<const CUpti_ModuleResourceData *>(resData->resourceDescriptor);
+            static_cast<const CUpti_ModuleResourceData *>(
+                resData->resourceDescriptor);
         if (modData && modData->pCubin && modData->cubinSize > 0) {
           DEBUG_PRINTF("[PARCAGPU] Module loaded: cubin=%p size=%zu\n",
                        modData->pCubin, modData->cubinSize);
-          parcagpu::PCSampling::instance().loadModule(
-              modData->pCubin, modData->cubinSize);
+          parcagpu::PCSampling::instance().loadModule(modData->pCubin,
+                                                      modData->cubinSize);
         }
         break;
       }
       case CUPTI_CBID_RESOURCE_MODULE_UNLOAD_STARTING: {
         const CUpti_ModuleResourceData *modData =
-            static_cast<const CUpti_ModuleResourceData *>(resData->resourceDescriptor);
+            static_cast<const CUpti_ModuleResourceData *>(
+                resData->resourceDescriptor);
         if (modData && modData->pCubin && modData->cubinSize > 0) {
           DEBUG_PRINTF("[PARCAGPU] Module unloading: cubin=%p size=%zu\n",
                        modData->pCubin, modData->cubinSize);
-          parcagpu::PCSampling::instance().unloadModule(
-              modData->pCubin, modData->cubinSize);
+          parcagpu::PCSampling::instance().unloadModule(modData->pCubin,
+                                                        modData->cubinSize);
         }
         break;
       }
@@ -391,24 +396,29 @@ private:
         return;
       }
 
-      const char *name = cbdata->symbolName ? cbdata->symbolName : cbdata->functionName;
+      const char *name =
+          cbdata->symbolName ? cbdata->symbolName : cbdata->functionName;
       int signedCbid;
 
       if (domain == CUPTI_CB_DOMAIN_DRIVER_API) {
-        // Skip if this driver call is under a runtime call (same correlation ID)
+        // Skip if this driver call is under a runtime call (same correlation
+        // ID)
         if (correlationId == runtimeEnterCorrelationId) {
-          DEBUG_PRINTF("[PARCAGPU] Skipping driver EXIT correlationId=%u - runtime will handle\n",
+          DEBUG_PRINTF("[PARCAGPU] Skipping driver EXIT correlationId=%u - "
+                       "runtime will handle\n",
                        correlationId);
           return;
         }
         // Pure driver call (no runtime wrapper) - use negative cbid
         signedCbid = -(int)cbid;
-        DEBUG_PRINTF("[PARCAGPU] Driver API callback: cbid=%d, correlationId=%u, func=%s\n",
+        DEBUG_PRINTF("[PARCAGPU] Driver API callback: cbid=%d, "
+                     "correlationId=%u, func=%s\n",
                      cbid, correlationId, name);
       } else if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
         signedCbid = (int)cbid;
         runtimeEnterCorrelationId = 0; // Clear after use
-        DEBUG_PRINTF("[PARCAGPU] Runtime API callback: cbid=%d, correlationId=%u, func=%s\n",
+        DEBUG_PRINTF("[PARCAGPU] Runtime API callback: cbid=%d, "
+                     "correlationId=%u, func=%s\n",
                      cbid, correlationId, name);
       } else {
         return;
@@ -419,12 +429,15 @@ private:
       if (signedCbid < 0) {
         // Driver API: cuGraphLaunch = 514, cuGraphLaunch_ptsz = 515
         int driverCbid = -signedCbid;
-        isGraphLaunch = (driverCbid == CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch ||
-                         driverCbid == CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
+        isGraphLaunch =
+            (driverCbid == CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch ||
+             driverCbid == CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
       } else {
         // Runtime API: cudaGraphLaunch = 311, cudaGraphLaunch_ptsz = 312
-        isGraphLaunch = (signedCbid == CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000 ||
-                         signedCbid == CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000);
+        isGraphLaunch =
+            (signedCbid == CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000 ||
+             signedCbid ==
+                 CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000);
       }
 
       // Rate limit probes using token bucket (skip for graph launches)
@@ -433,14 +446,16 @@ private:
         clock_gettime(CLOCK_MONOTONIC, &ts);
         uint64_t nowNs = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
         if (!rateLimiterTryAcquire(nowNs)) {
-          DEBUG_PRINTF("[PARCAGPU] Rate limited: skipping probe for correlationId=%u\n",
-                       correlationId);
+          DEBUG_PRINTF(
+              "[PARCAGPU] Rate limited: skipping probe for correlationId=%u\n",
+              correlationId);
           return;
         }
       }
 
       profiler.outstandingEvents++;
-      // Emit USDT probe with signed cbid (negative for driver, positive for runtime)
+      // Emit USDT probe with signed cbid (negative for driver, positive for
+      // runtime)
       STAP_PROBE3(parcagpu, cuda_correlation, correlationId, signedCbid, name);
 
       // Insert into correlation filter so we can match kernel activities later
@@ -450,8 +465,9 @@ private:
                      correlationId);
       } else {
         g_correlationFilter.insert(correlationId);
-        DEBUG_PRINTF("[PARCAGPU] Inserted correlationId=%u into correlation filter\n",
-                     correlationId);
+        DEBUG_PRINTF(
+            "[PARCAGPU] Inserted correlationId=%u into correlation filter\n",
+            correlationId);
       }
 
       // Flush if too many events pile up
@@ -460,12 +476,6 @@ private:
                      profiler.outstandingEvents);
         proton::cupti::activityFlushAll<true>(0);
         profiler.outstandingEvents = 0;
-      }
-
-      // Collect PC sampling data after kernel launch (continuous mode)
-      if (profiler.pcSamplingEnabled) {
-        parcagpu::PCSampling::instance().collectData(cbdata->context,
-                                                   correlationId);
       }
     }
   }
