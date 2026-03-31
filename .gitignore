@@ -1,9 +1,7 @@
-cupti/build-*
 build/
-.zig-cache/
-zig-out/
 test/build/
 test/bpf/vmlinux.h
 test/bpf/activity_parser
 test/bpf/activityparser_*.go
 test/bpf/activityparser_*.o
+src/probes.h

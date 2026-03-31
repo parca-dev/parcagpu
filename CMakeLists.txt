@@ -54,6 +54,25 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+# Generate USDT probe header and object from probes.d
+find_program(DTRACE dtrace REQUIRED)
+
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.h
+    COMMAND ${DTRACE} -h -s ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.d
+                         -o ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.h
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.d
+    COMMENT "Generating USDT probe header (probes.h)"
+)
+
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/probes.o
+    COMMAND ${DTRACE} -G -s ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.d
+                         -o ${CMAKE_CURRENT_BINARY_DIR}/probes.o
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.d
+    COMMENT "Generating USDT probe object (probes.o)"
+)
+
 # Collect proton driver source files we need
 # Note: We only link driver APIs and callback utilities (no profiler dependencies)
 set(PROTON_SOURCES
@@ -64,11 +83,19 @@ set(PROTON_SOURCES
 
 # Build the shared library
 add_library(parcagpucupti SHARED
-    src/parcagpu_cupti.cpp
-    src/parcagpu_pc_sampling.cpp
+    src/cupti.cpp
+    src/pc_sampling.cpp
     src/correlation_filter.cpp
     ${PROTON_SOURCES}
 )
+
+# Wire USDT probe artifacts into the build
+add_custom_target(probes_generated
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.h
+            ${CMAKE_CURRENT_BINARY_DIR}/probes.o
+)
+add_dependencies(parcagpucupti probes_generated)
+target_link_libraries(parcagpucupti ${CMAKE_CURRENT_BINARY_DIR}/probes.o)
 
 # Link against system libraries only (NOT libcupti - loaded dynamically by Proton)
 target_link_libraries(parcagpucupti

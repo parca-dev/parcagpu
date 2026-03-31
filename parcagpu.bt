@@ -1,7 +1,7 @@
 #!/usr/bin/env bpftrace
 
 BEGIN {
-    printf("Monitoring CUDA kernel executions via parcagpu USDT probes...\n");
+    printf("Monitoring CUDA activity via parcagpu USDT probes...\n");
     printf("%-20s %-12s %-10s %-10s %-10s %-10s %-10s %-10s %s\n",
            "TIME", "DURATION_NS", "CORR_ID", "DEVICE", "STREAM", "GRAPH", "NODE", "START", "KERNEL");
 }
@@ -17,16 +17,17 @@ usdt:*:parcagpu:kernel_executed {
     $graph_node_id = arg6;
     $kernel_name = str(arg7);
 
-    printf("%-20s %-12lu %-10u %-10u %-10u %-10u %-10lu %-10lu %s\n",
-           strftime("%H:%M:%S.%f", nsecs),
+    printf("%-12s.%-6u %-12lu %-10u %-10u %-10u %-10u %-10lu %-10lu ",
+           strftime("%H:%M:%S", nsecs),
+           (nsecs % 1000000000) / 1000,
            $duration,
            $correlation_id,
            $device_id,
            $stream_id,
            $graph_id,
            $graph_node_id,
-           $start,
-           $kernel_name);
+           $start);
+    printf("%s\n", $kernel_name);
 }
 
 usdt:*:parcagpu:cuda_correlation {
@@ -34,7 +35,63 @@ usdt:*:parcagpu:cuda_correlation {
     $cbid = arg1;
     $name = str(arg2);
 
-    printf("%-20s [CORR] %u: cbid=%u %s\n", strftime("%H:%M:%S.%f", nsecs),$correlation_id, $cbid, $name);
+    printf("%-12s.%-6u [CORR] %u: cbid=%u %s\n", strftime("%H:%M:%S", nsecs), (nsecs % 1000000000) / 1000, $correlation_id, $cbid, $name);
+}
+
+usdt:*:parcagpu:pc_sample_summary {
+    $function_index = arg0;
+    $pc_offset = arg1;
+    $total_samples = arg2;
+    $stalled_samples = arg3;
+    $source_path = str(arg4);
+    $line_number = arg5;
+    $function_name = str(arg6);
+
+    printf("%-12s.%-6u [PC_SAMPLE] func=%u pc=0x%lx total=%lu stalled=%lu %s:%u %s\n",
+           strftime("%H:%M:%S", nsecs),
+           (nsecs % 1000000000) / 1000,
+           $function_index,
+           $pc_offset,
+           $total_samples,
+           $stalled_samples,
+           $source_path,
+           $line_number,
+           $function_name);
+}
+
+usdt:*:parcagpu:pc_stall_reason {
+    $function_index = arg0;
+    $pc_offset = arg1;
+    $stall_reason_index = arg2;
+    $stall_reason_name = str(arg3);
+    $samples = arg4;
+
+    printf("%-12s.%-6u [STALL]     func=%u pc=0x%lx reason[%u]=%s samples=%lu\n",
+           strftime("%H:%M:%S", nsecs),
+           (nsecs % 1000000000) / 1000,
+           $function_index,
+           $pc_offset,
+           $stall_reason_index,
+           $stall_reason_name,
+           $samples);
+}
+
+usdt:*:parcagpu:cubin_loaded {
+    $cubin_crc = arg0;
+
+    printf("%-12s.%-6u [CUBIN_LOAD] crc=0x%lx\n",
+           strftime("%H:%M:%S", nsecs),
+           (nsecs % 1000000000) / 1000,
+           $cubin_crc);
+}
+
+usdt:*:parcagpu:cubin_unloaded {
+    $cubin_crc = arg0;
+
+    printf("%-12s.%-6u [CUBIN_UNLOAD] crc=0x%lx\n",
+           strftime("%H:%M:%S", nsecs),
+           (nsecs % 1000000000) / 1000,
+           $cubin_crc);
 }
 
 END {

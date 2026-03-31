@@ -1,5 +1,5 @@
-#ifndef PARCAGPU_PC_SAMPLING_H_
-#define PARCAGPU_PC_SAMPLING_H_
+#ifndef PC_SAMPLING_H_
+#define PC_SAMPLING_H_
 
 #include <atomic>
 #include <map>
@@ -7,7 +7,6 @@
 #include <mutex>
 #include <set>
 #include <string>
-#include <sys/sdt.h>
 #include <vector>
 
 #include <cuda.h>
@@ -17,7 +16,6 @@
 #include "Profiler/Cupti/CuptiPCSampling.h"
 #include "Utility/Map.h"
 #include "Utility/Set.h"
-#include "Utility/Singleton.h"
 
 #define DEBUG_PRINTF(...)                                                      \
   do {                                                                         \
@@ -80,21 +78,25 @@ struct ConfigureData {
   uint32_t *stallReasonIndices{};
   std::map<size_t, size_t> stallReasonIndexToMetricIndex{};
   std::set<size_t> notIssuedStallReasonIndices{};
-  CUpti_PCSamplingData pcSamplingData{};
+  CUpti_PCSamplingData pcSamplingData{};       // registered with CUPTI config
+  CUpti_PCSamplingData outputData{};           // separate buffer for getData calls
   std::vector<CUpti_PCSamplingConfigurationInfo> configurationInfos;
 };
 
-// PC Sampling singleton class (adapted from Proton's CuptiPCSampling)
-class PCSampling : public proton::Singleton<PCSampling> {
+// PC Sampling class (adapted from Proton's CuptiPCSampling)
+// Owned by CuptiProfiler — not a standalone singleton, so lifetime
+// is tied to the profiler and there are no static destruction order issues.
+class PCSampling {
 public:
   PCSampling() = default;
-  virtual ~PCSampling() = default;
+  ~PCSampling() = default;
 
   // Check if PC sampling is supported (CUPTI >= 12.8.1)
   static bool isSupported();
 
   void initialize(CUcontext context);
   void collectData(CUcontext context);
+  void collectAllData();
   void finalize(CUcontext context);
   void loadModule(const char *cubin, size_t cubinSize);
   void unloadModule(const char *cubin, size_t cubinSize);
@@ -108,6 +110,10 @@ private:
   proton::ThreadSafeMap<size_t, std::pair<CubinData, size_t>>
       cubinCrcToCubinData;
   proton::ThreadSafeSet<uint32_t> contextInitialized;
+
+  // Plain vector of initialized context IDs for iteration in collectAllData.
+  // Protected by contextMutex.
+  std::vector<uint32_t> initializedContextIds;
 
   std::mutex contextMutex{};
 };

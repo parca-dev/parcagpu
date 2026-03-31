@@ -1,22 +1,21 @@
-#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <memory>
-#include <sys/sdt.h>
 #include <time.h>
 #include <unistd.h>
+
+// USDT probes — must come before any header that might include <sys/sdt.h>,
+// so that _SDT_HAS_SEMAPHORES is defined first.
+#include "probes.h"
 
 // Include proton headers
 #include "Driver/GPU/CuptiApi.h"
 #include "Profiler/Cupti/CuptiCallbacks.h"
 #include "Utility/Singleton.h"
 #include "correlation_filter.h"
-#include "parcagpu_pc_sampling.h"
-
-#include <cupti.h>
+#include "pc_sampling.h"
 
 namespace parcagpu {
 
@@ -85,7 +84,7 @@ static constexpr int ACTIVITY_BATCH_SIZE = 128;
 
 __attribute__((noinline)) void parcagpuActivityBatch(const void **ptrs,
                                                      uint32_t count) {
-  STAP_PROBE2(parcagpu, activity_batch, ptrs, count);
+  PARCAGPU_ACTIVITY_BATCH(ptrs, count);
 }
 
 namespace parcagpu {
@@ -165,19 +164,27 @@ public:
 
     DEBUG_PRINTF("[PARCAGPU] Cleanup started\n");
 
-    // Flush any remaining activity records
-    proton::cupti::activityFlushAll<true>(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
+    // PC sampling data is drained in finalize() during CONTEXT_DESTROY_STARTING
+    // when the CUDA context is still valid. By the time cleanup() runs, the
+    // context may already be dead, so we don't drain here.
 
-    // Disable activity recording
-    proton::cupti::activityDisable<true>(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
-
-    // Disable all callbacks (using Proton's utilities)
+    // Disable all callbacks
     if (subscriber) {
       proton::setRuntimeCallbacks(subscriber, /*enable=*/false);
       proton::setLaunchCallbacks(subscriber, /*enable=*/false);
       if (pcSamplingEnabled) {
         proton::setResourceCallbacks(subscriber, /*enable=*/false);
       }
+    }
+
+    // Flush any remaining activity records
+    proton::cupti::activityFlushAll<true>(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
+
+    // Disable activity recording
+    proton::cupti::activityDisable<true>(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+
+    // Unsubscribe
+    if (subscriber) {
       proton::cupti::unsubscribe<true>(subscriber);
       subscriber = nullptr;
     }
@@ -189,6 +196,9 @@ private:
   std::atomic<bool> initialized{false};
   bool pcSamplingEnabled = false;
   CUpti_SubscriberHandle subscriber = nullptr;
+
+  // PC sampling state — owned by this profiler, destroyed with it.
+  parcagpu::PCSampling pcSampling;
 
   // Outstanding event counter for flushing
   size_t outstandingEvents = 0;
@@ -205,6 +215,10 @@ private:
 
   static void allocBuffer(uint8_t **buffer, size_t *bufferSize,
                           size_t *maxNumRecords) {
+    if (!PARCAGPU_CUDA_CORRELATION_ENABLED()) {
+      *buffer = nullptr;
+      return;
+    }
     *buffer = static_cast<uint8_t *>(aligned_alloc(AlignSize, BufferSize));
     if (*buffer == nullptr) {
       DEBUG_PRINTF("[PARCAGPU] ERROR: aligned_alloc failed\n");
@@ -228,8 +242,9 @@ private:
     const void *batchPtrs[ACTIVITY_BATCH_SIZE];
     uint32_t batchCount = 0;
 
-    DEBUG_PRINTF("[PARCAGPU] completeBuffer called: buffer=%p validSize=%zu\n",
-                 buffer, validSize);
+    DEBUG_PRINTF(
+        "[PARCAGPU] completeBuffer called: ctx=%p buffer=%p validSize=%zu\n",
+        ctx, buffer, validSize);
 
     // Start a new buffer cycle for graph correlation tracking
     uint32_t cycle = g_bufferCycle.fetch_add(1);
@@ -279,9 +294,9 @@ private:
                      k->end - k->start);
 
         // Emit USDT probe for kernel execution
-        STAP_PROBE8(parcagpu, kernel_executed, k->start, k->end,
-                    k->correlationId, k->deviceId, k->streamId, k->graphId,
-                    k->graphNodeId, k->name);
+        PARCAGPU_KERNEL_EXECUTED(k->start, k->end, k->correlationId,
+                                 k->deviceId, k->streamId, k->graphId,
+                                 k->graphNodeId, k->name);
         break;
       }
       default:
@@ -315,12 +330,6 @@ private:
     // activities so decrementing by recordCount can cause underflow
     CuptiProfiler::instance().outstandingEvents = 0;
 
-    // Drain PC sampling data on the buffer-completion thread (off the
-    // application's launch path).
-    if (CuptiProfiler::instance().pcSamplingEnabled && ctx != nullptr) {
-      parcagpu::PCSampling::instance().collectData(ctx);
-    }
-
     // Free the buffer (Proton's pattern)
     std::free(buffer);
   }
@@ -346,8 +355,7 @@ private:
         if (modData && modData->pCubin && modData->cubinSize > 0) {
           DEBUG_PRINTF("[PARCAGPU] Module loaded: cubin=%p size=%zu\n",
                        modData->pCubin, modData->cubinSize);
-          parcagpu::PCSampling::instance().loadModule(modData->pCubin,
-                                                      modData->cubinSize);
+          profiler.pcSampling.loadModule(modData->pCubin, modData->cubinSize);
         }
         break;
       }
@@ -358,27 +366,30 @@ private:
         if (modData && modData->pCubin && modData->cubinSize > 0) {
           DEBUG_PRINTF("[PARCAGPU] Module unloading: cubin=%p size=%zu\n",
                        modData->pCubin, modData->cubinSize);
-          parcagpu::PCSampling::instance().unloadModule(modData->pCubin,
-                                                        modData->cubinSize);
+          profiler.pcSampling.unloadModule(modData->pCubin, modData->cubinSize);
         }
         break;
       }
       case CUPTI_CBID_RESOURCE_CONTEXT_CREATED: {
         CUcontext ctx = resData->context;
         DEBUG_PRINTF("[PARCAGPU] Context created: %p\n", ctx);
-        parcagpu::PCSampling::instance().initialize(ctx);
+        profiler.pcSampling.initialize(ctx);
         break;
       }
       case CUPTI_CBID_RESOURCE_CONTEXT_DESTROY_STARTING: {
         CUcontext ctx = resData->context;
         DEBUG_PRINTF("[PARCAGPU] Context destroying: %p\n", ctx);
-        parcagpu::PCSampling::instance().finalize(ctx);
+        profiler.pcSampling.finalize(ctx);
         break;
       }
       default:
         break;
       }
     } else {
+      // No profiler attached — skip all correlation/rate-limiter work.
+      if (!PARCAGPU_CUDA_CORRELATION_ENABLED())
+        return;
+
       // Handle both Runtime and Driver API callbacks
       // Track runtime ENTER so we can skip driver EXIT when they match
       const CUpti_CallbackData *cbdata =
@@ -456,7 +467,13 @@ private:
       profiler.outstandingEvents++;
       // Emit USDT probe with signed cbid (negative for driver, positive for
       // runtime)
-      STAP_PROBE3(parcagpu, cuda_correlation, correlationId, signedCbid, name);
+      PARCAGPU_CUDA_CORRELATION(correlationId, signedCbid, name);
+
+      // Drain PC sampling data on kernel launch EXIT — the context from
+      // cbdata is always valid here, unlike in completeBuffer or at shutdown.
+      if (profiler.pcSamplingEnabled) {
+        profiler.pcSampling.collectData(cbdata->context);
+      }
 
       // Insert into correlation filter so we can match kernel activities later
       if (isGraphLaunch) {
