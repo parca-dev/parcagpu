@@ -11,6 +11,7 @@ provider parcagpu {
                            const char *functionName);
   probe pc_stall_reason(uint32_t functionIndex, uint64_t pcOffset,
                          uint32_t stallReasonIndex, uint32_t samples);
+  probe stall_reason_map(const char *names, uint32_t count);
   probe cubin_loaded(uint64_t cubinCrc, int reserved1, int reserved2);
   probe cubin_unloaded(uint64_t cubinCrc, int reserved);
 };

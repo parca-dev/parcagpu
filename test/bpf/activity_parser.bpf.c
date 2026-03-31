@@ -26,6 +26,8 @@
 
 #define MAX_BATCH_SIZE 128
 #define MAX_KERNEL_NAME 128
+#define STALL_REASON_NAME_LEN 64
+#define MAX_STALL_REASONS 64
 
 // USDT spec map — populated by Go loader before uprobe attachment.
 // Keyed by spec ID (uint32); value is struct bpf_usdt_spec.
@@ -53,6 +55,23 @@ struct kernel_event {
 struct bpf_map_def events SEC("maps") = {
     .type = BPF_MAP_TYPE_RINGBUF,
     .max_entries = 1 << 20, // 1 MB
+};
+
+// Stall reason name table — indexed by stall reason index.
+// Value is a 64-byte null-terminated string.
+struct bpf_map_def stall_reasons SEC("maps") = {
+    .type = BPF_MAP_TYPE_ARRAY,
+    .key_size = sizeof(u32),
+    .value_size = STALL_REASON_NAME_LEN,
+    .max_entries = MAX_STALL_REASONS,
+};
+
+// Whether the stall reason map has been populated.
+struct bpf_map_def stall_map_loaded SEC("maps") = {
+    .type = BPF_MAP_TYPE_ARRAY,
+    .key_size = sizeof(u32),
+    .value_size = sizeof(u32),
+    .max_entries = 1,
 };
 
 // Stats counters.
@@ -145,6 +164,38 @@ int BPF_USDT(handle_activity_batch, u64 ptrs_base, u32 num_activities) {
     bpf_ringbuf_submit(evt, 0);
   }
 
+  return 0;
+}
+
+SEC("usdt/parcagpu/stall_reason_map")
+int BPF_USDT(handle_stall_reason_map, u64 names_base, u32 count) {
+  // Only load the map once.
+  u32 zero = 0;
+  u32 *loaded = bpf_map_lookup_elem(&stall_map_loaded, &zero);
+  if (!loaded)
+    return 0;
+  if (*loaded)
+    return 0;
+
+  if (count > MAX_STALL_REASONS)
+    count = MAX_STALL_REASONS;
+
+  // Read each 64-byte name slot and store in the BPF map.
+  for (u32 i = 0; i < MAX_STALL_REASONS; i++) {
+    if (i >= count)
+      break;
+
+    char name[STALL_REASON_NAME_LEN] = {};
+    int ret = bpf_probe_read_user(name, sizeof(name),
+                                  (void *)(names_base + (u64)i * STALL_REASON_NAME_LEN));
+    if (ret != 0)
+      continue;
+
+    bpf_map_update_elem(&stall_reasons, &i, name, BPF_ANY);
+  }
+
+  u32 one = 1;
+  bpf_map_update_elem(&stall_map_loaded, &zero, &one, BPF_ANY);
   return 0;
 }
 

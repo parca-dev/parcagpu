@@ -397,7 +397,13 @@ void PCSampling::initialize(CUcontext context) {
       [&]() { return !contextInitialized.contain(contextId); }, contextMutex,
       [&]() {
         enablePCSampling(context);
-        getConfigureData(contextId)->initialize(context);
+        auto *configData = getConfigureData(contextId);
+        configData->initialize(context);
+
+        // Build contiguous stall reason map for USDT probe emission.
+        stallReasonMap.build(configData->numStallReasons,
+                            configData->stallReasonIndices,
+                            configData->stallReasonNames);
 
         contextInitialized.insert(contextId);
         initializedContextIds.push_back(contextId);
@@ -504,6 +510,13 @@ void PCSampling::collectData(CUcontext context) {
   DEBUG_PRINTF("Collecting PC sampling data for context %u (cfg total=%zu remaining=%zu)\n",
                contextId, configureData->pcSamplingData.totalNumPcs,
                configureData->pcSamplingData.remainingNumPcs);
+
+  // Re-emit stall reason map periodically so the profiler backend can
+  // join stall reason indices to human-readable names.
+  if (stallReasonMap.data() && stallReasonMapLimiter.tryAcquire()) {
+    PARCAGPU_STALL_REASON_MAP(stallReasonMap.data(),
+                              stallReasonMap.numEntries());
+  }
 
   // Use the separate output buffer for getData — the configured
   // pcSamplingData buffer is owned by CUPTI.

@@ -16,6 +16,7 @@
 #include "Utility/Singleton.h"
 #include "correlation_filter.h"
 #include "pc_sampling.h"
+#include "token_bucket.h"
 
 namespace parcagpu {
 
@@ -33,32 +34,9 @@ static std::atomic<uint32_t> g_bufferCycle{0};
 // runtime calls)
 thread_local uint32_t runtimeEnterCorrelationId = 0;
 
-// Token bucket rate limiter (configurable via PARCAGPU_RATE_LIMIT)
-double rateLimitPerSec = 100.0;
-
-// Thread-local token bucket state
-thread_local uint64_t lastRefillNs = 0;
-thread_local double tokens = 0;
-
-// Returns true if the sample should be emitted, false if rate limited
-bool rateLimiterTryAcquire(uint64_t nowNs) {
-  if (lastRefillNs > 0) {
-    double elapsedSec = (nowNs - lastRefillNs) / 1e9;
-    tokens = tokens + elapsedSec * rateLimitPerSec;
-    if (tokens > rateLimitPerSec) {
-      tokens = rateLimitPerSec;
-    }
-  } else {
-    tokens = rateLimitPerSec; // Start with full bucket
-  }
-  lastRefillNs = nowNs;
-
-  if (tokens >= 1.0) {
-    tokens -= 1.0;
-    return true;
-  }
-  return false;
-}
+// Thread-local rate limiter for callback probes (default 100/sec,
+// configurable via PARCAGPU_RATE_LIMIT).
+thread_local TokenBucket callbackLimiter(100.0);
 
 void init_debug() {
   static bool initialized = false;
@@ -69,7 +47,7 @@ void init_debug() {
     if (rateEnv != nullptr) {
       double rate = atof(rateEnv);
       if (rate > 0) {
-        rateLimitPerSec = rate;
+        callbackLimiter.setRate(rate);
       }
     }
     initialized = true;
@@ -386,12 +364,7 @@ private:
         break;
       }
     } else {
-      // No profiler attached — skip all correlation/rate-limiter work.
-      if (!PARCAGPU_CUDA_CORRELATION_ENABLED())
-        return;
-
       // Handle both Runtime and Driver API callbacks
-      // Track runtime ENTER so we can skip driver EXIT when they match
       const CUpti_CallbackData *cbdata =
           static_cast<const CUpti_CallbackData *>(cbdata_void);
       uint32_t correlationId = cbdata->correlationId;
@@ -406,6 +379,17 @@ private:
       if (cbdata->callbackSite != CUPTI_API_EXIT) {
         return;
       }
+
+      // Drain PC sampling data on kernel launch EXIT — the context from
+      // cbdata is always valid here, unlike in completeBuffer or at shutdown.
+      // Runs regardless of which USDT probes are attached.
+      if (profiler.pcSamplingEnabled) {
+        profiler.pcSampling.collectData(cbdata->context);
+      }
+
+      // Skip correlation/rate-limiter work when no profiler is attached.
+      if (!PARCAGPU_CUDA_CORRELATION_ENABLED())
+        return;
 
       const char *name =
           cbdata->symbolName ? cbdata->symbolName : cbdata->functionName;
@@ -453,10 +437,7 @@ private:
 
       // Rate limit probes using token bucket (skip for graph launches)
       if (!limiter_disabled && !isGraphLaunch) {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        uint64_t nowNs = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-        if (!rateLimiterTryAcquire(nowNs)) {
+        if (!callbackLimiter.tryAcquire()) {
           DEBUG_PRINTF(
               "[PARCAGPU] Rate limited: skipping probe for correlationId=%u\n",
               correlationId);
@@ -468,12 +449,6 @@ private:
       // Emit USDT probe with signed cbid (negative for driver, positive for
       // runtime)
       PARCAGPU_CUDA_CORRELATION(correlationId, signedCbid, name);
-
-      // Drain PC sampling data on kernel launch EXIT — the context from
-      // cbdata is always valid here, unlike in completeBuffer or at shutdown.
-      if (profiler.pcSamplingEnabled) {
-        profiler.pcSampling.collectData(cbdata->context);
-      }
 
       // Insert into correlation filter so we can match kernel activities later
       if (isGraphLaunch) {

@@ -43,19 +43,15 @@ usdt:*:parcagpu:pc_sample_summary {
     $pc_offset = arg1;
     $total_samples = arg2;
     $stalled_samples = arg3;
-    $source_path = str(arg4);
-    $line_number = arg5;
-    $function_name = str(arg6);
+    $function_name = str(arg4);
 
-    printf("%-12s.%-6u [PC_SAMPLE] func=%u pc=0x%lx total=%lu stalled=%lu %s:%u %s\n",
+    printf("%-12s.%-6u [PC_SAMPLE] func=%u pc=0x%lx total=%lu stalled=%lu %s\n",
            strftime("%H:%M:%S", nsecs),
            (nsecs % 1000000000) / 1000,
            $function_index,
            $pc_offset,
            $total_samples,
            $stalled_samples,
-           $source_path,
-           $line_number,
            $function_name);
 }
 
@@ -63,17 +59,26 @@ usdt:*:parcagpu:pc_stall_reason {
     $function_index = arg0;
     $pc_offset = arg1;
     $stall_reason_index = arg2;
-    $stall_reason_name = str(arg3);
-    $samples = arg4;
+    $samples = arg3;
 
-    printf("%-12s.%-6u [STALL]     func=%u pc=0x%lx reason[%u]=%s samples=%lu\n",
+    printf("%-12s.%-6u [STALL]     func=%u pc=0x%lx reason[%u] samples=%lu\n",
            strftime("%H:%M:%S", nsecs),
            (nsecs % 1000000000) / 1000,
            $function_index,
            $pc_offset,
            $stall_reason_index,
-           $stall_reason_name,
            $samples);
+}
+
+usdt:*:parcagpu:stall_reason_map {
+    $names = arg0;
+    $count = arg1;
+
+    printf("%-12s.%-6u [STALL_MAP] count=%u base=%p\n",
+           strftime("%H:%M:%S", nsecs),
+           (nsecs % 1000000000) / 1000,
+           $count,
+           $names);
 }
 
 usdt:*:parcagpu:cubin_loaded {

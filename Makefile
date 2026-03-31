@@ -1,4 +1,4 @@
-.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug bpf-test test-multi
+.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug bpf-test test-multi test-pc-real
 
 LIB_NAME = libparcagpucupti.so
 
@@ -134,6 +134,37 @@ test-multi: local bpf-test
 	sleep 1; \
 	sudo kill $${BPF_PID} 2>/dev/null; wait $${BPF_PID} 2>/dev/null; \
 	echo "=== test-multi completed (test exit: $${TEST_EXIT}) ==="
+
+# Run pc_sample_toy with BPF activity parser and verify stall reason map is received.
+# Requires: real GPU, root (sudo) for BPF, pc_sample_toy compiled separately.
+test-pc-real: local bpf-test
+	@echo "=== Running PC sampling smoke test ==="
+	@LIB_PATH="$$(pwd)/build-local/lib/libparcagpucupti.so"; \
+	TOY="$$(pwd)/microbenchmarks/pc_sample_toy"; \
+	if [ ! -x "$$TOY" ]; then \
+		echo "error: $$TOY not found — compile with: /usr/local/cuda/bin/nvcc -o microbenchmarks/pc_sample_toy microbenchmarks/pc_sample_toy.cu" >&2; \
+		exit 1; \
+	fi; \
+	PARCAGPU_SAMPLING_FACTOR=18 CUDA_INJECTION64_PATH="$$LIB_PATH" "$$TOY" 3 & \
+	TOY_PID=$$!; \
+	echo "pc_sample_toy PID: $${TOY_PID}"; \
+	while kill -0 $${TOY_PID} 2>/dev/null && ! grep -q libparcagpucupti "/proc/$${TOY_PID}/maps" 2>/dev/null; do \
+		sleep 0.1; \
+	done; \
+	echo "Starting BPF activity parser (requires root)..."; \
+	sudo test/bpf/activity_parser -pid $${TOY_PID} -lib "$$LIB_PATH" -v 2>&1 | tee /tmp/parcagpu-pc-test.log & \
+	BPF_PID=$$!; \
+	wait $${TOY_PID} 2>/dev/null; \
+	sleep 1; \
+	sudo kill $${BPF_PID} 2>/dev/null; wait $${BPF_PID} 2>/dev/null; \
+	echo; \
+	if grep -q 'stall reason map:' /tmp/parcagpu-pc-test.log && \
+	   grep -q 'smsp__pcsamp' /tmp/parcagpu-pc-test.log; then \
+		echo "=== PASS: stall reason map received ==="; \
+	else \
+		echo "=== FAIL: stall reason map not found in output ===" >&2; \
+		exit 1; \
+	fi
 
 format:
 	@echo "=== Formatting source files ==="

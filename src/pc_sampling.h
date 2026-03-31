@@ -9,6 +9,9 @@
 #include <string>
 #include <vector>
 
+#include "stall_reason_map.h"
+#include "token_bucket.h"
+
 #include <cuda.h>
 #include <cupti.h>
 
@@ -116,6 +119,12 @@ private:
   std::vector<uint32_t> initializedContextIds;
 
   std::mutex contextMutex{};
+
+  // Contiguous stall reason map for USDT probe emission.
+  StallReasonMap stallReasonMap;
+
+  // Rate limiter for stall reason map re-emission (1 token per 10 seconds).
+  TokenBucket stallReasonMapLimiter{0.1};
 };
 
 } // namespace parcagpu

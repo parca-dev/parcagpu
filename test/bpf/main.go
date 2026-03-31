@@ -107,52 +107,63 @@ func main() {
 		log.Fatalf("Parsing USDT probes: %v", err)
 	}
 
-	// Find parcagpu:activity_batch probe(s) and attach uprobe at each site.
+	// Find USDT probes and attach uprobes at each site.
 	ex, err := link.OpenExecutable(realLib)
 	if err != nil {
 		log.Fatalf("Opening executable %s: %v", realLib, err)
 	}
 
+	type probeTarget struct {
+		name    string
+		handler *ebpf.Program
+	}
+	targets := []probeTarget{
+		{"activity_batch", objs.HandleActivityBatch},
+		{"stall_reason_map", objs.HandleStallReasonMap},
+	}
+
 	var links []link.Link
 	var specID uint32
-	for _, probe := range probes {
-		if probe.Provider != "parcagpu" || probe.Name != "activity_batch" {
-			continue
+	for _, t := range targets {
+		for _, probe := range probes {
+			if probe.Provider != "parcagpu" || probe.Name != t.name {
+				continue
+			}
+
+			// Parse the stapsdt argument spec into a bpf_usdt_spec.
+			spec, err := pfelf.ParseUSDTArguments(probe.Arguments)
+			if err != nil {
+				log.Fatalf("Parsing USDT args %q: %v", probe.Arguments, err)
+			}
+
+			// Store spec in the BPF map so bpf_usdt_arg() can look it up.
+			specBytes := pfelf.USDTSpecToBytes(spec)
+			if err := objs.BpfUsdtSpecs.Put(specID, specBytes); err != nil {
+				log.Fatalf("Populating USDT spec map: %v", err)
+			}
+
+			// Cookie: spec_id in high 32 bits (bpf_usdt_arg reads it via bpf_get_attach_cookie).
+			cookie := uint64(specID) << 32
+
+			log.Printf("USDT probe parcagpu:%s at offset 0x%x, args=%q, spec_id=%d",
+				t.name, probe.Location, probe.Arguments, specID)
+
+			up, err := ex.Uprobe(t.name, t.handler, &link.UprobeOptions{
+				Address:      probe.Location,
+				PID:          *pid,
+				Cookie:       cookie,
+				RefCtrOffset: probe.SemaphoreOffset,
+			})
+			if err != nil {
+				log.Fatalf("Attaching uprobe for %s at offset 0x%x: %v", t.name, probe.Location, err)
+			}
+			links = append(links, up)
+			specID++
 		}
-
-		// Parse the stapsdt argument spec into a bpf_usdt_spec.
-		spec, err := pfelf.ParseUSDTArguments(probe.Arguments)
-		if err != nil {
-			log.Fatalf("Parsing USDT args %q: %v", probe.Arguments, err)
-		}
-
-		// Store spec in the BPF map so bpf_usdt_arg() can look it up.
-		specBytes := pfelf.USDTSpecToBytes(spec)
-		if err := objs.BpfUsdtSpecs.Put(specID, specBytes); err != nil {
-			log.Fatalf("Populating USDT spec map: %v", err)
-		}
-
-		// Cookie: spec_id in high 32 bits (bpf_usdt_arg reads it via bpf_get_attach_cookie).
-		cookie := uint64(specID) << 32
-
-		log.Printf("USDT probe parcagpu:activity_batch at offset 0x%x, args=%q, spec_id=%d",
-			probe.Location, probe.Arguments, specID)
-
-		up, err := ex.Uprobe("activity_batch", objs.HandleActivityBatch, &link.UprobeOptions{
-			Address:      probe.Location,
-			PID:          *pid,
-			Cookie:       cookie,
-			RefCtrOffset: probe.SemaphoreOffset,
-		})
-		if err != nil {
-			log.Fatalf("Attaching uprobe at offset 0x%x: %v", probe.Location, err)
-		}
-		links = append(links, up)
-		specID++
 	}
 
 	if len(links) == 0 {
-		log.Fatalf("No parcagpu:activity_batch USDT probes found in %s", realLib)
+		log.Fatalf("No parcagpu USDT probes found in %s", realLib)
 	}
 	defer func() {
 		for _, l := range links {
@@ -233,6 +244,7 @@ func main() {
 	fmt.Println()
 	log.Printf("Final stats:")
 	printStats(&objs, eventCount)
+	printStallReasonMap(&objs)
 }
 
 func printStats(objs *activityParserObjects, eventCount uint64) {
@@ -249,6 +261,29 @@ func printStats(objs *activityParserObjects, eventCount uint64) {
 
 	log.Printf("  batches=%d activities_scanned=%d kernels_found=%d events_received=%d drops=%d",
 		batches, activities, kernels, eventCount, drops)
+}
+
+func printStallReasonMap(objs *activityParserObjects) {
+	// Check if the stall reason map was populated by BPF.
+	var loaded uint32
+	loadedKey := uint32(0)
+	if err := objs.StallMapLoaded.Lookup(&loadedKey, &loaded); err != nil || loaded == 0 {
+		log.Printf("  stall reason map: not received")
+		return
+	}
+
+	log.Printf("  stall reason map:")
+	for i := uint32(0); i < 64; i++ {
+		var name [64]byte
+		if err := objs.StallReasons.Lookup(&i, &name); err != nil {
+			continue
+		}
+		s := cString(name[:])
+		if s == "" {
+			continue
+		}
+		log.Printf("    [%2d] %s", i, s)
+	}
 }
 
 func raiseMemlock() error {
