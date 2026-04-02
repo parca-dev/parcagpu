@@ -1,7 +1,7 @@
-#include "probes.h"
 #include "Driver/GPU/CudaApi.h"
 #include "Driver/GPU/CuptiApi.h"
 #include "pc_sampling.h"
+#include "probes.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +18,26 @@ namespace parcagpu {
 // Debug logging (reuse from main file)
 extern bool debug_enabled;
 extern void init_debug();
+
+// noinline wrappers so each USDT probe has exactly one call site in the
+// binary.  Multiple call sites produce multiple .note.stapsdt entries with
+// different argument encodings, which complicates BPF attachment.
+__attribute__((noinline)) void fireCubinLoaded(uint64_t crc, const char *cubin,
+                                               uint64_t size) {
+  PARCAGPU_CUBIN_LOADED(crc, cubin, size);
+}
+
+__attribute__((noinline)) void fireCubinUnloaded(uint64_t crc) {
+  PARCAGPU_CUBIN_UNLOADED(crc);
+}
+
+// Max records per pc_sample_batch probe invocation.
+static constexpr uint32_t PCSampleBatchSize = 128;
+
+__attribute__((noinline)) void firePCSampleBatch(
+    const void **ptrs, uint32_t count) {
+  PARCAGPU_PC_SAMPLE_BATCH(ptrs, count);
+}
 
 namespace {
 
@@ -82,8 +102,8 @@ bool getPCSamplingData(CUcontext context,
   };
   auto result = proton::cupti::pcSamplingGetData<false>(&params);
   if (result != CUPTI_SUCCESS) {
-    DEBUG_PRINTF("cuptiPCSamplingGetData failed: error %d (ctx=%p)\n",
-                 result, context);
+    DEBUG_PRINTF("cuptiPCSamplingGetData failed: error %d (ctx=%p)\n", result,
+                 context);
     return false;
   }
   return true;
@@ -328,7 +348,8 @@ void ConfigureData::initialize(CUcontext context) {
   configurationInfos.emplace_back(configureCollectionMode());
   configurationInfos.emplace_back(configureSamplingBuffer());
   // Don't set sampling period — let CUPTI use its default.
-  // Explicit period values silently break sampling on some GPUs (e.g. Blackwell).
+  // Explicit period values silently break sampling on some GPUs (e.g.
+  // Blackwell).
 
   setConfigurationAttribute(context, configurationInfos);
 
@@ -350,7 +371,8 @@ bool PCSampling::isSupported() {
   // If unset, PC sampling is disabled.
   const char *env = getenv("PARCAGPU_SAMPLING_FACTOR");
   if (!env) {
-    DEBUG_PRINTF("PC sampling not enabled (PARCAGPU_SAMPLING_FACTOR not set)\n");
+    DEBUG_PRINTF(
+        "PC sampling not enabled (PARCAGPU_SAMPLING_FACTOR not set)\n");
     return false;
   }
   int factor = atoi(env);
@@ -402,8 +424,8 @@ void PCSampling::initialize(CUcontext context) {
 
         // Build contiguous stall reason map for USDT probe emission.
         stallReasonMap.build(configData->numStallReasons,
-                            configData->stallReasonIndices,
-                            configData->stallReasonNames);
+                             configData->stallReasonIndices,
+                             configData->stallReasonNames);
 
         contextInitialized.insert(contextId);
         initializedContextIds.push_back(contextId);
@@ -422,30 +444,21 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData) {
   DEBUG_PRINTF("Processing %zu PCs (remaining: %zu)\n",
                pcSamplingData->totalNumPcs, pcSamplingData->remainingNumPcs);
 
-  // Process each PC sample
-  for (size_t i = 0; i < pcSamplingData->totalNumPcs; ++i) {
-    auto *pcData = pcSamplingData->pPcData + i;
+  if (debug_enabled) {
+    for (size_t i = 0; i < pcSamplingData->totalNumPcs; ++i) {
+      auto *pcData = pcSamplingData->pPcData + i;
 
-    // Calculate total and stalled samples
-    uint64_t totalSamples = 0;
-    uint64_t stalledSamples = 0;
-
-    for (size_t j = 0; j < pcData->stallReasonCount; ++j) {
-      auto *stallReason = &pcData->stallReason[j];
-      totalSamples += stallReason->samples;
-
-      // Check if this is a "not_issued" stall (not really stalled)
-      bool isNotIssued = configureData->notIssuedStallReasonIndices.count(
-                             stallReason->pcSamplingStallReasonIndex) > 0;
-
-      if (!isNotIssued) {
-        stalledSamples += stallReason->samples;
+      uint64_t totalSamples = 0;
+      uint64_t stalledSamples = 0;
+      for (size_t j = 0; j < pcData->stallReasonCount; ++j) {
+        auto *stallReason = &pcData->stallReason[j];
+        totalSamples += stallReason->samples;
+        bool isNotIssued = configureData->notIssuedStallReasonIndices.count(
+                               stallReason->pcSamplingStallReasonIndex) > 0;
+        if (!isNotIssued)
+          stalledSamples += stallReason->samples;
       }
-    }
 
-    // Source correlation only for debug logging — backend resolves
-    // file/line from the cubin using pcOffset.
-    if (debug_enabled) {
       auto *cubinData = getCubinData(pcData->cubinCrc);
       auto key =
           CubinData::LineInfoKey{pcData->functionIndex, pcData->pcOffset};
@@ -461,38 +474,28 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData) {
       std::string fullPath = lineInfo.fileName.size()
                                  ? lineInfo.dirName + "/" + lineInfo.fileName
                                  : "";
-      DEBUG_PRINTF("  [%zu] func=%s pc=0x%lx total=%lu stalled=%lu %s:%u\n",
-                   i, lineInfo.functionName.c_str(), pcData->pcOffset,
+      DEBUG_PRINTF("  [%zu] func=%s pc=0x%lx total=%lu stalled=%lu %s:%u\n", i,
+                   lineInfo.functionName.c_str(), pcData->pcOffset,
                    totalSamples, stalledSamples, fullPath.c_str(),
                    lineInfo.lineNumber);
     }
+  }
 
-    PARCAGPU_PC_SAMPLE_SUMMARY(pcData->functionIndex, pcData->pcOffset,
-                               totalSamples, stalledSamples,
-                               pcData->functionName);
+  // Emit batched PC sample probes as a bag of pointers (like activity_batch).
+  // Using pointers avoids depending on the CUPTI struct stride, which can
+  // change across CUDA versions.
+  const void *batchPtrs[PCSampleBatchSize];
+  uint32_t batchCount = 0;
 
-    // Emit detailed stall reason probes
-    for (size_t j = 0; j < pcData->stallReasonCount; ++j) {
-      auto *stallReason = &pcData->stallReason[j];
-      auto stallReasonIndex = stallReason->pcSamplingStallReasonIndex;
-
-      if (debug_enabled) {
-        const char *stallReasonName = "";
-        for (size_t k = 0; k < configureData->numStallReasons; k++) {
-          if (configureData->stallReasonIndices[k] == stallReasonIndex) {
-            stallReasonName = configureData->stallReasonNames[k];
-            break;
-          }
-        }
-        if (stallReason->samples > 0) {
-          DEBUG_PRINTF("    stall: %s = %u\n", stallReasonName,
-                       stallReason->samples);
-        }
-      }
-
-      PARCAGPU_PC_STALL_REASON(pcData->functionIndex, pcData->pcOffset,
-                               stallReasonIndex, stallReason->samples);
+  for (size_t i = 0; i < pcSamplingData->totalNumPcs; ++i) {
+    batchPtrs[batchCount++] = &pcSamplingData->pPcData[i];
+    if (batchCount == PCSampleBatchSize) {
+      firePCSampleBatch(batchPtrs, batchCount);
+      batchCount = 0;
     }
+  }
+  if (batchCount > 0) {
+    firePCSampleBatch(batchPtrs, batchCount);
   }
 }
 
@@ -507,7 +510,8 @@ void PCSampling::collectData(CUcontext context) {
   }
 
   auto *configureData = getConfigureData(contextId);
-  DEBUG_PRINTF("Collecting PC sampling data for context %u (cfg total=%zu remaining=%zu)\n",
+  DEBUG_PRINTF("Collecting PC sampling data for context %u (cfg total=%zu "
+               "remaining=%zu)\n",
                contextId, configureData->pcSamplingData.totalNumPcs,
                configureData->pcSamplingData.remainingNumPcs);
 
@@ -516,6 +520,22 @@ void PCSampling::collectData(CUcontext context) {
   if (stallReasonMap.data() && stallReasonMapLimiter.tryAcquire()) {
     PARCAGPU_STALL_REASON_MAP(stallReasonMap.data(),
                               stallReasonMap.numEntries());
+  }
+
+  // Replay cubin_loaded probes for late-attaching tracers.
+  // When the semaphore transitions to non-zero, re-emit all known cubins.
+  if (PARCAGPU_CUBIN_LOADED_ENABLED()) {
+    if (!cubinsEmitted) {
+      DEBUG_PRINTF("Emitting cubins");
+      std::lock_guard<std::mutex> lock(contextMutex);
+      for (const auto &ref : loadedCubins) {
+        fireCubinLoaded(ref.crc, ref.data, ref.size);
+      }
+      cubinsEmitted = true;
+    }
+  } else {
+    // Tracer detached — reset so we replay again on next attach.
+    cubinsEmitted = false;
   }
 
   // Use the separate output buffer for getData — the configured
@@ -536,7 +556,8 @@ void PCSampling::collectAllData() {
     auto result = contextIdToConfigureData.find(contextId);
     if (!result) {
       DEBUG_PRINTF("Context %u in initializedContextIds but not in map, "
-                   "skipping\n", contextId);
+                   "skipping\n",
+                   contextId);
       continue;
     }
     auto *configureData = &result->get();
@@ -559,10 +580,10 @@ void PCSampling::finalize(CUcontext context) {
   DEBUG_PRINTF("Finalizing PC sampling for context %p\n", context);
 
   // Remove from iteration list first so collectAllData won't touch this context
-  initializedContextIds.erase(
-      std::remove(initializedContextIds.begin(),
-                  initializedContextIds.end(), contextId),
-      initializedContextIds.end());
+  initializedContextIds.erase(std::remove(initializedContextIds.begin(),
+                                          initializedContextIds.end(),
+                                          contextId),
+                              initializedContextIds.end());
 
   // Drain remaining data before disabling
   auto *configureData = getConfigureData(contextId);
@@ -579,7 +600,6 @@ void PCSampling::finalize(CUcontext context) {
 
 void PCSampling::loadModule(const char *cubin, size_t cubinSize) {
   auto cubinCrc = getCubinCrc(cubin, cubinSize);
-  auto *cubinData = getCubinData(cubinCrc);
 
   if (cubinCrcToCubinData.contain(cubinCrc)) {
     // Increment reference count
@@ -587,13 +607,19 @@ void PCSampling::loadModule(const char *cubin, size_t cubinSize) {
     DEBUG_PRINTF("Module 0x%lx loaded (refcount=%zu)\n", cubinCrc,
                  cubinCrcToCubinData[cubinCrc].second);
   } else {
-    // New module
+    // New module — getCubinData after the contain() check so operator[]
+    // doesn't auto-insert before we test.
+    auto *cubinData = getCubinData(cubinCrc);
     cubinData->cubinCrc = cubinCrc;
     cubinData->cubinSize = cubinSize;
     cubinData->cubin = cubin;
     cubinCrcToCubinData[cubinCrc].second = 1;
     DEBUG_PRINTF("Module 0x%lx loaded (new)\n", cubinCrc);
-    PARCAGPU_CUBIN_LOADED(cubinCrc, 0, 0);
+    fireCubinLoaded(cubinCrc, cubin, cubinSize);
+    {
+      std::lock_guard<std::mutex> lock(contextMutex);
+      loadedCubins.push_back({cubinCrc, cubin, cubinSize});
+    }
   }
 }
 
@@ -610,7 +636,16 @@ void PCSampling::unloadModule(const char *cubin, size_t cubinSize) {
   } else {
     cubinCrcToCubinData.erase(cubinCrc);
     DEBUG_PRINTF("Module 0x%lx unloaded (removed)\n", cubinCrc);
-    PARCAGPU_CUBIN_UNLOADED(cubinCrc, 0);
+    fireCubinUnloaded(cubinCrc);
+    {
+      std::lock_guard<std::mutex> lock(contextMutex);
+      loadedCubins.erase(std::remove_if(loadedCubins.begin(),
+                                        loadedCubins.end(),
+                                        [cubinCrc](const CubinRef &r) {
+                                          return r.crc == cubinCrc;
+                                        }),
+                         loadedCubins.end());
+    }
   }
 }
 

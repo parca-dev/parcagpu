@@ -628,6 +628,13 @@ void *cupti_thread(void *arg) {
             size_t maxNumRecords;
             bufferRequestedCallback(&buffer, &bufferSize, &maxNumRecords);
 
+            // The profiler may return NULL when no tracer is attached
+            // (semaphore-gated short circuit). Skip this flush cycle.
+            if (buffer == NULL) {
+                usleep(100000);
+                continue;
+            }
+
             // Fill the buffer with activity records for launched kernels
             size_t offset = 0;
             size_t recordSize = sizeof(CUpti_ActivityKernel5);

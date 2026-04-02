@@ -123,6 +123,20 @@ private:
   // Contiguous stall reason map for USDT probe emission.
   StallReasonMap stallReasonMap;
 
+  // Lightweight cubin metadata for replaying cubin_loaded probes to
+  // late-attaching tracers. Protected by contextMutex.
+  struct CubinRef {
+    uint64_t crc;
+    const char *data;
+    size_t size;
+  };
+  std::vector<CubinRef> loadedCubins;
+
+  // Tracks whether we've replayed cubin_loaded probes for a late-attaching
+  // tracer. Reset to false when the cubin_loaded semaphore transitions to
+  // non-zero.
+  bool cubinsEmitted = false;
+
   // Rate limiter for stall reason map re-emission (1 token per 10 seconds).
   TokenBucket stallReasonMapLimiter{0.1};
 };

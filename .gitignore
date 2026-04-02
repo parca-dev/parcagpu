@@ -5,3 +5,5 @@ test/bpf/activity_parser
 test/bpf/activityparser_*.go
 test/bpf/activityparser_*.o
 src/probes.h
+microbenchmarks/rapid_launch
+microbenchmarks/pc_sample_toy

@@ -38,36 +38,15 @@ usdt:*:parcagpu:cuda_correlation {
     printf("%-12s.%-6u [CORR] %u: cbid=%u %s\n", strftime("%H:%M:%S", nsecs), (nsecs % 1000000000) / 1000, $correlation_id, $cbid, $name);
 }
 
-usdt:*:parcagpu:pc_sample_summary {
-    $function_index = arg0;
-    $pc_offset = arg1;
-    $total_samples = arg2;
-    $stalled_samples = arg3;
-    $function_name = str(arg4);
+usdt:*:parcagpu:pc_sample_batch {
+    $records = arg0;
+    $count = arg1;
 
-    printf("%-12s.%-6u [PC_SAMPLE] func=%u pc=0x%lx total=%lu stalled=%lu %s\n",
+    printf("%-12s.%-6u [PC_BATCH] count=%u records=%p\n",
            strftime("%H:%M:%S", nsecs),
            (nsecs % 1000000000) / 1000,
-           $function_index,
-           $pc_offset,
-           $total_samples,
-           $stalled_samples,
-           $function_name);
-}
-
-usdt:*:parcagpu:pc_stall_reason {
-    $function_index = arg0;
-    $pc_offset = arg1;
-    $stall_reason_index = arg2;
-    $samples = arg3;
-
-    printf("%-12s.%-6u [STALL]     func=%u pc=0x%lx reason[%u] samples=%lu\n",
-           strftime("%H:%M:%S", nsecs),
-           (nsecs % 1000000000) / 1000,
-           $function_index,
-           $pc_offset,
-           $stall_reason_index,
-           $samples);
+           $count,
+           $records);
 }
 
 usdt:*:parcagpu:stall_reason_map {
@@ -83,11 +62,13 @@ usdt:*:parcagpu:stall_reason_map {
 
 usdt:*:parcagpu:cubin_loaded {
     $cubin_crc = arg0;
+    $cubin_size = arg2;
 
-    printf("%-12s.%-6u [CUBIN_LOAD] crc=0x%lx\n",
+    printf("%-12s.%-6u [CUBIN_LOAD] crc=0x%lx size=%lu\n",
            strftime("%H:%M:%S", nsecs),
            (nsecs % 1000000000) / 1000,
-           $cubin_crc);
+           $cubin_crc,
+           $cubin_size);
 }
 
 usdt:*:parcagpu:cubin_unloaded {

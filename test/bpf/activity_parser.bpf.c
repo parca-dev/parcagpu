@@ -28,19 +28,21 @@
 #define MAX_KERNEL_NAME 128
 #define STALL_REASON_NAME_LEN 64
 #define MAX_STALL_REASONS 64
+#define MAX_CUBIN_SIZE (64 * 1024 * 1024) // 64MB safety cap
 
 // USDT spec map — populated by Go loader before uprobe attachment.
 // Keyed by spec ID (uint32); value is struct bpf_usdt_spec.
-// Old-style SEC("maps") definition to match the extern in usdt_args.h.
-struct bpf_map_def __bpf_usdt_specs SEC("maps") = {
-    .type = BPF_MAP_TYPE_HASH,
-    .key_size = sizeof(u32),
-    .value_size = sizeof(struct bpf_usdt_spec),
-    .max_entries = 256,
-};
+struct usdt_specs_t {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, u32);
+    __type(value, struct bpf_usdt_spec);
+    __uint(max_entries, 256);
+} __bpf_usdt_specs SEC(".maps");
 
 // Event sent to user-space for each kernel activity found.
 struct kernel_event {
+  u32 event_type; // EVENT_TYPE_KERNEL
+  u32 _pad;
   u64 start;
   u64 end;
   u32 correlation_id;
@@ -49,6 +51,59 @@ struct kernel_event {
   u32 graph_id;
   u64 graph_node_id;
   char name[MAX_KERNEL_NAME];
+};
+
+// Cubin load/unload events — Go reads actual bytes via /proc/pid/mem.
+struct cubin_event {
+  u32 event_type; // EVENT_TYPE_CUBIN_LOADED or EVENT_TYPE_CUBIN_UNLOADED
+  u32 _pad;
+  u64 cubin_crc;
+  u64 cubin_ptr; // user-space address (for /proc/pid/mem read)
+  u64 cubin_size;
+};
+
+// Event type tags for the ring buffer.
+#define EVENT_TYPE_KERNEL 1
+#define EVENT_TYPE_CUBIN_LOADED 2
+#define EVENT_TYPE_CUBIN_UNLOADED 3
+#define EVENT_TYPE_PC_SAMPLE 4
+
+// Matches CUpti_PCSamplingStallReason (packed, aligned 8).
+struct cupti_stall_reason {
+  u32 stall_reason_index;
+  u32 samples;
+};
+
+// Matches CUpti_PCSamplingPCData (packed, aligned 8).
+// Contains user-space pointers that BPF chases with bpf_probe_read_user.
+// We read the base 56-byte struct, then conditionally read correlationId
+// if the size field indicates CUDA 13+ (size > 56).
+struct cupti_pc_data {
+  u64 size;               // struct size (56 = CUDA 12, 60+ = CUDA 13)
+  u64 cubin_crc;
+  u64 pc_offset;
+  u32 function_index;
+  u32 _pad;
+  u64 function_name_ptr;  // const char* in user-space
+  u64 stall_reason_count;
+  u64 stall_reason_ptr;   // CUpti_PCSamplingStallReason* in user-space
+} __attribute__((__packed__)) __attribute__((aligned(8)));
+
+#define CUPTI_PC_DATA_BASE_SIZE 56
+
+#define MAX_PC_BATCH_SIZE 512
+#define MAX_FUNC_NAME 128
+
+// PC sample event sent to user-space.
+struct pc_sample_event {
+  u32 event_type; // EVENT_TYPE_PC_SAMPLE
+  u32 stall_reason_count;
+  u64 cubin_crc;
+  u64 pc_offset;
+  u32 function_index;
+  u32 correlation_id; // kernel correlation ID (CUDA 13+ serialized mode, else 0)
+  char function_name[MAX_FUNC_NAME];
+  struct cupti_stall_reason stall_reasons[MAX_STALL_REASONS];
 };
 
 // Ring buffer for sending events to user-space.
@@ -145,6 +200,7 @@ int BPF_USDT(handle_activity_batch, u64 ptrs_base, u32 num_activities) {
       continue;
     }
 
+    evt->event_type = EVENT_TYPE_KERNEL;
     evt->start = record.start;
     evt->end = record.end;
     evt->correlation_id = record.correlation_id;
@@ -186,8 +242,9 @@ int BPF_USDT(handle_stall_reason_map, u64 names_base, u32 count) {
       break;
 
     char name[STALL_REASON_NAME_LEN] = {};
-    int ret = bpf_probe_read_user(name, sizeof(name),
-                                  (void *)(names_base + (u64)i * STALL_REASON_NAME_LEN));
+    int ret = bpf_probe_read_user(
+        name, sizeof(name),
+        (void *)(names_base + (u64)i * STALL_REASON_NAME_LEN));
     if (ret != 0)
       continue;
 
@@ -196,6 +253,113 @@ int BPF_USDT(handle_stall_reason_map, u64 names_base, u32 count) {
 
   u32 one = 1;
   bpf_map_update_elem(&stall_map_loaded, &zero, &one, BPF_ANY);
+  return 0;
+}
+
+SEC("usdt/parcagpu/cubin_loaded")
+int BPF_USDT(handle_cubin_loaded, u64 cubin_crc, u64 cubin_ptr,
+             u64 cubin_size) {
+  if (cubin_size == 0 || cubin_size > MAX_CUBIN_SIZE)
+    return 0;
+
+  struct cubin_event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+  if (!evt) {
+    bump_stat(STAT_DROPS);
+    return 0;
+  }
+
+  evt->event_type = EVENT_TYPE_CUBIN_LOADED;
+  evt->cubin_crc = cubin_crc;
+  evt->cubin_ptr = cubin_ptr;
+  evt->cubin_size = cubin_size;
+  bpf_ringbuf_submit(evt, 0);
+  return 0;
+}
+
+SEC("usdt/parcagpu/cubin_unloaded")
+int BPF_USDT(handle_cubin_unloaded, u64 cubin_crc) {
+  struct cubin_event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+  if (!evt) {
+    bump_stat(STAT_DROPS);
+    return 0;
+  }
+
+  evt->event_type = EVENT_TYPE_CUBIN_UNLOADED;
+  evt->cubin_crc = cubin_crc;
+  evt->cubin_ptr = 0;
+  evt->cubin_size = 0;
+  bpf_ringbuf_submit(evt, 0);
+  return 0;
+}
+
+SEC("usdt/parcagpu/pc_sample_batch")
+int BPF_USDT(handle_pc_sample_batch, u64 ptrs_base, u32 count) {
+  if (count > MAX_PC_BATCH_SIZE)
+    count = MAX_PC_BATCH_SIZE;
+
+  for (u32 i = 0; i < MAX_PC_BATCH_SIZE; i++) {
+    if (i >= count)
+      break;
+
+    // Read the i-th pointer from the array.
+    u64 rec_ptr = 0;
+    int ret = bpf_probe_read_user(&rec_ptr, sizeof(rec_ptr),
+                                  (void *)(ptrs_base + (u64)i * sizeof(u64)));
+    if (ret != 0 || rec_ptr == 0)
+      continue;
+
+    // Chase the pointer to read the CUPTI PC data record.
+    struct cupti_pc_data rec = {};
+    ret = bpf_probe_read_user(&rec, sizeof(rec), (void *)rec_ptr);
+    if (ret != 0)
+      continue;
+
+    // Reserve ring buffer space for the event.
+    struct pc_sample_event *evt =
+        bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+    if (!evt) {
+      bump_stat(STAT_DROPS);
+      continue;
+    }
+
+    evt->event_type = EVENT_TYPE_PC_SAMPLE;
+    evt->cubin_crc = rec.cubin_crc;
+    evt->pc_offset = rec.pc_offset;
+    evt->function_index = rec.function_index;
+
+    // Read correlationId if the struct is large enough (CUDA 13+).
+    // It sits right after the stallReason pointer at offset 56.
+    evt->correlation_id = 0;
+    if (rec.size > CUPTI_PC_DATA_BASE_SIZE) {
+      u32 corr = 0;
+      bpf_probe_read_user(&corr, sizeof(corr),
+                          (void *)(rec_ptr + CUPTI_PC_DATA_BASE_SIZE));
+      evt->correlation_id = corr;
+    }
+
+    // Chase the function name pointer.
+    if (rec.function_name_ptr) {
+      bpf_probe_read_user_str(evt->function_name, sizeof(evt->function_name),
+                              (void *)rec.function_name_ptr);
+    } else {
+      evt->function_name[0] = '\0';
+    }
+
+    // Chase the stall reason pointer.
+    u32 sr_count = rec.stall_reason_count;
+    if (sr_count > MAX_STALL_REASONS)
+      sr_count = MAX_STALL_REASONS;
+    evt->stall_reason_count = sr_count;
+
+    if (rec.stall_reason_ptr && sr_count > 0) {
+      bpf_probe_read_user(evt->stall_reasons,
+                          sr_count * sizeof(struct cupti_stall_reason),
+                          (void *)rec.stall_reason_ptr);
+    }
+
+    bpf_ringbuf_submit(evt, 0);
+  }
+
   return 0;
 }
 
