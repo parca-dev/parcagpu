@@ -11,13 +11,13 @@
 
 namespace parcagpu {
 
-// CUDA driver version for 12.8.1 (when continuous PC sampling became stable)
+// CUDA driver version for 12.8.1 (minimum for PC sampling)
 // Version format: major * 1000 + minor * 10 + patch
 #define CUDA_VERSION_12_8_1 12081
 
-// Debug logging (reuse from main file)
-extern bool debug_enabled;
-extern void init_debug();
+// CUPTI version that added correlationId to CUpti_PCSamplingPCData,
+// breaking ABI compatibility.
+#define CUPTI_CUDA12_4_VERSION 22
 
 // noinline wrappers so each USDT probe has exactly one call site in the
 // binary.  Multiple call sites produce multiple .note.stapsdt entries with
@@ -64,22 +64,34 @@ void enablePCSampling(CUcontext context) {
   proton::cupti::pcSamplingEnable<true>(&params);
 }
 
-void startPCSampling(CUcontext context) {
+bool startPCSampling(CUcontext context) {
+  // CUPTI requires the GPU to be idle before starting PC sampling.
+  proton::cuda::ctxSynchronize<false>();
   CUpti_PCSamplingStartParams params = {
       /*size=*/CUpti_PCSamplingStartParamsSize,
       /*pPriv=*/NULL,
       /*ctx=*/context,
   };
-  proton::cupti::pcSamplingStart<true>(&params);
+  auto ret = proton::cupti::pcSamplingStart<false>(&params);
+  if (ret != CUPTI_SUCCESS) {
+    DEBUG_PRINTF("cuptiPCSamplingStart failed: %d\n", ret);
+    return false;
+  }
+  return true;
 }
 
-void stopPCSampling(CUcontext context) {
+bool stopPCSampling(CUcontext context) {
   CUpti_PCSamplingStopParams params = {
       /*size=*/CUpti_PCSamplingStopParamsSize,
       /*pPriv=*/NULL,
       /*ctx=*/context,
   };
-  proton::cupti::pcSamplingStop<true>(&params);
+  auto ret = proton::cupti::pcSamplingStop<false>(&params);
+  if (ret != CUPTI_SUCCESS) {
+    DEBUG_PRINTF("cuptiPCSamplingStop failed: %d\n", ret);
+    return false;
+  }
+  return true;
 }
 
 void disablePCSampling(CUcontext context) {
@@ -333,8 +345,17 @@ CUpti_PCSamplingConfigurationInfo ConfigureData::configureCollectionMode() {
   collectionModeInfo.attributeType =
       CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_COLLECTION_MODE;
   collectionModeInfo.attributeData.collectionModeData.collectionMode =
-      CUPTI_PC_SAMPLING_COLLECTION_MODE_CONTINUOUS;
+      CUPTI_PC_SAMPLING_COLLECTION_MODE_KERNEL_SERIALIZED;
   return collectionModeInfo;
+}
+
+CUpti_PCSamplingConfigurationInfo ConfigureData::configureStartStopControl() {
+  CUpti_PCSamplingConfigurationInfo startStopControlInfo{};
+  startStopControlInfo.attributeType =
+      CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_ENABLE_START_STOP_CONTROL;
+  startStopControlInfo.attributeData.enableStartStopControlData
+      .enableStartStopControl = true;
+  return startStopControlInfo;
 }
 
 void ConfigureData::initialize(CUcontext context) {
@@ -346,6 +367,7 @@ void ConfigureData::initialize(CUcontext context) {
 
   configurationInfos.emplace_back(configureStallReasons());
   configurationInfos.emplace_back(configureCollectionMode());
+  configurationInfos.emplace_back(configureStartStopControl());
   configurationInfos.emplace_back(configureSamplingBuffer());
   // Don't set sampling period — let CUPTI use its default.
   // Explicit period values silently break sampling on some GPUs (e.g.
@@ -366,17 +388,10 @@ void ConfigureData::initialize(CUcontext context) {
 // GPUPCSampling implementation
 
 bool PCSampling::isSupported() {
-  // PARCAGPU_SAMPLING_FACTOR must be set to enable PC sampling.
-  // Any non-zero value enables it; 0 disables.
-  // If unset, PC sampling is disabled.
+  // PC sampling is enabled by default.
+  // Set PARCAGPU_SAMPLING_FACTOR=0 to disable.
   const char *env = getenv("PARCAGPU_SAMPLING_FACTOR");
-  if (!env) {
-    DEBUG_PRINTF(
-        "PC sampling not enabled (PARCAGPU_SAMPLING_FACTOR not set)\n");
-    return false;
-  }
-  int factor = atoi(env);
-  if (factor == 0) {
+  if (env && atoi(env) == 0) {
     DEBUG_PRINTF("PC sampling disabled via PARCAGPU_SAMPLING_FACTOR=0\n");
     return false;
   }
@@ -392,14 +407,46 @@ bool PCSampling::isSupported() {
     DEBUG_PRINTF("PC sampling not supported: CUDA driver version %d.%d.%d < "
                  "required 12.8.1\n",
                  major, minor, patch);
+    fireError(driverVersion,
+              "CUDA driver version too low for PC sampling (need >= 12.8.1)",
+              "pc_sampling");
     return false;
   }
+
+  // Check CUPTI API/driver version compatibility.
+  // CUPTI 12.4 (v22) added correlationId to CUpti_PCSamplingPCData, breaking
+  // ABI. Mixing compile-time and runtime versions across this boundary crashes.
+  uint32_t cuptiVersion = 0;
+  proton::cupti::getVersion<true>(&cuptiVersion);
+
+  if ((cuptiVersion < CUPTI_CUDA12_4_VERSION &&
+       CUPTI_API_VERSION >= CUPTI_CUDA12_4_VERSION) ||
+      (cuptiVersion >= CUPTI_CUDA12_4_VERSION &&
+       CUPTI_API_VERSION < CUPTI_CUDA12_4_VERSION)) {
+    DEBUG_PRINTF(
+        "PC sampling disabled: CUPTI API version %d and driver version %d "
+        "are incompatible across the 12.4 (v22) ABI boundary\n",
+        CUPTI_API_VERSION, cuptiVersion);
+    fireError((int32_t)cuptiVersion,
+              "CUPTI API/driver version mismatch (12.4 ABI boundary)",
+              "pc_sampling");
+    return false;
+  }
+
+  // Attempt a lightweight permission probe. CUPTI PC sampling requires
+  // either root, CAP_SYS_ADMIN, or the NVIDIA module parameter
+  // NVreg_RestrictProfilingToAdminUsers=0.
+  // We cannot easily pre-check permissions without attempting CUPTI calls,
+  // so we defer the real check to initialize() where enablePCSampling()
+  // will fail with a CUPTI error if permissions are insufficient.
+  // TODO: Add explicit permission pre-check.
+  // Reference: https://developer.nvidia.com/nvidia-development-tools-solutions-err_nvgpuctrperm-permission-issue-performance-counters
 
   int major = driverVersion / 1000;
   int minor = (driverVersion % 1000) / 10;
   int patch = driverVersion % 10;
-  DEBUG_PRINTF("PC sampling supported: CUDA driver version %d.%d.%d\n", major,
-               minor, patch);
+  DEBUG_PRINTF("PC sampling supported: CUDA %d.%d.%d, CUPTI v%u (API v%d)\n",
+               major, minor, patch, cuptiVersion, CUPTI_API_VERSION);
   return true;
 }
 
@@ -416,9 +463,35 @@ void PCSampling::initialize(CUcontext context) {
   proton::cupti::getContextId<true>(context, &contextId);
 
   doubleCheckedLock(
-      [&]() { return !contextInitialized.contain(contextId); }, contextMutex,
       [&]() {
-        enablePCSampling(context);
+        return !contextInitialized.contain(contextId) &&
+               !contextFailed.contain(contextId);
+      },
+      contextMutex,
+      [&]() {
+        // enablePCSampling can fail due to insufficient permissions
+        // (ERR_NVGPUCTRPERM). Catch and degrade gracefully.
+        CUpti_PCSamplingEnableParams enableParams = {
+            /*size=*/CUpti_PCSamplingEnableParamsSize,
+            /*pPriv=*/NULL,
+            /*ctx=*/context,
+        };
+        auto result =
+            proton::cupti::pcSamplingEnable<false>(&enableParams);
+        if (result != CUPTI_SUCCESS) {
+          DEBUG_PRINTF(
+              "Failed to enable PC sampling for context %u: CUPTI error %d\n"
+              "This may be a permission issue. See:\n"
+              "https://developer.nvidia.com/nvidia-development-tools-solutions-"
+              "err_nvgpuctrperm-permission-issue-performance-counters\n",
+              contextId, result);
+          fireError((int32_t)result,
+                    "Failed to enable PC sampling (possible permission issue)",
+                    "pc_sampling");
+          contextFailed.insert(contextId);
+          return;
+        }
+
         auto *configData = getConfigureData(contextId);
         configData->initialize(context);
 
@@ -429,9 +502,37 @@ void PCSampling::initialize(CUcontext context) {
 
         contextInitialized.insert(contextId);
         initializedContextIds.push_back(contextId);
-        DEBUG_PRINTF("PC sampling started in continuous mode for context %u\n",
-                     contextId);
+        DEBUG_PRINTF(
+            "PC sampling initialized (serialized mode) for context %u\n",
+            contextId);
       });
+}
+
+void PCSampling::start(CUcontext context) {
+  std::lock_guard<std::mutex> lock(pcSamplingMutex);
+  if (samplingActive)
+    return;
+  if (startPCSampling(context)) {
+    samplingActive = true;
+    samplingContext = context;
+    DEBUG_PRINTF("PC sampling started (kernels serialized)\n");
+  }
+}
+
+void PCSampling::stop(CUcontext context) {
+  std::lock_guard<std::mutex> lock(pcSamplingMutex);
+  if (!samplingActive)
+    return;
+  stopPCSampling(context);
+  samplingActive = false;
+  DEBUG_PRINTF("PC sampling stopped (kernels concurrent)\n");
+  // Drain data collected during this window.
+  collectData(context);
+}
+
+__attribute__((noinline)) void fireError(int32_t code, const char *message,
+                                         const char *component) {
+  PARCAGPU_ERROR(code, message, component);
 }
 
 void PCSampling::processPCSamplingData(ConfigureData *configureData) {
@@ -499,27 +600,17 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData) {
   }
 }
 
-void PCSampling::collectData(CUcontext context) {
-  uint32_t contextId = 0;
-  proton::cupti::getContextId<true>(context, &contextId);
-
-  if (!contextInitialized.contain(contextId)) {
-    DEBUG_PRINTF("Context %u not initialized, skipping data collection\n",
-                 contextId);
-    return;
-  }
-
-  auto *configureData = getConfigureData(contextId);
-  DEBUG_PRINTF("Collecting PC sampling data for context %u (cfg total=%zu "
-               "remaining=%zu)\n",
-               contextId, configureData->pcSamplingData.totalNumPcs,
-               configureData->pcSamplingData.remainingNumPcs);
-
-  // Re-emit stall reason map periodically so the profiler backend can
-  // join stall reason indices to human-readable names.
-  if (stallReasonMap.data() && stallReasonMapLimiter.tryAcquire()) {
-    PARCAGPU_STALL_REASON_MAP(stallReasonMap.data(),
-                              stallReasonMap.numEntries());
+void PCSampling::emitMetadata() {
+  // Re-emit stall reason map when a tracer attaches (semaphore transitions
+  // to non-zero), using the same pattern as cubin replay.
+  if (stallReasonMap.data() && PARCAGPU_STALL_REASON_MAP_ENABLED()) {
+    if (!stallMapEmitted) {
+      PARCAGPU_STALL_REASON_MAP(stallReasonMap.data(),
+                                stallReasonMap.numEntries());
+      stallMapEmitted = true;
+    }
+  } else {
+    stallMapEmitted = false;
   }
 
   // Replay cubin_loaded probes for late-attaching tracers.
@@ -537,6 +628,23 @@ void PCSampling::collectData(CUcontext context) {
     // Tracer detached — reset so we replay again on next attach.
     cubinsEmitted = false;
   }
+}
+
+void PCSampling::collectData(CUcontext context) {
+  uint32_t contextId = 0;
+  proton::cupti::getContextId<true>(context, &contextId);
+
+  if (!contextInitialized.contain(contextId)) {
+    DEBUG_PRINTF("Context %u not initialized, skipping data collection\n",
+                 contextId);
+    return;
+  }
+
+  auto *configureData = getConfigureData(contextId);
+  DEBUG_PRINTF("Collecting PC sampling data for context %u (cfg total=%zu "
+               "remaining=%zu)\n",
+               contextId, configureData->pcSamplingData.totalNumPcs,
+               configureData->pcSamplingData.remainingNumPcs);
 
   // Use the separate output buffer for getData — the configured
   // pcSamplingData buffer is owned by CUPTI.
@@ -570,8 +678,11 @@ void PCSampling::finalize(CUcontext context) {
   uint32_t contextId = 0;
   proton::cupti::getContextId<true>(context, &contextId);
 
-  if (!contextInitialized.contain(contextId))
+  if (!contextInitialized.contain(contextId)) {
+    // Clean up failed context tracking if applicable.
+    contextFailed.erase(contextId);
     return;
+  }
 
   // Hold contextMutex for the entire finalize to prevent collectAllData
   // from racing with us (it iterates initializedContextIds under this lock).
@@ -584,6 +695,15 @@ void PCSampling::finalize(CUcontext context) {
                                           initializedContextIds.end(),
                                           contextId),
                               initializedContextIds.end());
+
+  // Stop sampling if it was started on this context.
+  {
+    std::lock_guard<std::mutex> lock2(pcSamplingMutex);
+    if (samplingActive) {
+      stopPCSampling(context);
+      samplingActive = false;
+    }
+  }
 
   // Drain remaining data before disabling
   auto *configureData = getConfigureData(contextId);

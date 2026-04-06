@@ -15,6 +15,7 @@
 #include "Profiler/Cupti/CuptiCallbacks.h"
 #include "Utility/Singleton.h"
 #include "correlation_filter.h"
+#include "env_config.h"
 #include "pc_sampling.h"
 #include "token_bucket.h"
 
@@ -38,6 +39,51 @@ thread_local uint32_t runtimeEnterCorrelationId = 0;
 // configurable via PARCAGPU_RATE_LIMIT).
 thread_local TokenBucket callbackLimiter(100.0);
 
+// ---------------------------------------------------------------------------
+// PC sampling probabilistic control.
+// Sampling is gated by an interval + probability: at most once per interval,
+// roll the probability die; if it hits, sample all kernels until the interval
+// window closes.
+// ---------------------------------------------------------------------------
+
+// Config — read from env at startup. Stored in a struct so it can be made
+// runtime-adjustable later (e.g. via signal or control file).
+struct PCSamplingConfig {
+  double probability;  // PARCAGPU_PC_SAMPLING_PROBABILITY (default 1/100)
+  uint64_t intervalNs; // PARCAGPU_PC_SAMPLING_INTERVAL in nanoseconds
+};
+static PCSamplingConfig g_pcSamplingConfig = {0.01, 1000000000ULL};
+
+// Per-thread sampling state.
+struct PCSamplingState {
+  bool active = false;        // Currently sampling
+  uint64_t windowStartNs = 0; // When the current window opened
+  uint64_t lastCheckNs = 0;   // Last time we checked the probability
+  unsigned int rngSeed = 0;   // Thread-local RNG state
+};
+thread_local PCSamplingState g_pcSamplingState;
+
+static uint64_t nowNs() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+// Seed the per-thread RNG lazily.
+static void ensureRngSeeded(PCSamplingState &s) {
+  if (s.rngSeed == 0) {
+    uint64_t t = nowNs();
+    s.rngSeed = (unsigned int)(t ^ (uintptr_t)&s);
+    if (s.rngSeed == 0)
+      s.rngSeed = 1;
+  }
+}
+
+static double threadRandom(PCSamplingState &s) {
+  ensureRngSeeded(s);
+  return (double)rand_r(&s.rngSeed) / RAND_MAX;
+}
+
 void init_debug() {
   static bool initialized = false;
   if (!initialized) {
@@ -50,6 +96,21 @@ void init_debug() {
         callbackLimiter.setRate(rate);
       }
     }
+
+    const char *probEnv = getenv("PARCAGPU_PC_SAMPLING_PROBABILITY");
+    if (probEnv) {
+      double p = atof(probEnv);
+      if (p > 0.0 && p <= 1.0)
+        g_pcSamplingConfig.probability = p;
+    }
+    const char *intervalEnv = getenv("PARCAGPU_PC_SAMPLING_INTERVAL");
+    if (intervalEnv) {
+      double s = atof(intervalEnv);
+      if (s > 0.0)
+        g_pcSamplingConfig.intervalNs = (uint64_t)(s * 1e9);
+    }
+
+    validateEnvVars();
     initialized = true;
   }
 }
@@ -86,7 +147,7 @@ public:
     // Check if PC sampling is supported
     pcSamplingEnabled = parcagpu::PCSampling::isSupported();
     if (pcSamplingEnabled) {
-      DEBUG_PRINTF("[PARCAGPU] PC sampling enabled (continuous mode)\n");
+      DEBUG_PRINTF("[PARCAGPU] PC sampling enabled (serialized mode)\n");
     } else {
       DEBUG_PRINTF(
           "[PARCAGPU] PC sampling disabled, using kernel activity only\n");
@@ -369,9 +430,36 @@ private:
           static_cast<const CUpti_CallbackData *>(cbdata_void);
       uint32_t correlationId = cbdata->correlationId;
 
-      if (domain == CUPTI_CB_DOMAIN_RUNTIME_API &&
-          cbdata->callbackSite == CUPTI_API_ENTER) {
-        runtimeEnterCorrelationId = correlationId;
+      // ENTER: manage probabilistic sampling windows.
+      // start() begins CUPTI PC sampling (kernels serialized).
+      // stop() ends it and drains data (kernels concurrent again).
+      if (cbdata->callbackSite == CUPTI_API_ENTER) {
+        if (domain == CUPTI_CB_DOMAIN_RUNTIME_API)
+          runtimeEnterCorrelationId = correlationId;
+
+        if (profiler.pcSamplingEnabled) {
+          auto &st = g_pcSamplingState;
+          auto &cfg = g_pcSamplingConfig;
+          uint64_t now = nowNs();
+
+          // If sampling and the window has closed, stop + drain.
+          if (st.active && (now - st.windowStartNs >= cfg.intervalNs)) {
+            profiler.pcSampling.stop(cbdata->context);
+            st.active = false;
+          }
+
+          // If not sampling, check interval then probability.
+          if (!st.active && (now - st.lastCheckNs >= cfg.intervalNs)) {
+            st.lastCheckNs = now;
+            if (threadRandom(st) < cfg.probability) {
+              st.active = true;
+              st.windowStartNs = now;
+              profiler.pcSampling.start(cbdata->context);
+            }
+          }
+
+          profiler.pcSampling.emitMetadata();
+        }
         return;
       }
 
@@ -380,11 +468,18 @@ private:
         return;
       }
 
-      // Drain PC sampling data on kernel launch EXIT — the context from
-      // cbdata is always valid here, unlike in completeBuffer or at shutdown.
-      // Runs regardless of which USDT probes are attached.
+      // EXIT: stop sampling if the window has closed.
       if (profiler.pcSamplingEnabled) {
-        profiler.pcSampling.collectData(cbdata->context);
+        auto &st = g_pcSamplingState;
+        auto &cfg = g_pcSamplingConfig;
+        uint64_t now = nowNs();
+
+        if (st.active && (now - st.windowStartNs >= cfg.intervalNs)) {
+          profiler.pcSampling.stop(cbdata->context);
+          st.active = false;
+        }
+
+        profiler.pcSampling.emitMetadata();
       }
 
       // Skip correlation/rate-limiter work when no profiler is attached.

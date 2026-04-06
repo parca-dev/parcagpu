@@ -1,7 +1,10 @@
 #include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <cuda.h>
 #include <cupti.h>
+#include <cupti_pcsampling.h>
 
 // Define callback function types if not already defined by CUPTI headers
 #ifndef CUpti_BufferRequestFunc
@@ -144,5 +147,280 @@ CUptiResult cuptiGetContextId(CUcontext context, uint32_t *contextId) {
 CUptiResult cuptiUnsubscribe(CUpti_SubscriberHandle subscriber) {
     (void)subscriber;  // Mark as intentionally unused
     fprintf(stderr, "[MOCK_CUPTI] cuptiUnsubscribe()\n");
+    return CUPTI_SUCCESS;
+}
+
+// =========================================================================
+// PC Sampling mock — uses a real cubin from pc_sample_toy for realistic
+// CRC, offsets, and source-line correlation.
+// =========================================================================
+
+// Real cubin loaded from file (set MOCK_CUBIN_PATH, or auto-detected).
+static char *__cubin_data = NULL;
+static size_t __cubin_size = 0;
+static uint64_t __cubin_crc = 0;
+
+// CRC function shared between cuptiGetCubinCrc and internal use.
+static uint64_t __compute_crc(const void *data, size_t size) {
+    const uint8_t *bytes = (const uint8_t *)data;
+    uint64_t crc = 0xDEADBEEFULL;
+    for (size_t i = 0; i < size; i++)
+        crc = crc * 31 + bytes[i];
+    return crc;
+}
+
+static void __load_cubin(void) {
+    if (__cubin_data)
+        return;
+    const char *path = getenv("MOCK_CUBIN_PATH");
+    if (!path) {
+        fprintf(stderr, "[MOCK_CUPTI] MOCK_CUBIN_PATH not set, no cubin loaded\n");
+        return;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[MOCK_CUPTI] Failed to open cubin: %s\n", path);
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    __cubin_size = (size_t)ftell(f);
+    fseek(f, 0, SEEK_SET);
+    __cubin_data = (char *)malloc(__cubin_size);
+    if (fread(__cubin_data, 1, __cubin_size, f) != __cubin_size) {
+        fprintf(stderr, "[MOCK_CUPTI] Short read on cubin: %s\n", path);
+        free(__cubin_data);
+        __cubin_data = NULL;
+        __cubin_size = 0;
+        fclose(f);
+        return;
+    }
+    fclose(f);
+    __cubin_crc = __compute_crc(__cubin_data, __cubin_size);
+    fprintf(stderr, "[MOCK_CUPTI] Loaded cubin: %s (%zu bytes, crc=0x%lx)\n",
+            path, __cubin_size, __cubin_crc);
+}
+
+CUptiResult cuptiGetVersion(uint32_t *version) {
+    *version = 24;
+    return CUPTI_SUCCESS;
+}
+
+static int __pc_sampling_started = 0;
+
+CUptiResult cuptiPCSamplingEnable(CUpti_PCSamplingEnableParams *params) {
+    (void)params;
+    fprintf(stderr, "[MOCK_CUPTI] cuptiPCSamplingEnable()\n");
+    return CUPTI_SUCCESS;
+}
+
+CUptiResult cuptiPCSamplingDisable(CUpti_PCSamplingDisableParams *params) {
+    (void)params;
+    fprintf(stderr, "[MOCK_CUPTI] cuptiPCSamplingDisable()\n");
+    return CUPTI_SUCCESS;
+}
+
+CUptiResult cuptiPCSamplingStart(CUpti_PCSamplingStartParams *params) {
+    (void)params;
+    __pc_sampling_started = 1;
+    return CUPTI_SUCCESS;
+}
+
+CUptiResult cuptiPCSamplingStop(CUpti_PCSamplingStopParams *params) {
+    (void)params;
+    __pc_sampling_started = 0;
+    return CUPTI_SUCCESS;
+}
+
+CUptiResult cuptiPCSamplingSetConfigurationAttribute(
+    CUpti_PCSamplingConfigurationInfoParams *params) {
+    (void)params;
+    fprintf(stderr, "[MOCK_CUPTI] cuptiPCSamplingSetConfigurationAttribute()\n");
+    return CUPTI_SUCCESS;
+}
+
+CUptiResult cuptiPCSamplingGetNumStallReasons(
+    CUpti_PCSamplingGetNumStallReasonsParams *params) {
+    *params->numStallReasons = 3;
+    return CUPTI_SUCCESS;
+}
+
+static const char *__mock_stall_names[] = {
+    "smsp__pcsamp_warps_issue_stalled_not_selected",
+    "smsp__pcsamp_warps_issue_stalled_math_pipe_throttle",
+    "smsp__pcsamp_warps_issue_stalled_barrier",
+};
+
+CUptiResult cuptiPCSamplingGetStallReasons(
+    CUpti_PCSamplingGetStallReasonsParams *params) {
+    size_t n = params->numStallReasons < 3 ? params->numStallReasons : 3;
+    for (size_t i = 0; i < n; i++) {
+        strncpy(params->stallReasons[i], __mock_stall_names[i],
+                CUPTI_STALL_REASON_STRING_SIZE - 1);
+        params->stallReasons[i][CUPTI_STALL_REASON_STRING_SIZE - 1] = '\0';
+        params->stallReasonIndex[i] = (uint32_t)i;
+    }
+    return CUPTI_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic PC samples using real offsets from pc_sample_toy.cu kernels.
+// Offsets extracted from nvdisasm -g on the sm_121 cubin.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    const char *functionName;
+    uint32_t functionIndex;
+    uint64_t pcOffset;
+    // Expected source correlation for this offset:
+    uint32_t lineNumber;
+    const char *fileName;
+    const char *dirName;
+} MockPCSample;
+
+// Representative offsets covering all three kernels and distinct source lines.
+// Offsets and line numbers from: nvdisasm -g -c pc_sample_toy.sm_121.cubin
+static MockPCSample __mock_samples[] = {
+    // shmem_bounce — shared-memory bouncing kernel
+    {"_Z12shmem_bouncePfiy", 0, 0x00b0, 54,
+     "pc_sample_toy.cu", "/home/tpr/src/parcagpu-proton/microbenchmarks"},  // STS [R2], R3
+    {"_Z12shmem_bouncePfiy", 0, 0x00d0, 55,
+     "pc_sample_toy.cu", "/home/tpr/src/parcagpu-proton/microbenchmarks"},  // BAR.SYNC
+    {"_Z12shmem_bouncePfiy", 0, 0x01f0, 58,
+     "pc_sample_toy.cu", "/home/tpr/src/parcagpu-proton/microbenchmarks"},  // LDS (inner loop)
+    {"_Z12shmem_bouncePfiy", 0, 0x0230, 58,
+     "pc_sample_toy.cu", "/home/tpr/src/parcagpu-proton/microbenchmarks"},  // FFMA (inner loop)
+    {"_Z12shmem_bouncePfiy", 0, 0x0250, 59,
+     "pc_sample_toy.cu", "/home/tpr/src/parcagpu-proton/microbenchmarks"},  // BAR.SYNC (inner loop)
+
+    // hash_churn — integer bit-twiddling kernel
+    {"_Z10hash_churnPjiy", 1, 0x0050, 34,
+     "pc_sample_toy.cu", "/home/tpr/src/parcagpu-proton/microbenchmarks"},  // IMAD (idx calc)
+    {"_Z10hash_churnPjiy", 1, 0x0080, 39,
+     "pc_sample_toy.cu", "/home/tpr/src/parcagpu-proton/microbenchmarks"},  // LDCU (loop start)
+    {"_Z10hash_churnPjiy", 1, 0x0180, 40,
+     "pc_sample_toy.cu", "/home/tpr/src/parcagpu-proton/microbenchmarks"},  // IMAD.SHL (h ^= h << 13)
+
+    // trig_storm — FP math kernel
+    {"_Z10trig_stormPfiy", 2, 0x0050, 21,
+     "pc_sample_toy.cu", "/home/tpr/src/parcagpu-proton/microbenchmarks"},  // IMAD (idx calc)
+    {"_Z10trig_stormPfiy", 2, 0x00b0, 25,
+     "pc_sample_toy.cu", "/home/tpr/src/parcagpu-proton/microbenchmarks"},  // FMUL (x * 0.001f)
+    {"_Z10trig_stormPfiy", 2, 0x0f30, 27,
+     "pc_sample_toy.cu", "/home/tpr/src/parcagpu-proton/microbenchmarks"},  // FMUL (sinf*cosf inner)
+};
+#define NUM_MOCK_SAMPLES (sizeof(__mock_samples) / sizeof(__mock_samples[0]))
+
+static int __pc_get_data_calls = 0;
+
+CUptiResult cuptiPCSamplingGetData(CUpti_PCSamplingGetDataParams *params) {
+    CUpti_PCSamplingData *data = params->pcSamplingData;
+
+    __pc_get_data_calls++;
+    if (__pc_get_data_calls % 3 != 0 || data->collectNumPcs == 0) {
+        data->totalNumPcs = 0;
+        data->remainingNumPcs = 0;
+        return CUPTI_SUCCESS;
+    }
+
+    // Cycle through the sample table, emitting a batch each time.
+    static size_t sample_cursor = 0;
+    size_t count = data->collectNumPcs < 4 ? data->collectNumPcs : 4;
+    if (count > NUM_MOCK_SAMPLES)
+        count = NUM_MOCK_SAMPLES;
+
+    data->totalNumPcs = count;
+    data->remainingNumPcs = 0;
+    data->totalSamples = count * 9;
+
+    for (size_t i = 0; i < count; i++) {
+        MockPCSample *s = &__mock_samples[(sample_cursor + i) % NUM_MOCK_SAMPLES];
+        CUpti_PCSamplingPCData *pc = &data->pPcData[i];
+        pc->size = sizeof(CUpti_PCSamplingPCData);
+        pc->cubinCrc = __cubin_crc;
+        pc->pcOffset = s->pcOffset;
+        pc->functionIndex = s->functionIndex;
+        pc->functionName = (char *)s->functionName;
+        pc->stallReasonCount = 3;
+        for (size_t j = 0; j < 3; j++) {
+            pc->stallReason[j].pcSamplingStallReasonIndex = (uint32_t)j;
+            pc->stallReason[j].samples = (uint32_t)(5 - j * 2);
+        }
+    }
+    sample_cursor = (sample_cursor + count) % NUM_MOCK_SAMPLES;
+    return CUPTI_SUCCESS;
+}
+
+CUptiResult cuptiGetCubinCrc(CUpti_GetCubinCrcParams *params) {
+    params->cubinCrc = __compute_crc(params->cubin, params->cubinSize);
+    return CUPTI_SUCCESS;
+}
+
+// Source correlation: look up the offset in our known table.
+// Falls back to zeros if the offset isn't in the table (same as real CUPTI
+// when debug info is missing).
+CUptiResult cuptiGetSassToSourceCorrelation(
+    CUpti_GetSassToSourceCorrelationParams *params) {
+    for (size_t i = 0; i < NUM_MOCK_SAMPLES; i++) {
+        MockPCSample *s = &__mock_samples[i];
+        if (params->pcOffset == s->pcOffset &&
+            params->functionName && strcmp(params->functionName, s->functionName) == 0) {
+            params->lineNumber = s->lineNumber;
+            params->fileName = strdup(s->fileName);
+            params->dirName = strdup(s->dirName);
+            return CUPTI_SUCCESS;
+        }
+    }
+    // Unknown offset — no source info available.
+    params->lineNumber = 0;
+    params->fileName = NULL;
+    params->dirName = NULL;
+    return CUPTI_SUCCESS;
+}
+
+// =========================================================================
+// Resource callback helper — called from test harness after init.
+// Fires CONTEXT_CREATED and MODULE_LOADED with the real cubin.
+// =========================================================================
+
+void __mock_cupti_fire_resource_callbacks(void) {
+    if (!__cupti_runtime_api_callback)
+        return;
+
+    __load_cubin();
+
+    fprintf(stderr, "[MOCK_CUPTI] Firing resource callbacks\n");
+
+    // 1. CONTEXT_CREATED
+    CUpti_ResourceData resData;
+    memset(&resData, 0, sizeof(resData));
+    resData.context = (CUcontext)(uintptr_t)0x1;
+    __cupti_runtime_api_callback(
+        __cupti_runtime_api_userdata,
+        CUPTI_CB_DOMAIN_RESOURCE,
+        CUPTI_CBID_RESOURCE_CONTEXT_CREATED,
+        &resData);
+
+    // 2. MODULE_LOADED with the real cubin.
+    CUpti_ModuleResourceData modData;
+    memset(&modData, 0, sizeof(modData));
+    if (__cubin_data) {
+        modData.pCubin = __cubin_data;
+        modData.cubinSize = __cubin_size;
+    } else {
+        // Fallback: minimal fake cubin if no file was loaded.
+        static const char fake[] = {0x7f, 'E', 'L', 'F', 0,0,0,0, 0,0,0,0, 0,0,0,0};
+        modData.pCubin = fake;
+        modData.cubinSize = sizeof(fake);
+    }
+    resData.resourceDescriptor = &modData;
+    __cupti_runtime_api_callback(
+        __cupti_runtime_api_userdata,
+        CUPTI_CB_DOMAIN_RESOURCE,
+        CUPTI_CBID_RESOURCE_MODULE_LOADED,
+        &resData);
+}
+
+CUptiResult cuptiActivityDisable(CUpti_ActivityKind kind) {
+    (void)kind;
     return CUPTI_SUCCESS;
 }

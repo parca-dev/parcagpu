@@ -10,7 +10,6 @@
 #include <vector>
 
 #include "stall_reason_map.h"
-#include "token_bucket.h"
 
 #include <cuda.h>
 #include <cupti.h>
@@ -32,6 +31,10 @@
   } while (0)
 
 namespace parcagpu {
+
+// Debug logging control — defined in cupti.cpp.
+extern bool debug_enabled;
+extern void init_debug();
 
 // Use Proton's CubinData directly
 using proton::CubinData;
@@ -67,6 +70,7 @@ struct ConfigureData {
   CUpti_PCSamplingConfigurationInfo configureScratchBuffer();
   CUpti_PCSamplingConfigurationInfo configureHardwareBufferSize();
   CUpti_PCSamplingConfigurationInfo configureCollectionMode();
+  CUpti_PCSamplingConfigurationInfo configureStartStopControl();
 
   // Buffer size constants (from Proton)
   static constexpr size_t HardwareBufferSize = 128 * 1024 * 1024;
@@ -94,10 +98,24 @@ public:
   PCSampling() = default;
   ~PCSampling() = default;
 
-  // Check if PC sampling is supported (CUPTI >= 12.8.1)
+  // Check if PC sampling is supported (CUPTI >= 12.8.1).
+  // Enabled by default; set PARCAGPU_SAMPLING_FACTOR=0 to disable.
   static bool isSupported();
 
   void initialize(CUcontext context);
+
+  // Start PC sampling — kernels become serialized until stop().
+  // No-op if already started. Thread-safe.
+  void start(CUcontext context);
+
+  // Stop PC sampling, drain accumulated data, and emit probes.
+  // Kernels resume concurrent execution. No-op if not started.
+  void stop(CUcontext context);
+
+  // Emit stall reason map and replay cubin probes for late-attaching tracers.
+  // Call periodically regardless of sampling state.
+  void emitMetadata();
+
   void collectData(CUcontext context);
   void collectAllData();
   void finalize(CUcontext context);
@@ -113,11 +131,17 @@ private:
   proton::ThreadSafeMap<size_t, std::pair<CubinData, size_t>>
       cubinCrcToCubinData;
   proton::ThreadSafeSet<uint32_t> contextInitialized;
+  proton::ThreadSafeSet<uint32_t> contextFailed; // contexts where enable failed
 
   // Plain vector of initialized context IDs for iteration in collectAllData.
   // Protected by contextMutex.
   std::vector<uint32_t> initializedContextIds;
 
+  // Tracks whether CUPTI PC sampling is currently active (start/stop).
+  // Only one context can be sampling at a time in KERNEL_SERIALIZED mode.
+  std::atomic<bool> samplingActive{false};
+  CUcontext samplingContext{};
+  std::mutex pcSamplingMutex{};
   std::mutex contextMutex{};
 
   // Contiguous stall reason map for USDT probe emission.
@@ -136,10 +160,11 @@ private:
   // tracer. Reset to false when the cubin_loaded semaphore transitions to
   // non-zero.
   bool cubinsEmitted = false;
-
-  // Rate limiter for stall reason map re-emission (1 token per 10 seconds).
-  TokenBucket stallReasonMapLimiter{0.1};
+  bool stallMapEmitted = false;
 };
+
+// Fire the error USDT probe. Callable from any translation unit.
+void fireError(int32_t code, const char *message, const char *component);
 
 } // namespace parcagpu
 

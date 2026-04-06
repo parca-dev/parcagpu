@@ -24,3 +24,8 @@ CUresult cuDriverGetVersion(int *driverVersion) {
 
     return CUDA_SUCCESS;
 }
+
+// Mock cuCtxSynchronize — no-op in test (no real GPU work to wait for)
+CUresult cuCtxSynchronize(void) {
+    return CUDA_SUCCESS;
+}

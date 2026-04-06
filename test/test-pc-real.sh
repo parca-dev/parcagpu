@@ -45,7 +45,10 @@ trap cleanup EXIT
 
 # --- Launch the toy workload ---
 echo "=== Starting pc_sample_toy ==="
-PARCAGPU_DEBUG=1 PARCAGPU_SAMPLING_FACTOR=18 CUDA_INJECTION64_PATH="$LIB" "$TOY" 8 > "$TOY_LOG" 2>&1 &
+PARCAGPU_DEBUG=1 PARCAGPU_SAMPLING_FACTOR=18 \
+  PARCAGPU_PC_SAMPLING_PROBABILITY=1 \
+  PARCAGPU_PC_SAMPLING_INTERVAL=0.5 \
+  CUDA_INJECTION64_PATH="$LIB" "$TOY" 8 > "$TOY_LOG" 2>&1 &
 TOY_PID=$!
 echo "pc_sample_toy PID: $TOY_PID"
 
@@ -99,7 +102,7 @@ check() {
 }
 
 check "modules loaded (parcagpu)" "Module 0x.*loaded" "$TOY_LOG"
-check "stall reason map received" "stall reason map:" "$BPF_LOG"
+check "stall reason map received" "\[ 0\] smsp__pcsamp" "$BPF_LOG"
 check "PC samples contain stall reasons" "smsp__pcsamp" "$BPF_LOG"
 check "cubins loaded (bpf)" "\[CUBIN\].*loaded" "$BPF_LOG"
 check "PC sample events received" "pc_samples=[1-9]" "$BPF_LOG"

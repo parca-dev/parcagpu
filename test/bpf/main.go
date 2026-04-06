@@ -49,6 +49,7 @@ const (
 	eventTypeCubinLoaded   = 2
 	eventTypeCubinUnloaded = 3
 	eventTypePCSample      = 4
+	eventTypeError         = 5
 )
 
 // KernelEvent matches struct kernel_event in the BPF program.
@@ -78,6 +79,14 @@ type CubinEvent struct {
 type StallReason struct {
 	Index   uint32
 	Samples uint32
+}
+
+// ErrorEvent matches struct error_event in the BPF program.
+type ErrorEvent struct {
+	EventType uint32
+	ErrorCode int32
+	Message   [256]byte
+	Component [64]byte
 }
 
 // PCSampleEvent matches struct pc_sample_event in the BPF program.
@@ -438,6 +447,7 @@ func main() {
 		{"cubin_loaded", objs.HandleCubinLoaded},
 		{"cubin_unloaded", objs.HandleCubinUnloaded},
 		{"pc_sample_batch", objs.HandlePcSampleBatch},
+		{"error", objs.HandleError},
 	}
 
 	var links []link.Link
@@ -584,6 +594,16 @@ func main() {
 				continue
 			}
 			cubins.unload(event.CubinCRC)
+
+		case eventTypeError:
+			var event ErrorEvent
+			if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &event); err != nil {
+				log.Printf("Parsing error event: %v", err)
+				continue
+			}
+			msg := cString(event.Message[:])
+			comp := cString(event.Component[:])
+			log.Printf("ERROR [%s] code=%d: %s", comp, event.ErrorCode, msg)
 
 		case eventTypePCSample:
 			var event PCSampleEvent

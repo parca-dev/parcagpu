@@ -86,6 +86,7 @@ add_library(parcagpucupti SHARED
     src/cupti.cpp
     src/pc_sampling.cpp
     src/correlation_filter.cpp
+    src/env_config.cpp
     ${PROTON_SOURCES}
 )
 

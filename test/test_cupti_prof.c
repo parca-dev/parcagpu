@@ -901,6 +901,16 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    // Fire resource callbacks (CONTEXT_CREATED, MODULE_LOADED) so that
+    // PC sampling initialization runs in the profiler library.
+    typedef void (*FireResourceCallbacksFunc)(void);
+    FireResourceCallbacksFunc fireResourceCbs =
+        (FireResourceCallbacksFunc)dlsym(RTLD_DEFAULT,
+                                         "__mock_cupti_fire_resource_callbacks");
+    if (fireResourceCbs) {
+        fireResourceCbs();
+    }
+
     // Load kernel names if specified
     KernelNameList *kernel_names = NULL;
     if (config.kernel_names) {

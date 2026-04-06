@@ -1,4 +1,4 @@
-.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug bpf-test microbenchmarks test-multi test-pc-real
+.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug bpf-test microbenchmarks test-multi test-pc-real test-pc-mock
 
 LIB_NAME = libparcagpucupti.so
 
@@ -150,6 +150,10 @@ test-multi: local bpf-test
 # Requires: real GPU, root (sudo) for BPF, pc_sample_toy compiled separately.
 test-pc-real: local bpf-test microbenchmarks
 	sudo -E test/test-pc-real.sh
+
+# Mock PC sampling test — no GPU required, uses mock CUPTI/CUDA.
+test-pc-mock: local bpf-test
+	sudo -E test/test-pc-mock.sh
 
 format:
 	@echo "=== Formatting source files ==="

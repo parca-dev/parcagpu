@@ -22,12 +22,10 @@
 
 #include "usdt_args.h"
 
-#include "cupti_activity_bpf.h"
+#include "cupti_bpf.h"
 
 #define MAX_BATCH_SIZE 128
 #define MAX_KERNEL_NAME 128
-#define STALL_REASON_NAME_LEN 64
-#define MAX_STALL_REASONS 64
 #define MAX_CUBIN_SIZE (64 * 1024 * 1024) // 64MB safety cap
 
 // USDT spec map — populated by Go loader before uprobe attachment.
@@ -67,32 +65,7 @@ struct cubin_event {
 #define EVENT_TYPE_CUBIN_LOADED 2
 #define EVENT_TYPE_CUBIN_UNLOADED 3
 #define EVENT_TYPE_PC_SAMPLE 4
-
-// Matches CUpti_PCSamplingStallReason (packed, aligned 8).
-struct cupti_stall_reason {
-  u32 stall_reason_index;
-  u32 samples;
-};
-
-// Matches CUpti_PCSamplingPCData (packed, aligned 8).
-// Contains user-space pointers that BPF chases with bpf_probe_read_user.
-// We read the base 56-byte struct, then conditionally read correlationId
-// if the size field indicates CUDA 13+ (size > 56).
-struct cupti_pc_data {
-  u64 size;               // struct size (56 = CUDA 12, 60+ = CUDA 13)
-  u64 cubin_crc;
-  u64 pc_offset;
-  u32 function_index;
-  u32 _pad;
-  u64 function_name_ptr;  // const char* in user-space
-  u64 stall_reason_count;
-  u64 stall_reason_ptr;   // CUpti_PCSamplingStallReason* in user-space
-} __attribute__((__packed__)) __attribute__((aligned(8)));
-
-#define CUPTI_PC_DATA_BASE_SIZE 56
-
-#define MAX_PC_BATCH_SIZE 512
-#define MAX_FUNC_NAME 128
+#define EVENT_TYPE_ERROR 5
 
 // PC sample event sent to user-space.
 struct pc_sample_event {
@@ -101,9 +74,19 @@ struct pc_sample_event {
   u64 cubin_crc;
   u64 pc_offset;
   u32 function_index;
-  u32 correlation_id; // kernel correlation ID (CUDA 13+ serialized mode, else 0)
+  u32 correlation_id; // kernel correlation ID (CUDA 12.4+ / CUPTI v22+, else 0)
   char function_name[MAX_FUNC_NAME];
   struct cupti_stall_reason stall_reasons[MAX_STALL_REASONS];
+};
+
+// Error event sent to user-space.
+#define MAX_ERROR_MSG 256
+#define MAX_ERROR_COMPONENT 64
+struct error_event {
+  u32 event_type; // EVENT_TYPE_ERROR
+  s32 error_code;
+  char message[MAX_ERROR_MSG];
+  char component[MAX_ERROR_COMPONENT];
 };
 
 // Ring buffer for sending events to user-space.
@@ -327,7 +310,7 @@ int BPF_USDT(handle_pc_sample_batch, u64 ptrs_base, u32 count) {
     evt->pc_offset = rec.pc_offset;
     evt->function_index = rec.function_index;
 
-    // Read correlationId if the struct is large enough (CUDA 13+).
+    // Read correlationId if the struct is large enough (CUDA 12.4+).
     // It sits right after the stallReason pointer at offset 56.
     evt->correlation_id = 0;
     if (rec.size > CUPTI_PC_DATA_BASE_SIZE) {
@@ -360,6 +343,28 @@ int BPF_USDT(handle_pc_sample_batch, u64 ptrs_base, u32 count) {
     bpf_ringbuf_submit(evt, 0);
   }
 
+  return 0;
+}
+
+SEC("usdt/parcagpu/error")
+int BPF_USDT(handle_error, s32 code, u64 message_ptr, u64 component_ptr) {
+  struct error_event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+  if (!evt) {
+    bump_stat(STAT_DROPS);
+    return 0;
+  }
+
+  evt->event_type = EVENT_TYPE_ERROR;
+  evt->error_code = code;
+  evt->message[0] = '\0';
+  evt->component[0] = '\0';
+  if (message_ptr)
+    bpf_probe_read_user_str(evt->message, sizeof(evt->message),
+                            (void *)message_ptr);
+  if (component_ptr)
+    bpf_probe_read_user_str(evt->component, sizeof(evt->component),
+                            (void *)component_ptr);
+  bpf_ringbuf_submit(evt, 0);
   return 0;
 }
 
