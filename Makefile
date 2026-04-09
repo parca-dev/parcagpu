@@ -1,4 +1,4 @@
-.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug bpf-test microbenchmarks test-multi test-pc-real test-pc-mock
+.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock
 
 LIB_NAME = libparcagpucupti.so
 
@@ -115,18 +115,23 @@ microbenchmarks: $(MICROBENCH_BINS)
 microbenchmarks/%: microbenchmarks/%.cu
 	$(NVCC) -g -lineinfo -arch=$(CUDA_ARCH) -o $@ $<
 
-# Build the BPF activity parser test program
+# Run go generate for the BPF test program (compiles .bpf.c via bpf2go)
 # Requires: clang, libbpf-dev, bpftool (for vmlinux.h), Go 1.21+
-bpf-test:
-	@echo "=== Building BPF activity parser test ==="
+generate:
+	@echo "=== Generating BPF objects ==="
 	@if [ ! -f test/bpf/vmlinux.h ]; then \
 		echo "Generating vmlinux.h from kernel BTF..."; \
 		bpftool btf dump file /sys/kernel/btf/vmlinux format c > test/bpf/vmlinux.h; \
 	fi
 	@cd test/bpf && \
-		export USDT_HEADERS=$$(go mod download github.com/parca-dev/usdt >/dev/null && \
-			go list -m -f '{{.Dir}}' github.com/parca-dev/usdt)/ebpf && \
-		go generate ./... && CGO_ENABLED=0 go build -o activity_parser .
+		USDT_HEADERS=$$(go list -m -f '{{.Dir}}' github.com/parca-dev/usdt)/ebpf && \
+		export USDT_HEADERS && \
+		go generate ./...
+
+# Build the BPF activity parser test program
+bpf-test: generate
+	@echo "=== Building BPF activity parser test ==="
+	@cd test/bpf && CGO_ENABLED=0 go build -o activity_parser .
 	@echo "BPF test built: test/bpf/activity_parser"
 
 # Run test_cupti_prof and BPF activity parser in parallel.
