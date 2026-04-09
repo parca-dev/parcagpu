@@ -35,13 +35,13 @@ import (
 	ebpf2 "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
-	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
+	"github.com/parca-dev/usdt"
 	"golang.org/x/sys/unix"
 
 	sasstable "github.com/gnurizen/sass-table"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target $GOARCH -cflags "-I../../vendor/opentelemetry-ebpf-profiler/support/ebpf" activityParser activity_parser.bpf.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target $GOARCH -cflags "-I../../ebpf -I$USDT_HEADERS" activityParser activity_parser.bpf.c
 
 // Event type tags — must match BPF #defines.
 const (
@@ -129,13 +129,13 @@ type textSection struct {
 }
 
 type cubinInfo struct {
-	crc       uint64
-	size      uint64
-	lines     []lineEntry // sorted by addr
-	files     []string    // file table from line table header
-	archSM    int              // SM version from ELF e_flags (e.g. 121)
-	texts     []textSection    // .text sections for instruction decoding
-	tmpPath   string           // temp file for llvm-dwarfdump
+	crc     uint64
+	size    uint64
+	lines   []lineEntry   // sorted by addr
+	files   []string      // file table from line table header
+	archSM  int           // SM version from ELF e_flags (e.g. 121)
+	texts   []textSection // .text sections for instruction decoding
+	tmpPath string        // temp file for llvm-dwarfdump
 }
 
 func newCubinStore(pid int) *cubinStore {
@@ -416,19 +416,9 @@ func main() {
 	defer objs.Close()
 
 	// Parse USDT probes from the shared library's .note.stapsdt section.
-	ef, err := pfelf.Open(realLib)
+	probes, err := usdt.ParseProbesFromFile(realLib)
 	if err != nil {
-		log.Fatalf("Opening ELF %s: %v", realLib, err)
-	}
-	defer ef.Close()
-
-	if err := ef.LoadSections(); err != nil {
-		log.Fatalf("Loading ELF sections: %v", err)
-	}
-
-	probes, err := ef.ParseUSDTProbes()
-	if err != nil {
-		log.Fatalf("Parsing USDT probes: %v", err)
+		log.Fatalf("Parsing USDT probes from %s: %v", realLib, err)
 	}
 
 	// Find USDT probes and attach uprobes at each site.
@@ -458,12 +448,12 @@ func main() {
 				continue
 			}
 
-			spec, err := pfelf.ParseUSDTArguments(probe.Arguments)
+			spec, err := usdt.ParseUSDTArguments(probe.Arguments)
 			if err != nil {
 				log.Fatalf("Parsing USDT args %q: %v", probe.Arguments, err)
 			}
 
-			specBytes := pfelf.USDTSpecToBytes(spec)
+			specBytes := usdt.SpecToBytes(spec)
 			if err := objs.BpfUsdtSpecs.Put(specID, specBytes); err != nil {
 				log.Fatalf("Populating USDT spec map: %v", err)
 			}

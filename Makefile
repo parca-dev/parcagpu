@@ -123,7 +123,10 @@ bpf-test:
 		echo "Generating vmlinux.h from kernel BTF..."; \
 		bpftool btf dump file /sys/kernel/btf/vmlinux format c > test/bpf/vmlinux.h; \
 	fi
-	@cd test/bpf && go generate ./... && CGO_ENABLED=0 go build -o activity_parser .
+	@cd test/bpf && \
+		export USDT_HEADERS=$$(go mod download github.com/parca-dev/usdt >/dev/null && \
+			go list -m -f '{{.Dir}}' github.com/parca-dev/usdt)/ebpf && \
+		go generate ./... && CGO_ENABLED=0 go build -o activity_parser .
 	@echo "BPF test built: test/bpf/activity_parser"
 
 # Run test_cupti_prof and BPF activity parser in parallel.

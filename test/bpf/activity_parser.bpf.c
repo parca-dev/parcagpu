@@ -90,35 +90,35 @@ struct error_event {
 };
 
 // Ring buffer for sending events to user-space.
-struct bpf_map_def events SEC("maps") = {
-    .type = BPF_MAP_TYPE_RINGBUF,
-    .max_entries = 1 << 20, // 1 MB
-};
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20); // 1 MB
+} events SEC(".maps");
 
 // Stall reason name table — indexed by stall reason index.
 // Value is a 64-byte null-terminated string.
-struct bpf_map_def stall_reasons SEC("maps") = {
-    .type = BPF_MAP_TYPE_ARRAY,
-    .key_size = sizeof(u32),
-    .value_size = STALL_REASON_NAME_LEN,
-    .max_entries = MAX_STALL_REASONS,
-};
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, u32);
+    __type(value, char[STALL_REASON_NAME_LEN]);
+    __uint(max_entries, MAX_STALL_REASONS);
+} stall_reasons SEC(".maps");
 
 // Whether the stall reason map has been populated.
-struct bpf_map_def stall_map_loaded SEC("maps") = {
-    .type = BPF_MAP_TYPE_ARRAY,
-    .key_size = sizeof(u32),
-    .value_size = sizeof(u32),
-    .max_entries = 1,
-};
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, u32);
+    __type(value, u32);
+    __uint(max_entries, 1);
+} stall_map_loaded SEC(".maps");
 
 // Stats counters.
-struct bpf_map_def stats SEC("maps") = {
-    .type = BPF_MAP_TYPE_ARRAY,
-    .key_size = sizeof(u32),
-    .value_size = sizeof(u64),
-    .max_entries = 4,
-};
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, u32);
+    __type(value, u64);
+    __uint(max_entries, 4);
+} stats SEC(".maps");
 
 enum stat_key {
   STAT_BATCHES = 0,    // number of batch probe invocations
