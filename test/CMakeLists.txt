@@ -20,6 +20,15 @@ set_target_properties(cupti PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
+# Mock CUDA driver library
+add_library(cuda SHARED mock_cuda.c)
+target_include_directories(cuda PRIVATE ${CUDA_INCLUDE_DIRS})
+set_target_properties(cuda PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON
+)
+
 # CUDA major version - prefer explicitly passed value, fall back to detection
 if(NOT DEFINED CUDA_MAJOR_VERSION)
     execute_process(

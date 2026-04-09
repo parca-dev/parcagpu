@@ -1,19 +1,19 @@
 # CUPTI Profiler Test Infrastructure
 
-This directory contains test infrastructure for `libparcagpucupti.so` using Zig as the build system.
+This directory contains test infrastructure for `libparcagpucupti.so` using CMake as the build system.
 
 ## Components
 
-- **test/mock_cupti.c**: Mock CUPTI library that provides stub implementations of all CUPTI APIs used by cupti-prof.c
+- **test/mock_cupti.c**: Mock CUPTI library that provides stub implementations of all CUPTI APIs used by the profiler
 - **test/test_cupti_prof.c**: Test program that dynamically loads libparcagpucupti.so and simulates CUPTI callbacks
-- **build.zig**: Zig build configuration (at project root)
+- **CMakeLists.txt**: CMake build configuration (at project root)
 - **test.sh**: Test script (at project root)
 
 ## Building
 
 From the project root:
 ```bash
-zig build
+make
 ```
 
 This builds:
@@ -21,32 +21,31 @@ This builds:
 2. `libparcagpucupti.so` - The profiler library linked against the mock CUPTI
 3. `test_cupti_prof` - Test executable that loads and exercises the profiler
 
-All outputs go to `zig-out/lib/` and `zig-out/bin/`.
+All outputs go to `build/lib/` and `build/bin/`.
 
 ## Running
 
 Using the test script (recommended):
 ```bash
-cd /home/tpr/src/gpu/parcagpu
 ./test.sh
 ```
 
-Using Zig directly:
+Using Make directly:
 ```bash
-zig build run
+make test
 ```
 
 Or manually:
 ```bash
-zig build
-LD_LIBRARY_PATH=zig-out/lib zig-out/bin/test_cupti_prof zig-out/lib/libparcagpucupti.so
+make
+LD_LIBRARY_PATH=build/lib build/bin/test_cupti_prof build/lib/libparcagpucupti.so
 ```
 
 ### Running Continuously
 
 To run the test in continuous mode (useful for monitoring probes with bpftrace):
 ```bash
-LD_LIBRARY_PATH=zig-out/lib zig-out/bin/test_cupti_prof zig-out/lib/libparcagpucupti.so --forever
+LD_LIBRARY_PATH=build/lib build/bin/test_cupti_prof build/lib/libparcagpucupti.so --forever
 ```
 
 In this mode, the test will:
@@ -83,7 +82,7 @@ The test script automatically enables `PARCAGPU_DEBUG=1` to show detailed debug 
 
 To run without debug output:
 ```bash
-LD_LIBRARY_PATH=zig-out/lib zig-out/bin/test_cupti_prof zig-out/lib/libparcagpucupti.so
+LD_LIBRARY_PATH=build/lib build/bin/test_cupti_prof build/lib/libparcagpucupti.so
 ```
 
 ## Verifying DTRACE Probes
@@ -92,13 +91,11 @@ To verify that the DTRACE/USDT probes are firing correctly, use the provided bpf
 
 **Terminal 1** - Run bpftrace to monitor probes:
 ```bash
-cd /home/tpr/src/gpu/parcagpu
 sudo bpftrace parcagpu.bt
 ```
 
 **Terminal 2** - Run the test:
 ```bash
-cd /home/tpr/src/gpu/parcagpu
 ./test.sh
 ```
 

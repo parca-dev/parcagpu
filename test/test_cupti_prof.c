@@ -628,6 +628,13 @@ void *cupti_thread(void *arg) {
             size_t maxNumRecords;
             bufferRequestedCallback(&buffer, &bufferSize, &maxNumRecords);
 
+            // The profiler may return NULL when no tracer is attached
+            // (semaphore-gated short circuit). Skip this flush cycle.
+            if (buffer == NULL) {
+                usleep(100000);
+                continue;
+            }
+
             // Fill the buffer with activity records for launched kernels
             size_t offset = 0;
             size_t recordSize = sizeof(CUpti_ActivityKernel5);
@@ -892,6 +899,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Warning: Could not get callback pointers from mock CUPTI.\n");
         dlclose(cupti_prof_handle);
         return 0;
+    }
+
+    // Fire resource callbacks (CONTEXT_CREATED, MODULE_LOADED) so that
+    // PC sampling initialization runs in the profiler library.
+    typedef void (*FireResourceCallbacksFunc)(void);
+    FireResourceCallbacksFunc fireResourceCbs =
+        (FireResourceCallbacksFunc)dlsym(RTLD_DEFAULT,
+                                         "__mock_cupti_fire_resource_callbacks");
+    if (fireResourceCbs) {
+        fireResourceCbs();
     }
 
     // Load kernel names if specified
