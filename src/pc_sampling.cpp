@@ -192,8 +192,6 @@ uint32_t getGPUSamplingFrequency() {
               "[5,31], using default %u\n",
               factor, PARCAGPU_DEFAULT_FREQUENCY);
     }
-  } else {
-    return 0;
   }
   return samplingPeriod;
 }
@@ -388,11 +386,11 @@ void ConfigureData::initialize(CUcontext context) {
 // GPUPCSampling implementation
 
 bool PCSampling::isSupported() {
-  // PC sampling is enabled by default.
-  // Set PARCAGPU_SAMPLING_FACTOR=0 to disable.
+  // PC sampling is off by default.
+  // Set PARCAGPU_SAMPLING_FACTOR to a value in [5,31] to enable.
   const char *env = getenv("PARCAGPU_SAMPLING_FACTOR");
-  if (env && atoi(env) == 0) {
-    DEBUG_PRINTF("PC sampling disabled via PARCAGPU_SAMPLING_FACTOR=0\n");
+  if (!env || atoi(env) == 0) {
+    DEBUG_PRINTF("PC sampling disabled (set PARCAGPU_SAMPLING_FACTOR to enable)\n");
     return false;
   }
 
