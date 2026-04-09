@@ -71,7 +71,7 @@ test: local
 # Clean build artifacts
 clean:
 	@echo "=== Cleaning build artifacts ==="
-	@rm -rf build build-local bin lib zig-out .zig-cache
+	@rm -rf build build-local bin lib
 	@rm -rf CMakeCache.txt CMakeFiles/ cmake_install.cmake compile_commands.json
 	@echo "Clean complete"
 
