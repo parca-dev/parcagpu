@@ -528,8 +528,11 @@ private:
                  CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000);
       }
 
-      // Rate limit probes using token bucket (skip for graph launches)
-      if (!isGraphLaunch) {
+      // Rate limit probes using token bucket.  Skip rate limiting for graph
+      // launches (they share one correlation ID across many kernels) and when
+      // PC sampling is active (every kernel needs its correlation callback so
+      // PC samples can be matched with CPU stacks on the agent side).
+      if (!isGraphLaunch && !g_pcSamplingState.active) {
         if (!callbackLimiter.tryAcquire()) {
           DEBUG_PRINTF(
               "[PARCAGPU] Rate limited: skipping probe for correlationId=%u\n",
