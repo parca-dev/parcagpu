@@ -291,6 +291,9 @@ static void (*bufferRequestedCallback)(uint8_t **buffer, size_t *size, size_t *m
 static void (*bufferCompletedCallback)(CUcontext ctx, uint32_t streamId, uint8_t *buffer, size_t size, size_t validSize) = NULL;
 static void (*parcagpuCuptiCallback)(void *userdata, CUpti_CallbackDomain domain, CUpti_CallbackId cbid, const CUpti_CallbackData *cbdata) = NULL;
 
+// Defined in mock_cupti.c — feeds correlation IDs to cuptiPCSamplingGetData.
+extern void __mock_pc_enqueue_correlation(uint32_t correlation_id);
+
 //=============================================================================
 // Launched Kernels Queue
 // Track which correlation IDs have had their callbacks executed
@@ -498,6 +501,7 @@ void simulate_runtime_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbi
         if (should_generate_activities) {
             enqueue_launched_kernel(correlationId);
         }
+        __mock_pc_enqueue_correlation(correlationId);
     }
 }
 
@@ -522,6 +526,7 @@ void simulate_driver_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbid
         if (should_generate_activities) {
             enqueue_launched_kernel(correlationId);
         }
+        __mock_pc_enqueue_correlation(correlationId);
     }
 }
 

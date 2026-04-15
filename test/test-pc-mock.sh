@@ -54,7 +54,7 @@ LD_LIBRARY_PATH="$ROOT/build-local/lib:${LD_LIBRARY_PATH:-}" \
   PARCAGPU_PC_SAMPLING_PROBABILITY=1 \
   PARCAGPU_PC_SAMPLING_INTERVAL=0.1 \
   MOCK_CUBIN_PATH="$CUBIN" \
-  "$TEST_BIN" "$LIB" --duration=5 > "$TEST_LOG" 2>&1 &
+  "$TEST_BIN" "$LIB" --launch-rate=50 --duration=15 > "$TEST_LOG" 2>&1 &
 TEST_PID=$!
 echo "test_cupti_prof PID: $TEST_PID"
 

@@ -311,12 +311,25 @@ static MockPCSample __mock_samples[] = {
 #define NUM_MOCK_SAMPLES (sizeof(__mock_samples) / sizeof(__mock_samples[0]))
 
 static int __pc_get_data_calls = 0;
+// Per-sample stall reason storage.  Allocated once and reused — pointers
+// into this array are placed in each CUpti_PCSamplingPCData.
+#define MAX_PC_DATA 16
+static CUpti_PCSamplingStallReason __pc_stall_storage[MAX_PC_DATA][3];
+
+// Most recent correlation ID from kernel launches.  The test harness
+// updates this via __mock_pc_enqueue_correlation on every launch.
+// cuptiPCSamplingGetData assigns recent IDs (counting back from the latest)
+// so they overlap with traces still in the gpuTraceFixer's pcTraces map.
+static volatile uint32_t __pc_latest_correlation = 0;
+
+void __mock_pc_enqueue_correlation(uint32_t correlation_id) {
+    __pc_latest_correlation = correlation_id;
+}
 
 CUptiResult cuptiPCSamplingGetData(CUpti_PCSamplingGetDataParams *params) {
     CUpti_PCSamplingData *data = params->pcSamplingData;
 
-    __pc_get_data_calls++;
-    if (__pc_get_data_calls % 3 != 0 || data->collectNumPcs == 0) {
+    if (data->collectNumPcs == 0) {
         data->totalNumPcs = 0;
         data->remainingNumPcs = 0;
         return CUPTI_SUCCESS;
@@ -327,6 +340,8 @@ CUptiResult cuptiPCSamplingGetData(CUpti_PCSamplingGetDataParams *params) {
     size_t count = data->collectNumPcs < 4 ? data->collectNumPcs : 4;
     if (count > NUM_MOCK_SAMPLES)
         count = NUM_MOCK_SAMPLES;
+    if (count > MAX_PC_DATA)
+        count = MAX_PC_DATA;
 
     data->totalNumPcs = count;
     data->remainingNumPcs = 0;
@@ -341,10 +356,17 @@ CUptiResult cuptiPCSamplingGetData(CUpti_PCSamplingGetDataParams *params) {
         pc->functionIndex = s->functionIndex;
         pc->functionName = (char *)s->functionName;
         pc->stallReasonCount = 3;
+        pc->stallReason = __pc_stall_storage[i];
         for (size_t j = 0; j < 3; j++) {
             pc->stallReason[j].pcSamplingStallReasonIndex = (uint32_t)j;
             pc->stallReason[j].samples = (uint32_t)(5 - j * 2);
         }
+        // Assign a correlation ID from recent-but-not-too-recent launches.
+        // Offset by 20 from the latest to ensure the cuda_correlation BPF
+        // probe has had time to fire and the trace is in pcTraces.
+        uint32_t latest = __pc_latest_correlation;
+        uint32_t back = 20 + (uint32_t)(count - 1 - i);
+        pc->correlationId = (latest > back) ? latest - back : 0;
     }
     sample_cursor = (sample_cursor + count) % NUM_MOCK_SAMPLES;
     return CUPTI_SUCCESS;
