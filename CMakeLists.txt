@@ -46,21 +46,24 @@ if(NOT DEFINED CUDA_INCLUDE_DIR)
     endif()
 endif()
 
+set(GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+file(MAKE_DIRECTORY ${GENERATED_DIR})
+
 # Include directories from proton
 include_directories(
     ${PROTON_DIR}/csrc/include
     ${PROTON_DIR}/common/include
     ${CUDA_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GENERATED_DIR}
 )
 
 # Generate USDT probe header and object from probes.d
 find_program(DTRACE dtrace REQUIRED)
 
 add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.h
+    OUTPUT ${GENERATED_DIR}/probes.h
     COMMAND ${DTRACE} -h -s ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.d
-                         -o ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.h
+                         -o ${GENERATED_DIR}/probes.h
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.d
     COMMENT "Generating USDT probe header (probes.h)"
 )
@@ -92,7 +95,7 @@ add_library(parcagpucupti SHARED
 
 # Wire USDT probe artifacts into the build
 add_custom_target(probes_generated
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.h
+    DEPENDS ${GENERATED_DIR}/probes.h
             ${CMAKE_CURRENT_BINARY_DIR}/probes.o
 )
 add_dependencies(parcagpucupti probes_generated)
