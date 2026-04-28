@@ -1,3 +1,6 @@
+// Copyright 2026 The Parca Authors
+// SPDX-License-Identifier: Apache-2.0
+
 #include "correlation_filter.h"
 
 namespace parcagpu {

@@ -1,3 +1,6 @@
+// Copyright 2026 The Parca Authors
+// SPDX-License-Identifier: Apache-2.0
+//
 // Test program that loads the activity_parser BPF program, attaches it
 // to parcagpu USDT probes in the target shared library, and logs kernel
 // activities received through the ring buffer. Also captures cubin modules

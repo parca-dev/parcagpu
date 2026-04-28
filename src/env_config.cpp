@@ -1,3 +1,6 @@
+// Copyright 2026 The Parca Authors
+// SPDX-License-Identifier: Apache-2.0
+
 #include "env_config.h"
 #include "pc_sampling.h" // DEBUG_PRINTF, fireError
 #include "probes.h"

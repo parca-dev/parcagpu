@@ -1,3 +1,6 @@
+// Copyright 2026 The Parca Authors
+// SPDX-License-Identifier: Apache-2.0
+
 #ifndef PC_SAMPLING_H_
 #define PC_SAMPLING_H_
 
