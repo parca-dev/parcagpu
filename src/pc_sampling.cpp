@@ -1,3 +1,6 @@
+// Copyright 2026 The Parca Authors
+// SPDX-License-Identifier: Apache-2.0
+
 #include "Driver/GPU/CudaApi.h"
 #include "Driver/GPU/CuptiApi.h"
 #include "pc_sampling.h"

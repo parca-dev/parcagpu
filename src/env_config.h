@@ -1,3 +1,6 @@
+// Copyright 2026 The Parca Authors
+// SPDX-License-Identifier: Apache-2.0
+
 #ifndef PARCAGPU_ENV_CONFIG_H_
 #define PARCAGPU_ENV_CONFIG_H_
 

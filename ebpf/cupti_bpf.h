@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0
+// Copyright 2026 The Parca Authors
+//
 // CUPTI BPF definitions — shared between test/bpf/ and production cuda.ebpf.c.
 //
 // Contains BPF-side layouts for:
