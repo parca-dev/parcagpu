@@ -89,6 +89,7 @@ static double threadRandom(PCSamplingState &s) {
 void init_debug() {
   static bool initialized = false;
   if (!initialized) {
+    initialized = true;
     debug_enabled = getenv("PARCAGPU_DEBUG") != nullptr;
     const char *rateEnv = getenv("PARCAGPU_RATE_LIMIT");
     if (rateEnv != nullptr) {

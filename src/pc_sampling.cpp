@@ -270,6 +270,7 @@ CUpti_PCSamplingData allocPCSamplingData(size_t collectNumPCs,
       static_cast<CUpti_PCSamplingPCData *>(
           std::calloc(collectNumPCs, sizeof(CUpti_PCSamplingPCData)))};
   for (size_t i = 0; i < collectNumPCs; ++i) {
+    pcSamplingData.pPcData[i].size = sizeof(CUpti_PCSamplingPCData);
     pcSamplingData.pPcData[i].stallReason =
         static_cast<CUpti_PCSamplingStallReason *>(std::calloc(
             numValidStallReasons, sizeof(CUpti_PCSamplingStallReason)));
@@ -647,16 +648,22 @@ void PCSampling::collectData(CUcontext context) {
                contextId, configureData->pcSamplingData.totalNumPcs,
                configureData->pcSamplingData.remainingNumPcs);
 
-  // Use the separate output buffer for getData — the configured
-  // pcSamplingData buffer is owned by CUPTI.
-  bool ok = getPCSamplingData(context, &configureData->outputData);
-  DEBUG_PRINTF("getData: ok=%d output total=%zu remaining=%zu "
-               "cfg total=%zu remaining=%zu\n",
-               ok, configureData->outputData.totalNumPcs,
-               configureData->outputData.remainingNumPcs,
-               configureData->pcSamplingData.totalNumPcs,
-               configureData->pcSamplingData.remainingNumPcs);
-  processPCSamplingData(configureData);
+  // Drain all available PCs in a loop. Each getData call returns at most
+  // DataBufferPCCount (1024) PCs; a single sampling window can produce
+  // tens of thousands. Failing to drain leaves data in CUPTI's internal
+  // buffers, which eventually causes CUPTI_ERROR_OUT_OF_MEMORY (error 8).
+  do {
+    bool ok = getPCSamplingData(context, &configureData->outputData);
+    DEBUG_PRINTF("getData: ok=%d output total=%zu remaining=%zu "
+                 "cfg total=%zu remaining=%zu\n",
+                 ok, configureData->outputData.totalNumPcs,
+                 configureData->outputData.remainingNumPcs,
+                 configureData->pcSamplingData.totalNumPcs,
+                 configureData->pcSamplingData.remainingNumPcs);
+    if (!ok)
+      break;
+    processPCSamplingData(configureData);
+  } while (configureData->outputData.remainingNumPcs > 0);
 }
 
 void PCSampling::collectAllData() {
@@ -671,7 +678,14 @@ void PCSampling::collectAllData() {
     }
     auto *configureData = &result->get();
     DEBUG_PRINTF("Draining PC sampling data for context %u\n", contextId);
-    processPCSamplingData(configureData);
+    // Fetch and drain all pending data from CUPTI.
+    do {
+      bool ok = getPCSamplingData(configureData->context,
+                                  &configureData->outputData);
+      if (!ok)
+        break;
+      processPCSamplingData(configureData);
+    } while (configureData->outputData.remainingNumPcs > 0);
   }
 }
 
@@ -706,14 +720,16 @@ void PCSampling::finalize(CUcontext context) {
     }
   }
 
-  // Drain remaining data before disabling
+  // Drain all remaining PC data before disabling.
   auto *configureData = getConfigureData(contextId);
-  processPCSamplingData(configureData);
-
-  // After disable, CUPTI may fill remaining records — drain once more
-  if (configureData->pcSamplingData.totalNumPcs > 0) {
+  do {
+    bool ok = getPCSamplingData(context, &configureData->outputData);
+    if (!ok)
+      break;
     processPCSamplingData(configureData);
-  }
+  } while (configureData->outputData.remainingNumPcs > 0);
+
+  disablePCSampling(context);
 
   contextIdToConfigureData.erase(contextId);
   contextInitialized.erase(contextId);
