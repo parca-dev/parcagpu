@@ -56,20 +56,31 @@ thread_local TokenBucket callbackLimiter(100.0);
 // observed since the last update.
 // ---------------------------------------------------------------------------
 
-// 50 ms — short enough to give ~20 dice rolls/sec (low rate variance, fast
-// response to workload phase changes), long enough that CUPTI start/stop
-// cost (~25 us measured) is amortized to <0.05% of wall time.
-static constexpr uint64_t kPCSamplingIntervalNs = 50'000'000ULL;
+// 30 ms — short enough to give ~33 dice rolls/sec (tighter rate variance,
+// faster response to workload phase changes), long enough that CUPTI
+// start/stop cost (~25 us measured) is amortized to <0.1% of wall time.
+static constexpr uint64_t kPCSamplingIntervalNs = 30'000'000ULL;
 // How often the controller recalibrates probability based on observed rate.
 static constexpr uint64_t kPCControlPeriodNs = 5'000'000'000ULL;
 // Don't react to <25% rate error (avoids oscillating on noise).
 static constexpr double kPCControlTolerance = 0.25;
-// Single update can change probability by at most this factor up or down.
-static constexpr double kPCControlStepClamp = 2.0;
+// Symmetric step clamp at sqrt(2). Larger steps (2x or 4x) amplify
+// single-window sampling noise into multi-update oscillations: one
+// 30ms window happening to land in an idle phase shows few samples,
+// the controller over-corrects, then the next busy phase shows many.
+// sqrt(2) keeps each adjustment small enough that the eventual
+// equilibrium sits within the tolerance band even under bursty signal.
+static constexpr double kPCControlStepShrink = 1.41421356;
+static constexpr double kPCControlStepGrow = 1.41421356;
 static constexpr double kPCProbMin = 0.001;
 static constexpr double kPCProbMax = 1.0;
-// Initial guess; controller converges within 1-2 control periods.
-static constexpr double kPCInitialProbability = 0.05;
+// Initial guess. Higher values waste samples on kernel-dense workloads
+// (FNS-class: 5K launches/sec); lower values starve kernel-sparse
+// workloads (5 launches/sec) of dice rolls until the controller grows
+// it. 0.02 is a tested compromise: kernel-sparse workloads see windows
+// in the first few seconds, kernel-dense see only ~10x overshoot
+// transient that resolves in ~2-3 control periods.
+static constexpr double kPCInitialProbability = 0.02;
 // Default target rate when PARCAGPU_PC_SAMPLING_RATE is unset.
 static constexpr double kPCDefaultTargetRate = 100.0;
 
@@ -149,7 +160,7 @@ static void controllerMaybeUpdate() {
     return;
   double ratio =
       g_pcController.targetRate / std::max(observedRate, 1e-3);
-  ratio = std::clamp(ratio, 1.0 / kPCControlStepClamp, kPCControlStepClamp);
+  ratio = std::clamp(ratio, 1.0 / kPCControlStepShrink, kPCControlStepGrow);
   double oldP = g_pcController.probability.load(std::memory_order_relaxed);
   double newP = std::clamp(oldP * ratio, kPCProbMin, kPCProbMax);
   g_pcController.probability.store(newP, std::memory_order_relaxed);

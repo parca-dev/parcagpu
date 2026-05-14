@@ -179,8 +179,8 @@ void doubleCheckedLock(CheckFn check, std::mutex &mutex, ActionFn action) {
 
 // Helper to get PARCAGPU's custom sampling frequency from environment
 uint32_t getGPUSamplingFrequency() {
-  // Default frequency for PARCAGPU is 18 (Proton uses 10)
-  constexpr uint32_t PARCAGPU_DEFAULT_FREQUENCY = 18;
+  // Default frequency for PARCAGPU is 20 (Proton uses 10)
+  constexpr uint32_t PARCAGPU_DEFAULT_FREQUENCY = 20;
 
   uint32_t samplingPeriod = PARCAGPU_DEFAULT_FREQUENCY;
   const char *sampling_factor_env = getenv("PARCAGPU_SAMPLING_FACTOR");
