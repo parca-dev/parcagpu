@@ -324,6 +324,11 @@ private:
           DEBUG_PRINTF("[PARCAGPU] Filtered kernel activity: correlationId=%u "
                        "graphId=%u (not in filter)\n",
                        k->correlationId, k->graphId);
+          // Skip both KERNEL_EXECUTED and activity_batch push. Without this,
+          // the eBPF activity_batch consumer would emit a kernel_event for
+          // every rate-limited launch, producing orphan entries in parca-agent's
+          // timesAwaitingTraces map (no cuda_correlation USDT was emitted for
+          // these correlation IDs, so no trace will ever arrive to match them).
           break;
         }
 
@@ -338,20 +343,23 @@ private:
         PARCAGPU_KERNEL_EXECUTED(k->start, k->end, k->correlationId,
                                  k->deviceId, k->streamId, k->graphId,
                                  k->graphNodeId, k->name);
+
+        // Collect pointer for batch probe — only for kernel records that
+        // passed the correlation filter. eBPF's activity_batch handler only
+        // emits kernel_events for KERNEL/CONCURRENT_KERNEL kinds anyway
+        // (cuda.ebpf.c kind check), so excluding non-kernel kinds here saves
+        // ringbuf bandwidth without losing any consumed data.
+        batchPtrs[batchCount++] = record;
+        if (batchCount >= ACTIVITY_BATCH_SIZE) {
+          parcagpuActivityBatch(batchPtrs, batchCount);
+          batchCount = 0;
+        }
         break;
       }
       default:
         DEBUG_PRINTF("[PARCAGPU] Activity record %d: kind=%d\n", recordCount,
                      record->kind);
         break;
-      }
-
-      // Collect pointer for batch probe (all activity kinds).
-      // BPF consumers inspect the kind field to filter types they care about.
-      batchPtrs[batchCount++] = record;
-      if (batchCount >= ACTIVITY_BATCH_SIZE) {
-        parcagpuActivityBatch(batchPtrs, batchCount);
-        batchCount = 0;
       }
     }
 
