@@ -615,32 +615,27 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData) {
 }
 
 void PCSampling::emitMetadata() {
-  // Re-emit stall reason map when a tracer attaches (semaphore transitions
-  // to non-zero), using the same pattern as cubin replay.
+  // Re-fire stall_reason_map and cubin_loaded on every call when a tracer is
+  // attached. The naive "fire once on semaphore-transition" approach was
+  // racy: there is a small window between the kernel incrementing the USDT
+  // semaphore (via RefCtrOffset on uprobe attach) and the breakpoint
+  // actually being armed in the target's text, during which a single fire
+  // from the lib hits the original nop and is silently lost. Re-firing
+  // every call closes that race.
+  //
+  // Both consumers de-duplicate downstream: the BPF stall_reason_map
+  // handler returns early after the first successful load (stall_map_loaded
+  // map), and cubin consumers track cubins by CRC.
   if (stallReasonMap.data() && PARCAGPU_STALL_REASON_MAP_ENABLED()) {
-    if (!stallMapEmitted) {
-      PARCAGPU_STALL_REASON_MAP(stallReasonMap.data(),
-                                stallReasonMap.numEntries());
-      stallMapEmitted = true;
-    }
-  } else {
-    stallMapEmitted = false;
+    PARCAGPU_STALL_REASON_MAP(stallReasonMap.data(),
+                              stallReasonMap.numEntries());
   }
 
-  // Replay cubin_loaded probes for late-attaching tracers.
-  // When the semaphore transitions to non-zero, re-emit all known cubins.
   if (PARCAGPU_CUBIN_LOADED_ENABLED()) {
-    if (!cubinsEmitted) {
-      DEBUG_PRINTF("Emitting cubins");
-      std::lock_guard<std::mutex> lock(contextMutex);
-      for (const auto &ref : loadedCubins) {
-        fireCubinLoaded(ref.crc, ref.data, ref.size);
-      }
-      cubinsEmitted = true;
+    std::lock_guard<std::mutex> lock(contextMutex);
+    for (const auto &ref : loadedCubins) {
+      fireCubinLoaded(ref.crc, ref.data, ref.size);
     }
-  } else {
-    // Tracer detached — reset so we replay again on next attach.
-    cubinsEmitted = false;
   }
 }
 

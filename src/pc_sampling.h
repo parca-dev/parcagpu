@@ -161,12 +161,6 @@ private:
     size_t size;
   };
   std::vector<CubinRef> loadedCubins;
-
-  // Tracks whether we've replayed cubin_loaded probes for a late-attaching
-  // tracer. Reset to false when the cubin_loaded semaphore transitions to
-  // non-zero.
-  bool cubinsEmitted = false;
-  bool stallMapEmitted = false;
 };
 
 // Fire the error USDT probe. Callable from any translation unit.
