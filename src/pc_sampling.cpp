@@ -189,7 +189,7 @@ uint32_t getGPUSamplingFrequency() {
     if (factor >= 5 && factor <= 31) {
       samplingPeriod = factor;
       DEBUG_PRINTF("Using PARCAGPU_SAMPLING_FACTOR=%u\n", samplingPeriod);
-    } else if (factor != 0) { // 0 is handled in isSupported()
+    } else if (factor != 0) {
       fprintf(stderr,
               "[PARCAGPU] Warning: PARCAGPU_SAMPLING_FACTOR=%d out of range "
               "[5,31], using default %u\n",
@@ -390,11 +390,12 @@ void ConfigureData::initialize(CUcontext context) {
 // GPUPCSampling implementation
 
 bool PCSampling::isSupported() {
-  // PC sampling is off by default.
-  // Set PARCAGPU_SAMPLING_FACTOR to a value in [5,31] to enable.
-  const char *env = getenv("PARCAGPU_SAMPLING_FACTOR");
-  if (!env || atoi(env) == 0) {
-    DEBUG_PRINTF("PC sampling disabled (set PARCAGPU_SAMPLING_FACTOR to enable)\n");
+  // PC sampling is off by default. Setting PARCAGPU_PC_SAMPLING_RATE to a
+  // non-negative number opts in; the user does not need to also set
+  // PARCAGPU_SAMPLING_FACTOR (it has a default).
+  const char *env = getenv("PARCAGPU_PC_SAMPLING_RATE");
+  if (!env) {
+    DEBUG_PRINTF("PC sampling disabled (set PARCAGPU_PC_SAMPLING_RATE to enable)\n");
     return false;
   }
 

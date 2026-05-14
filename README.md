@@ -34,8 +34,8 @@ export CUDA_INJECTION64_PATH=/path/to/libparcagpucupti.so
 |---|---|---|
 | `PARCAGPU_DEBUG` | off | Enable debug logging |
 | `PARCAGPU_RATE_LIMIT` | 100 | Token-bucket rate limit for callback probes (events/sec per thread) |
-| `PARCAGPU_SAMPLING_FACTOR` | 20 | PC sampling period (log2 cycles between samples); set to 0 to disable PC sampling |
-| `PARCAGPU_PC_SAMPLING_RATE` | 100 | Target PC samples/sec; a controller adjusts the per-window dice-roll probability internally to converge on this rate. Set to 0 to disable rate control (controller off, fixed probability). |
+| `PARCAGPU_PC_SAMPLING_RATE` | (unset) | Setting this env var to a non-negative number enables PC sampling. The value is the target samples/sec; a controller adjusts the per-window dice-roll probability internally to converge on this rate. Set to 0 to enable sampling with rate control disabled (controller off, fixed probability). |
+| `PARCAGPU_SAMPLING_FACTOR` | 20 | Hardware PC sampling period (log2 cycles between samples). Only takes effect when PC sampling is enabled via `PARCAGPU_PC_SAMPLING_RATE`. |
 
 ### Monitoring with bpftrace
 

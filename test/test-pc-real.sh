@@ -45,7 +45,7 @@ trap cleanup EXIT
 
 # --- Launch the toy workload ---
 echo "=== Starting pc_sample_toy ==="
-PARCAGPU_DEBUG=1 PARCAGPU_SAMPLING_FACTOR=20 \
+PARCAGPU_DEBUG=1 \
   PARCAGPU_PC_SAMPLING_RATE=10000 \
   CUDA_INJECTION64_PATH="$LIB" "$TOY" 8 > "$TOY_LOG" 2>&1 &
 TOY_PID=$!

@@ -52,7 +52,6 @@ trap cleanup EXIT
 echo "=== Starting test_cupti_prof (mock) ==="
 LD_LIBRARY_PATH="$ROOT/build-local/lib:${LD_LIBRARY_PATH:-}" \
   PARCAGPU_DEBUG=1 \
-  PARCAGPU_SAMPLING_FACTOR=20 \
   PARCAGPU_PC_SAMPLING_RATE=10000 \
   MOCK_CUBIN_PATH="$CUBIN" \
   "$TEST_BIN" "$LIB" --launch-rate=50 --duration=15 > "$TEST_LOG" 2>&1 &
