@@ -74,19 +74,20 @@ static constexpr double kPCControlStepShrink = 1.41421356;
 static constexpr double kPCControlStepGrow = 1.41421356;
 static constexpr double kPCProbMin = 0.001;
 static constexpr double kPCProbMax = 1.0;
-// Initial guess. Higher values waste samples on kernel-dense workloads
-// (FNS-class: 5K launches/sec); lower values starve kernel-sparse
-// workloads (5 launches/sec) of dice rolls until the controller grows
-// it. 0.02 is a tested compromise: kernel-sparse workloads see windows
-// in the first few seconds, kernel-dense see only ~10x overshoot
-// transient that resolves in ~2-3 control periods.
-static constexpr double kPCInitialProbability = 0.02;
+// Initial probability *at the default target rate*. Higher values waste
+// samples on kernel-dense workloads (FNS-class: 5K launches/sec); lower
+// values starve kernel-sparse workloads (a few launches/sec) of dice
+// rolls until the controller grows it. 0.02 is a tested compromise at
+// targetRate=100. Real initial probability scales with targetRate (see
+// init_debug) so callers asking for high rates start sampling
+// immediately instead of waiting many control periods to climb.
+static constexpr double kPCInitialProbabilityAtDefaultRate = 0.02;
 // Default target rate when PARCAGPU_PC_SAMPLING_RATE is unset.
 static constexpr double kPCDefaultTargetRate = 100.0;
 
 struct PCRateController {
   double targetRate = kPCDefaultTargetRate;       // immutable after init
-  std::atomic<double> probability{kPCInitialProbability};
+  std::atomic<double> probability{kPCInitialProbabilityAtDefaultRate};
   std::atomic<uint64_t> samplesTotal{0};
   std::atomic<uint64_t> lastCheckNs{0};
   std::atomic<uint64_t> lastCheckTotal{0};
@@ -187,6 +188,19 @@ void init_debug() {
       double r = atof(targetRateEnv);
       if (r > 0.0)
         g_pcController.targetRate = r;
+    }
+    // Scale initial probability with target rate so high-target requests
+    // start sampling immediately. The controller fires only when a
+    // sampling window closes; if the workload launches kernels rarely
+    // (vortex-class: ~1 launch/sec) and the initial probability is too
+    // low for a window to open, the controller starves and can never
+    // climb. Scaling avoids that for the common "user wants lots of
+    // samples on a sparse workload" case.
+    {
+      double scaled = kPCInitialProbabilityAtDefaultRate *
+                      (g_pcController.targetRate / kPCDefaultTargetRate);
+      double initP = std::clamp(scaled, kPCProbMin, kPCProbMax);
+      g_pcController.probability.store(initP, std::memory_order_relaxed);
     }
     g_pcController.lastCheckNs.store(nowNs(), std::memory_order_relaxed);
 
