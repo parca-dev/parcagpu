@@ -17,8 +17,7 @@ static const char *knownVars[] = {
     "PARCAGPU_DEBUG",
     "PARCAGPU_RATE_LIMIT",
     "PARCAGPU_SAMPLING_FACTOR",
-    "PARCAGPU_PC_SAMPLING_PROBABILITY",
-    "PARCAGPU_PC_SAMPLING_INTERVAL",
+    "PARCAGPU_PC_SAMPLING_RATE",
 };
 static constexpr size_t numKnownVars =
     sizeof(knownVars) / sizeof(knownVars[0]);
@@ -79,25 +78,14 @@ void validateEnvVars() {
     }
   }
 
-  val = std::getenv("PARCAGPU_PC_SAMPLING_PROBABILITY");
+  val = std::getenv("PARCAGPU_PC_SAMPLING_RATE");
   if (val) {
-    double p = std::atof(val);
-    if (p <= 0.0 || p > 1.0) {
-      DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_PC_SAMPLING_PROBABILITY=%s "
-                   "invalid (must be in (0, 1]), using default\n", val);
+    double r = std::atof(val);
+    if (r < 0.0) {
+      DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_PC_SAMPLING_RATE=%s "
+                   "invalid (must be >= 0), using default\n", val);
       fireError(0, val,
-                "env_config: PARCAGPU_PC_SAMPLING_PROBABILITY invalid");
-    }
-  }
-
-  val = std::getenv("PARCAGPU_PC_SAMPLING_INTERVAL");
-  if (val) {
-    double s = std::atof(val);
-    if (s <= 0.0) {
-      DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_PC_SAMPLING_INTERVAL=%s "
-                   "invalid (must be > 0), using default\n", val);
-      fireError(0, val,
-                "env_config: PARCAGPU_PC_SAMPLING_INTERVAL invalid");
+                "env_config: PARCAGPU_PC_SAMPLING_RATE invalid");
     }
   }
 }

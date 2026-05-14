@@ -39,6 +39,9 @@ namespace parcagpu {
 extern bool debug_enabled;
 extern void init_debug();
 
+// Notify the PC rate controller of a batch of samples just drained from CUPTI.
+extern void recordPCSamples(uint64_t n);
+
 // Use Proton's CubinData directly
 using proton::CubinData;
 

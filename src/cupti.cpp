@@ -43,24 +43,50 @@ thread_local TokenBucket callbackLimiter(100.0);
 
 // ---------------------------------------------------------------------------
 // PC sampling probabilistic control.
-// Sampling is gated by an interval + probability: at most once per interval,
-// roll the probability die; if it hits, sample all kernels until the interval
-// window closes.
+//
+// Sampling is gated by a per-thread interval + dice-roll mechanism: at most
+// once per kPCSamplingIntervalNs, roll against probability; if it hits, open
+// a sampling window that stays active until the next interval boundary.
+//
+// The user-facing knob is PARCAGPU_PC_SAMPLING_RATE (samples/sec); a
+// process-wide controller adjusts the dice-roll probability over time so the
+// observed sample rate converges on the target. Internally the controller
+// reads `samplesTotal` (incremented from pc_sampling.cpp on every batch) and
+// recalibrates probability every kPCControlPeriodNs based on the rate
+// observed since the last update.
 // ---------------------------------------------------------------------------
 
-// Config — read from env at startup. Stored in a struct so it can be made
-// runtime-adjustable later (e.g. via signal or control file).
-struct PCSamplingConfig {
-  double probability;  // PARCAGPU_PC_SAMPLING_PROBABILITY (default 1/100)
-  uint64_t intervalNs; // PARCAGPU_PC_SAMPLING_INTERVAL in nanoseconds
+// 50 ms — short enough to give ~20 dice rolls/sec (low rate variance, fast
+// response to workload phase changes), long enough that CUPTI start/stop
+// cost (~25 us measured) is amortized to <0.05% of wall time.
+static constexpr uint64_t kPCSamplingIntervalNs = 50'000'000ULL;
+// How often the controller recalibrates probability based on observed rate.
+static constexpr uint64_t kPCControlPeriodNs = 5'000'000'000ULL;
+// Don't react to <25% rate error (avoids oscillating on noise).
+static constexpr double kPCControlTolerance = 0.25;
+// Single update can change probability by at most this factor up or down.
+static constexpr double kPCControlStepClamp = 2.0;
+static constexpr double kPCProbMin = 0.001;
+static constexpr double kPCProbMax = 1.0;
+// Initial guess; controller converges within 1-2 control periods.
+static constexpr double kPCInitialProbability = 0.05;
+// Default target rate when PARCAGPU_PC_SAMPLING_RATE is unset.
+static constexpr double kPCDefaultTargetRate = 100.0;
+
+struct PCRateController {
+  double targetRate = kPCDefaultTargetRate;       // immutable after init
+  std::atomic<double> probability{kPCInitialProbability};
+  std::atomic<uint64_t> samplesTotal{0};
+  std::atomic<uint64_t> lastCheckNs{0};
+  std::atomic<uint64_t> lastCheckTotal{0};
 };
-static PCSamplingConfig g_pcSamplingConfig = {0.01, 1000000000ULL};
+static PCRateController g_pcController;
 
 // Per-thread sampling state.
 struct PCSamplingState {
   bool active = false;        // Currently sampling
   uint64_t windowStartNs = 0; // When the current window opened
-  uint64_t lastCheckNs = 0;   // Last time we checked the probability
+  uint64_t lastCheckNs = 0;   // Last time we rolled the dice
   unsigned int rngSeed = 0;   // Thread-local RNG state
 };
 thread_local PCSamplingState g_pcSamplingState;
@@ -86,6 +112,52 @@ static double threadRandom(PCSamplingState &s) {
   return (double)rand_r(&s.rngSeed) / RAND_MAX;
 }
 
+// Called from pc_sampling.cpp:processPCSamplingData() once per CUPTI batch
+// with the sum of distinct (PC, stallReason) pairs that had non-zero samples
+// — the unit the agent emits as a gpu_pc record on the receive side, and the
+// right rate to steer the controller with.
+void recordPCSamples(uint64_t n) {
+  g_pcController.samplesTotal.fetch_add(n, std::memory_order_relaxed);
+}
+
+// Adjust controller.probability to converge on targetRate. Cheap to call —
+// returns immediately unless kPCControlPeriodNs has elapsed since the last
+// adjustment. Safe under concurrent calls (CAS on lastCheckNs).
+static void controllerMaybeUpdate() {
+  if (g_pcController.targetRate <= 0.0)
+    return;
+  uint64_t now = nowNs();
+  uint64_t last = g_pcController.lastCheckNs.load(std::memory_order_relaxed);
+  if (now - last < kPCControlPeriodNs)
+    return;
+  // Only one thread per period actually performs the update.
+  if (!g_pcController.lastCheckNs.compare_exchange_strong(
+          last, now, std::memory_order_acq_rel))
+    return;
+  uint64_t total =
+      g_pcController.samplesTotal.load(std::memory_order_relaxed);
+  uint64_t lastTotal = g_pcController.lastCheckTotal.exchange(
+      total, std::memory_order_acq_rel);
+  uint64_t delta = total - lastTotal;
+  uint64_t elapsed = now - last;
+  if (elapsed == 0)
+    return;
+  double observedRate = (double)delta * 1e9 / (double)elapsed;
+  double err =
+      (observedRate - g_pcController.targetRate) / g_pcController.targetRate;
+  if (std::abs(err) <= kPCControlTolerance)
+    return;
+  double ratio =
+      g_pcController.targetRate / std::max(observedRate, 1e-3);
+  ratio = std::clamp(ratio, 1.0 / kPCControlStepClamp, kPCControlStepClamp);
+  double oldP = g_pcController.probability.load(std::memory_order_relaxed);
+  double newP = std::clamp(oldP * ratio, kPCProbMin, kPCProbMax);
+  g_pcController.probability.store(newP, std::memory_order_relaxed);
+  DEBUG_PRINTF("[PARCAGPU] PC rate controller: observed=%.2f target=%.2f "
+               "old_p=%.5f new_p=%.5f\n",
+               observedRate, g_pcController.targetRate, oldP, newP);
+}
+
 void init_debug() {
   static bool initialized = false;
   if (!initialized) {
@@ -99,18 +171,13 @@ void init_debug() {
       }
     }
 
-    const char *probEnv = getenv("PARCAGPU_PC_SAMPLING_PROBABILITY");
-    if (probEnv) {
-      double p = atof(probEnv);
-      if (p > 0.0 && p <= 1.0)
-        g_pcSamplingConfig.probability = p;
+    const char *targetRateEnv = getenv("PARCAGPU_PC_SAMPLING_RATE");
+    if (targetRateEnv) {
+      double r = atof(targetRateEnv);
+      if (r > 0.0)
+        g_pcController.targetRate = r;
     }
-    const char *intervalEnv = getenv("PARCAGPU_PC_SAMPLING_INTERVAL");
-    if (intervalEnv) {
-      double s = atof(intervalEnv);
-      if (s > 0.0)
-        g_pcSamplingConfig.intervalNs = (uint64_t)(s * 1e9);
-    }
+    g_pcController.lastCheckNs.store(nowNs(), std::memory_order_relaxed);
 
     validateEnvVars();
     initialized = true;
@@ -440,31 +507,33 @@ private:
           static_cast<const CUpti_CallbackData *>(cbdata_void);
       uint32_t correlationId = cbdata->correlationId;
 
-      // ENTER: manage probabilistic sampling windows.
-      // start() begins CUPTI PC sampling (kernels serialized).
-      // stop() ends it and drains data (kernels concurrent again).
+      // PC sampling windows are aligned to kernel-launch boundaries:
+      // start on a launch ENTER, stop on a launch EXIT. The decision to
+      // open a window is still time + probability gated; the launch CBIDs
+      // just determine when the boundaries fire.
+      const bool isKernelLaunchCb =
+          domain == CUPTI_CB_DOMAIN_DRIVER_API && proton::isLaunch(cbid);
+
+      // ENTER: open a sampling window on launch boundary if interval+prob hits.
       if (cbdata->callbackSite == CUPTI_API_ENTER) {
         if (domain == CUPTI_CB_DOMAIN_RUNTIME_API)
           runtimeEnterCorrelationId = correlationId;
 
         if (profiler.pcSamplingEnabled) {
-          auto &st = g_pcSamplingState;
-          auto &cfg = g_pcSamplingConfig;
-          uint64_t now = nowNs();
+          if (isKernelLaunchCb) {
+            auto &st = g_pcSamplingState;
+            uint64_t now = nowNs();
 
-          // If sampling and the window has closed, stop + drain.
-          if (st.active && (now - st.windowStartNs >= cfg.intervalNs)) {
-            profiler.pcSampling.stop(cbdata->context);
-            st.active = false;
-          }
-
-          // If not sampling, check interval then probability.
-          if (!st.active && (now - st.lastCheckNs >= cfg.intervalNs)) {
-            st.lastCheckNs = now;
-            if (threadRandom(st) < cfg.probability) {
-              st.active = true;
-              st.windowStartNs = now;
-              profiler.pcSampling.start(cbdata->context);
+            if (!st.active &&
+                (now - st.lastCheckNs >= kPCSamplingIntervalNs)) {
+              st.lastCheckNs = now;
+              const double p = g_pcController.probability.load(
+                  std::memory_order_relaxed);
+              if (threadRandom(st) < p) {
+                st.active = true;
+                st.windowStartNs = now;
+                profiler.pcSampling.start(cbdata->context);
+              }
             }
           }
 
@@ -478,15 +547,24 @@ private:
         return;
       }
 
-      // EXIT: stop sampling if the window has closed.
+      // EXIT: while a sampling window is open, drain CUPTI's host staging
+      // buffer on every CUDA API EXIT — not just launch EXITs. Empty drains
+      // are cheap (single API call returning 0 PCs) and missed drains lose
+      // samples (CUPTI_ERROR_OUT_OF_MEMORY when staging fills). Window close
+      // is still kernel-launch aligned: only check elapsed-time on a launch
+      // EXIT, so the window starts and ends at kernel boundaries.
       if (profiler.pcSamplingEnabled) {
         auto &st = g_pcSamplingState;
-        auto &cfg = g_pcSamplingConfig;
-        uint64_t now = nowNs();
 
-        if (st.active && (now - st.windowStartNs >= cfg.intervalNs)) {
-          profiler.pcSampling.stop(cbdata->context);
-          st.active = false;
+        if (st.active) {
+          if (isKernelLaunchCb &&
+              (nowNs() - st.windowStartNs >= kPCSamplingIntervalNs)) {
+            profiler.pcSampling.stop(cbdata->context);
+            st.active = false;
+            controllerMaybeUpdate();
+          } else {
+            profiler.pcSampling.collectData(cbdata->context);
+          }
         }
 
         profiler.pcSampling.emitMetadata();

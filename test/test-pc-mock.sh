@@ -47,12 +47,12 @@ trap cleanup EXIT
 # --- Launch mock workload ---
 # Mock CUPTI/CUDA libs from build-local so proton's dynamic loader finds them
 # instead of real libcupti.so / libcuda.so.
-# Set probability=1 so every interval check triggers sampling.
+# High target rate keeps the controller's probability near 1 throughout the
+# short mock run (otherwise it would converge below 1 once samples flow).
 echo "=== Starting test_cupti_prof (mock) ==="
 LD_LIBRARY_PATH="$ROOT/build-local/lib:${LD_LIBRARY_PATH:-}" \
   PARCAGPU_DEBUG=1 \
-  PARCAGPU_PC_SAMPLING_PROBABILITY=1 \
-  PARCAGPU_PC_SAMPLING_INTERVAL=0.1 \
+  PARCAGPU_PC_SAMPLING_RATE=10000 \
   MOCK_CUBIN_PATH="$CUBIN" \
   "$TEST_BIN" "$LIB" --launch-rate=50 --duration=15 > "$TEST_LOG" 2>&1 &
 TEST_PID=$!

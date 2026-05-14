@@ -547,21 +547,31 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData) {
   DEBUG_PRINTF("Processing %zu PCs (remaining: %zu)\n",
                pcSamplingData->totalNumPcs, pcSamplingData->remainingNumPcs);
 
-  if (debug_enabled) {
-    for (size_t i = 0; i < pcSamplingData->totalNumPcs; ++i) {
-      auto *pcData = pcSamplingData->pPcData + i;
+  // Count distinct (PC, stallReason) pairs with non-zero samples — that is
+  // the unit the agent sees as a "sample" record on the receive side, and the
+  // right rate to steer with the controller. The raw CUPTI per-cell hardware
+  // counts are weights, not records.
+  uint64_t batchSamples = 0;
+  for (size_t i = 0; i < pcSamplingData->totalNumPcs; ++i) {
+    auto *pcData = pcSamplingData->pPcData + i;
 
-      uint64_t totalSamples = 0;
-      uint64_t stalledSamples = 0;
-      for (size_t j = 0; j < pcData->stallReasonCount; ++j) {
-        auto *stallReason = &pcData->stallReason[j];
-        totalSamples += stallReason->samples;
-        bool isNotIssued = configureData->notIssuedStallReasonIndices.count(
-                               stallReason->pcSamplingStallReasonIndex) > 0;
-        if (!isNotIssued)
-          stalledSamples += stallReason->samples;
-      }
+    uint64_t totalSamples = 0;
+    uint64_t stalledSamples = 0;
+    uint64_t distinctPairs = 0;
+    for (size_t j = 0; j < pcData->stallReasonCount; ++j) {
+      auto *stallReason = &pcData->stallReason[j];
+      if (stallReason->samples == 0)
+        continue;
+      ++distinctPairs;
+      totalSamples += stallReason->samples;
+      bool isNotIssued = configureData->notIssuedStallReasonIndices.count(
+                             stallReason->pcSamplingStallReasonIndex) > 0;
+      if (!isNotIssued)
+        stalledSamples += stallReason->samples;
+    }
+    batchSamples += distinctPairs;
 
+    if (debug_enabled) {
       auto *cubinData = getCubinData(pcData->cubinCrc);
       auto key =
           CubinData::LineInfoKey{pcData->functionIndex, pcData->pcOffset};
@@ -583,6 +593,7 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData) {
                    lineInfo.lineNumber);
     }
   }
+  recordPCSamples(batchSamples);
 
   // Emit batched PC sample probes as a bag of pointers (like activity_batch).
   // Using pointers avoids depending on the CUPTI struct stride, which can
