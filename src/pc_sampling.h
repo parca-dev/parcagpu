@@ -159,8 +159,18 @@ private:
     uint64_t crc;
     const char *data;
     size_t size;
+    uint64_t lastEmittedNs; // monotonic; for emitMetadata staleness check
   };
   std::vector<CubinRef> loadedCubins;
+
+  // emitMetadata tracking: per-probe USDT semaphore count from the last
+  // call. Re-emit fires when the current count exceeds this (a new
+  // consumer joined, even if another was already attached). A periodic
+  // refresh bounds staleness from ABA cycles that net the same count
+  // between our reads.
+  std::atomic<uint16_t> prevStallSem{0};
+  std::atomic<uint16_t> prevCubinSem{0};
+  std::atomic<uint64_t> lastRefreshNs{0};
 };
 
 // Fire the error USDT probe. Callable from any translation unit.

@@ -614,27 +614,67 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData) {
   }
 }
 
+// Period between forced metadata refreshes regardless of probe-arm
+// transitions. Bounds how long an undetected ABA semaphore cycle (consumer
+// detaches and re-attaches between two of our reads) can leave a tracer
+// missing cubins or the stall-reason map.
+static constexpr uint64_t kEmitRefreshPeriodNs = 30ULL * 1000 * 1000 * 1000;
+
+static uint64_t emitMetadataNowNs() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return uint64_t(ts.tv_sec) * 1000000000ULL + uint64_t(ts.tv_nsec);
+}
+
+// Read the raw USDT semaphore (a refcount of attached uprobe consumers).
+// __atomic_load_n with relaxed ordering — the kernel updates this from
+// another address space via RefCtrOffset; this prevents the compiler from
+// caching the value across calls.
+static inline uint16_t readSem(unsigned short &sem) {
+  return __atomic_load_n(reinterpret_cast<uint16_t *>(&sem), __ATOMIC_RELAXED);
+}
+
 void PCSampling::emitMetadata() {
-  // Re-fire stall_reason_map and cubin_loaded on every call when a tracer is
-  // attached. The naive "fire once on semaphore-transition" approach was
-  // racy: there is a small window between the kernel incrementing the USDT
-  // semaphore (via RefCtrOffset on uprobe attach) and the breakpoint
-  // actually being armed in the target's text, during which a single fire
-  // from the lib hits the original nop and is silently lost. Re-firing
-  // every call closes that race.
+  // Re-emit stall_reason_map and cubin_loaded for late-attaching tracers.
   //
-  // Both consumers de-duplicate downstream: the BPF stall_reason_map
-  // handler returns early after the first successful load (stall_map_loaded
-  // map), and cubin consumers track cubins by CRC.
-  if (stallReasonMap.data() && PARCAGPU_STALL_REASON_MAP_ENABLED()) {
+  // The USDT semaphore is a refcount of attached uprobe consumers — every
+  // attach increments, every detach decrements. Re-emit whenever the count
+  // increases (so 1→2 fires the metadata to a second consumer joining
+  // while the first is still attached), plus on a periodic refresh that
+  // bounds staleness from ABA cycles which net the same count between our
+  // reads.
+
+  const uint64_t nowNs = emitMetadataNowNs();
+  const uint64_t lastRefresh = lastRefreshNs.load(std::memory_order_relaxed);
+  const bool refresh = (nowNs - lastRefresh) > kEmitRefreshPeriodNs;
+  if (refresh) {
+    lastRefreshNs.store(nowNs, std::memory_order_relaxed);
+  }
+
+  // Stall reason map (small, ~4KB) — no per-entry state needed.
+  const uint16_t stallSem = readSem(parcagpu_stall_reason_map_semaphore);
+  const uint16_t prevStall =
+      prevStallSem.exchange(stallSem, std::memory_order_acq_rel);
+  const bool stallJoin = stallSem > prevStall;
+  if (stallReasonMap.data() && stallSem > 0 && (stallJoin || refresh)) {
     PARCAGPU_STALL_REASON_MAP(stallReasonMap.data(),
                               stallReasonMap.numEntries());
   }
 
-  if (PARCAGPU_CUBIN_LOADED_ENABLED()) {
+  // Cubin loaded — re-fire all cubins on a consumer-join (count increase);
+  // on a periodic refresh, re-fire only entries that have gone stale.
+  const uint16_t cubinSem = readSem(parcagpu_cubin_loaded_semaphore);
+  const uint16_t prevCubin =
+      prevCubinSem.exchange(cubinSem, std::memory_order_acq_rel);
+  const bool cubinJoin = cubinSem > prevCubin;
+  if (cubinSem > 0 && (cubinJoin || refresh)) {
     std::lock_guard<std::mutex> lock(contextMutex);
-    for (const auto &ref : loadedCubins) {
-      fireCubinLoaded(ref.crc, ref.data, ref.size);
+    for (auto &ref : loadedCubins) {
+      if (cubinJoin ||
+          (nowNs - ref.lastEmittedNs) > kEmitRefreshPeriodNs) {
+        fireCubinLoaded(ref.crc, ref.data, ref.size);
+        ref.lastEmittedNs = nowNs;
+      }
     }
   }
 }
@@ -759,10 +799,11 @@ void PCSampling::loadModule(const char *cubin, size_t cubinSize) {
     cubinData->cubin = cubin;
     cubinCrcToCubinData[cubinCrc].second = 1;
     DEBUG_PRINTF("Module 0x%lx loaded (new)\n", cubinCrc);
+    const uint64_t emittedNs = emitMetadataNowNs();
     fireCubinLoaded(cubinCrc, cubin, cubinSize);
     {
       std::lock_guard<std::mutex> lock(contextMutex);
-      loadedCubins.push_back({cubinCrc, cubin, cubinSize});
+      loadedCubins.push_back({cubinCrc, cubin, cubinSize, emittedNs});
     }
   }
 }
