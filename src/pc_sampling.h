@@ -163,6 +163,18 @@ private:
   };
   std::vector<CubinRef> loadedCubins;
 
+  // Per-device GPU configuration, replayed alongside cubins so the agent can
+  // convert PC sample counts to nanoseconds (needs sampling factor, GPU clock).
+  // Protected by contextMutex.
+  struct GpuConfig {
+    uint32_t dev;
+    uint32_t samplingFactor;
+    uint32_t clockKHz;
+    uint32_t smCount;
+    uint64_t lastEmittedNs;
+  };
+  std::vector<GpuConfig> loadedConfigs;
+
   // emitMetadata tracking: per-probe USDT semaphore count from the last
   // call. Re-emit fires when the current count exceeds this (a new
   // consumer joined, even if another was already attached). A periodic
@@ -170,6 +182,7 @@ private:
   // between our reads.
   std::atomic<uint16_t> prevStallSem{0};
   std::atomic<uint16_t> prevCubinSem{0};
+  std::atomic<uint16_t> prevConfigSem{0};
   std::atomic<uint64_t> lastRefreshNs{0};
 };
 

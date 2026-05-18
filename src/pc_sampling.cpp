@@ -34,6 +34,14 @@ __attribute__((noinline)) void fireCubinUnloaded(uint64_t crc) {
   PARCAGPU_CUBIN_UNLOADED(crc);
 }
 
+__attribute__((noinline)) void fireGpuConfig(uint32_t dev, uint32_t factor,
+                                             uint32_t clockKHz,
+                                             uint32_t smCount) {
+  PARCAGPU_GPU_CONFIG(dev, factor, clockKHz, smCount);
+}
+
+static uint64_t emitMetadataNowNs();
+
 // Max records per pc_sample_batch probe invocation.
 static constexpr uint32_t PCSampleBatchSize = 128;
 
@@ -508,6 +516,26 @@ void PCSampling::initialize(CUcontext context) {
         DEBUG_PRINTF(
             "PC sampling initialized (serialized mode) for context %u\n",
             contextId);
+
+        // Capture per-device config so the agent can convert PC sample counts
+        // to nanoseconds. cuCtxGetDevice reads the current context; the
+        // CUPTI ENTER callback that drove us here ran with `context` current.
+        // contextMutex is already held by doubleCheckedLock above, so push
+        // into loadedConfigs without re-locking (std::mutex is not recursive).
+        CUdevice dev = 0;
+        int clockKHz = 0;
+        int smCount = 0;
+        proton::cuda::ctxGetDevice<false>(&dev);
+        proton::cuda::deviceGetAttribute<false>(
+            &clockKHz, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, dev);
+        proton::cuda::deviceGetAttribute<false>(
+            &smCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev);
+        const uint32_t factor = getGPUSamplingFrequency();
+        const uint64_t emittedNs = emitMetadataNowNs();
+        fireGpuConfig((uint32_t)dev, factor, (uint32_t)clockKHz,
+                      (uint32_t)smCount);
+        loadedConfigs.push_back({(uint32_t)dev, factor, (uint32_t)clockKHz,
+                                 (uint32_t)smCount, emittedNs});
       });
 }
 
@@ -673,6 +701,22 @@ void PCSampling::emitMetadata() {
       if (cubinJoin ||
           (nowNs - ref.lastEmittedNs) > kEmitRefreshPeriodNs) {
         fireCubinLoaded(ref.crc, ref.data, ref.size);
+        ref.lastEmittedNs = nowNs;
+      }
+    }
+  }
+
+  // GPU config — same edge-on-consumer-join + stale-refresh pattern as cubins.
+  const uint16_t cfgSem = readSem(parcagpu_gpu_config_semaphore);
+  const uint16_t prevCfg =
+      prevConfigSem.exchange(cfgSem, std::memory_order_acq_rel);
+  const bool cfgJoin = cfgSem > prevCfg;
+  if (cfgSem > 0 && (cfgJoin || refresh)) {
+    std::lock_guard<std::mutex> lock(contextMutex);
+    for (auto &ref : loadedConfigs) {
+      if (cfgJoin ||
+          (nowNs - ref.lastEmittedNs) > kEmitRefreshPeriodNs) {
+        fireGpuConfig(ref.dev, ref.samplingFactor, ref.clockKHz, ref.smCount);
         ref.lastEmittedNs = nowNs;
       }
     }
