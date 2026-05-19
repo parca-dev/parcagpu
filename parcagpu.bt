@@ -80,6 +80,45 @@ usdt:*:parcagpu:cubin_unloaded {
            $cubin_crc);
 }
 
+usdt:*:parcagpu:activity_batch {
+    $ptrs = arg0;
+    $count = arg1;
+
+    printf("%-12s.%-6u [ACT_BATCH] count=%u ptrs=%p\n",
+           strftime("%H:%M:%S", nsecs),
+           (nsecs % 1000000000) / 1000,
+           $count,
+           $ptrs);
+}
+
+usdt:*:parcagpu:gpu_config {
+    $device_id = arg0;
+    $sampling_factor = arg1;
+    $clock_khz = arg2;
+    $sm_count = arg3;
+
+    printf("%-12s.%-6u [GPU_CONFIG] dev=%u factor=%u clock_khz=%u sm_count=%u\n",
+           strftime("%H:%M:%S", nsecs),
+           (nsecs % 1000000000) / 1000,
+           $device_id,
+           $sampling_factor,
+           $clock_khz,
+           $sm_count);
+}
+
+usdt:*:parcagpu:error {
+    $code = arg0;
+    $message = str(arg1);
+    $component = str(arg2);
+
+    printf("%-12s.%-6u [ERROR] code=%d component=%s msg=%s\n",
+           strftime("%H:%M:%S", nsecs),
+           (nsecs % 1000000000) / 1000,
+           $code,
+           $component,
+           $message);
+}
+
 END {
     printf("\nMonitoring complete.\n");
 }
