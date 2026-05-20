@@ -114,9 +114,11 @@ void disablePCSampling(CUcontext context) {
   proton::cupti::pcSamplingDisable<true>(&params);
 }
 
-// Returns true if data was retrieved successfully, false on error.
-bool getPCSamplingData(CUcontext context,
-                       CUpti_PCSamplingData *pcSamplingData) {
+// Returns CUPTI_SUCCESS on success, or the raw CUptiResult on failure so
+// callers can distinguish CUPTI_ERROR_OUT_OF_MEMORY (error 8) — a wedged
+// internal-buffer condition we recover from — from other errors.
+CUptiResult getPCSamplingData(CUcontext context,
+                              CUpti_PCSamplingData *pcSamplingData) {
   CUpti_PCSamplingGetDataParams params = {
       /*size=*/CUpti_PCSamplingGetDataParamsSize,
       /*pPriv=*/NULL,
@@ -127,9 +129,8 @@ bool getPCSamplingData(CUcontext context,
   if (result != CUPTI_SUCCESS) {
     DEBUG_PRINTF("cuptiPCSamplingGetData failed: error %d (ctx=%p)\n", result,
                  context);
-    return false;
   }
-  return true;
+  return result;
 }
 
 void setConfigurationAttribute(
@@ -379,6 +380,11 @@ void ConfigureData::initialize(CUcontext context) {
   configurationInfos.emplace_back(configureCollectionMode());
   configurationInfos.emplace_back(configureStartStopControl());
   configurationInfos.emplace_back(configureSamplingBuffer());
+  // Bigger scratch + hardware buffers so a busy workload (PyTorch-class)
+  // doesn't overflow CUPTI's defaults within minutes and start returning
+  // CUPTI_ERROR_OUT_OF_MEMORY from cuptiPCSamplingGetData.
+  configurationInfos.emplace_back(configureScratchBuffer());
+  configurationInfos.emplace_back(configureHardwareBufferSize());
   // Don't set sampling period — let CUPTI use its default.
   // Explicit period values silently break sampling on some GPUs (e.g.
   // Blackwell).
@@ -744,16 +750,44 @@ void PCSampling::collectData(CUcontext context) {
   // tens of thousands. Failing to drain leaves data in CUPTI's internal
   // buffers, which eventually causes CUPTI_ERROR_OUT_OF_MEMORY (error 8).
   do {
-    bool ok = getPCSamplingData(context, &configureData->outputData);
-    DEBUG_PRINTF("getData: ok=%d output total=%zu remaining=%zu "
+    CUptiResult res = getPCSamplingData(context, &configureData->outputData);
+    DEBUG_PRINTF("getData: res=%d output total=%zu remaining=%zu "
                  "cfg total=%zu remaining=%zu\n",
-                 ok, configureData->outputData.totalNumPcs,
+                 res, configureData->outputData.totalNumPcs,
                  configureData->outputData.remainingNumPcs,
                  configureData->pcSamplingData.totalNumPcs,
                  configureData->pcSamplingData.remainingNumPcs);
-    if (!ok)
-      break;
-    processPCSamplingData(configureData);
+    if (res == CUPTI_SUCCESS) {
+      processPCSamplingData(configureData);
+      continue;
+    }
+    if (res == CUPTI_ERROR_OUT_OF_MEMORY) {
+      // CUPTI's PC-sampling state for this context is wedged — stop+start
+      // alone does NOT unwedge it (confirmed empirically: 7800 starts
+      // produced 0 samples after the first OOM). The fix is a full reset:
+      // disable + erase tracking + re-enable + re-configure, which is
+      // exactly what finalize() + initialize() do back-to-back.
+      //
+      // try_lock-probe on pcSamplingMutex first: collectData is sometimes
+      // called from inside PCSampling::stop() which already holds the
+      // mutex. Calling finalize() in that re-entry would self-deadlock
+      // on the non-recursive mutex (finalize re-takes it). If the probe
+      // fails (someone holds it), bail; the next callback not nested
+      // under stop()/start() will retry.
+      {
+        std::unique_lock<std::mutex> probe(pcSamplingMutex, std::try_to_lock);
+        if (!probe.owns_lock()) {
+          break;
+        }
+      }
+      // probe released; finalize() + initialize() each take their own
+      // locks (contextMutex, and pcSamplingMutex internally).
+      DEBUG_PRINTF("Recovering from CUPTI_ERROR_OUT_OF_MEMORY: full reinit on "
+                   "ctx=%p (disable+enable to clear wedged state)\n", context);
+      finalize(context);
+      initialize(context);
+    }
+    break;
   } while (configureData->outputData.remainingNumPcs > 0);
 }
 
@@ -771,10 +805,10 @@ void PCSampling::collectAllData() {
     DEBUG_PRINTF("Draining PC sampling data for context %u\n", contextId);
     // Fetch and drain all pending data from CUPTI.
     do {
-      bool ok = getPCSamplingData(configureData->context,
-                                  &configureData->outputData);
-      if (!ok)
+      if (getPCSamplingData(configureData->context,
+                            &configureData->outputData) != CUPTI_SUCCESS) {
         break;
+      }
       processPCSamplingData(configureData);
     } while (configureData->outputData.remainingNumPcs > 0);
   }
@@ -814,9 +848,10 @@ void PCSampling::finalize(CUcontext context) {
   // Drain all remaining PC data before disabling.
   auto *configureData = getConfigureData(contextId);
   do {
-    bool ok = getPCSamplingData(context, &configureData->outputData);
-    if (!ok)
+    if (getPCSamplingData(context, &configureData->outputData) !=
+        CUPTI_SUCCESS) {
       break;
+    }
     processPCSamplingData(configureData);
   } while (configureData->outputData.remainingNumPcs > 0);
 
