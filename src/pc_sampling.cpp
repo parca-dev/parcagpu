@@ -111,7 +111,12 @@ void disablePCSampling(CUcontext context) {
       /*pPriv=*/NULL,
       /*ctx=*/context,
   };
-  proton::cupti::pcSamplingDisable<true>(&params);
+  // Use <false>: invoked from a libcupti callback whose caller wasn't built
+  // with C++ EH, so a throw here would propagate up and abort the process.
+  auto ret = proton::cupti::pcSamplingDisable<false>(&params);
+  if (ret != CUPTI_SUCCESS) {
+    DEBUG_PRINTF("cuptiPCSamplingDisable failed: %d (ctx=%p)\n", ret, context);
+  }
 }
 
 // Returns CUPTI_SUCCESS on success, or the raw CUptiResult on failure so

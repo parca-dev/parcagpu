@@ -310,15 +310,26 @@ public:
       }
     }
 
-    // Flush any remaining activity records
-    proton::cupti::activityFlushAll<true>(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
+    // Cleanup runs from atexit and may also reach us via a libcupti callback
+    // whose caller wasn't built with C++ EH; throwing from here aborts the
+    // process. Use <false> + log on the cleanup-path calls.
+    if (auto r = proton::cupti::activityFlushAll<false>(
+            CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
+        r != CUPTI_SUCCESS) {
+      DEBUG_PRINTF("[PARCAGPU] activityFlushAll failed: %d\n", r);
+    }
 
-    // Disable activity recording
-    proton::cupti::activityDisable<true>(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+    if (auto r = proton::cupti::activityDisable<false>(
+            CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+        r != CUPTI_SUCCESS) {
+      DEBUG_PRINTF("[PARCAGPU] activityDisable failed: %d\n", r);
+    }
 
-    // Unsubscribe
     if (subscriber) {
-      proton::cupti::unsubscribe<true>(subscriber);
+      if (auto r = proton::cupti::unsubscribe<false>(subscriber);
+          r != CUPTI_SUCCESS) {
+        DEBUG_PRINTF("[PARCAGPU] unsubscribe failed: %d\n", r);
+      }
       subscriber = nullptr;
     }
 
@@ -477,6 +488,10 @@ private:
 
   static void callbackHandler(void *userdata, CUpti_CallbackDomain domain,
                               CUpti_CallbackId cbid, const void *cbdata_void) {
+    // libcupti invokes us from contexts whose callers weren't built with
+    // C++ EH support, so any uncaught throw aborts the process. Treat the
+    // whole body as untrusted and swallow exceptions at the boundary.
+    try {
     auto &profiler = CuptiProfiler::instance();
 
     if (domain == CUPTI_CB_DOMAIN_RESOURCE) {
@@ -677,26 +692,48 @@ private:
       if (profiler.outstandingEvents > 3000) {
         DEBUG_PRINTF("[PARCAGPU] Flushing: outstandingEvents=%zu\n",
                      profiler.outstandingEvents);
-        proton::cupti::activityFlushAll<true>(0);
+        if (auto r = proton::cupti::activityFlushAll<false>(0);
+            r != CUPTI_SUCCESS) {
+          DEBUG_PRINTF("[PARCAGPU] activityFlushAll failed: %d\n", r);
+        }
         profiler.outstandingEvents = 0;
       }
+    }
+    } catch (const std::exception &e) {
+      fprintf(stderr, "[PARCAGPU] callbackHandler caught: %s\n", e.what());
+    } catch (...) {
+      fprintf(stderr, "[PARCAGPU] callbackHandler caught unknown exception\n");
     }
   }
 };
 
 } // namespace parcagpu
 
-// CUPTI initialization function required for CUDA_INJECTION64_PATH
+// CUPTI initialization function required for CUDA_INJECTION64_PATH.
+// Called from the CUDA driver, which wasn't built with C++ EH; a throw out
+// of here would abort the host process. Catch everything at the boundary.
 extern "C" int InitializeInjection(void) {
   DEBUG_PRINTF("[PARCAGPU] InitializeInjection called\n");
-
-  auto &profiler = parcagpu::CuptiProfiler::instance();
-  if (!profiler.initialize()) {
-    return 0; // Return 0 on failure, but don't break injection
+  try {
+    auto &profiler = parcagpu::CuptiProfiler::instance();
+    if (!profiler.initialize()) {
+      return 0; // Return 0 on failure, but don't break injection
+    }
+    atexit([]() {
+      try {
+        parcagpu::CuptiProfiler::instance().cleanup();
+      } catch (const std::exception &e) {
+        fprintf(stderr, "[PARCAGPU] cleanup caught: %s\n", e.what());
+      } catch (...) {
+        fprintf(stderr, "[PARCAGPU] cleanup caught unknown exception\n");
+      }
+    });
+    return 1;
+  } catch (const std::exception &e) {
+    fprintf(stderr, "[PARCAGPU] InitializeInjection caught: %s\n", e.what());
+    return 0;
+  } catch (...) {
+    fprintf(stderr, "[PARCAGPU] InitializeInjection caught unknown exception\n");
+    return 0;
   }
-
-  // Register cleanup at exit
-  atexit([]() { parcagpu::CuptiProfiler::instance().cleanup(); });
-
-  return 1; // Success
 }
