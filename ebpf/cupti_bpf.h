@@ -87,4 +87,51 @@ struct cupti_pc_data {
 
 #define CUPTI_PC_DATA_BASE_SIZE 56
 
+// ---------------------------------------------------------------------------
+// NVTX events
+// ---------------------------------------------------------------------------
+//
+// BPF-side mirror of struct nvtx_event from parcagpu/src/nvtx.h. The host
+// collector batches records of this exact layout and exposes them via the
+// `nvtx_event_batch` USDT probe (pointer-array of count records). The BPF
+// reader follows each pointer, copies the record, and chases `message` via
+// bpf_probe_read_user_str up to NVTX_MAX_MSG_LEN bytes. Layout must stay
+// in lockstep with parcagpu's src/nvtx.h.
+//
+// The `message` field is a user pointer (8 bytes on the platforms we care
+// about). It points into the producing thread's per-thread message pool,
+// guaranteed to be live until the batch fires, so this BPF-side read is
+// safe even though batching defers the probe call.
+
+#define NVTX_KIND_RANGE_PUSH  1
+#define NVTX_KIND_RANGE_POP   2
+#define NVTX_KIND_RANGE_START 3
+#define NVTX_KIND_RANGE_END   4
+#define NVTX_KIND_MARK        5
+
+#define NVTX_RESOURCE_OS_THREAD   1
+#define NVTX_RESOURCE_CUDA_STREAM 2
+#define NVTX_RESOURCE_CUDA_DEVICE 3
+#define NVTX_RESOURCE_CUDA_KERNEL 4
+
+// Must match parcagpu/src/nvtx_collector.cpp kMsgCap.
+#define NVTX_MAX_MSG_LEN 240
+
+struct cupti_nvtx_event {
+  u64 timestamp_ns;   // offset 0   - CLOCK_MONOTONIC at callback entry
+  u32 tid;            // offset 8
+  u32 correlation_id; // offset 12
+  u32 domain_id;      // offset 16  - 0 = default (v1 always 0)
+  u16 kind;           // offset 20  - NVTX_KIND_*
+  u16 flags;          // offset 22  - reserved; 0 in v1
+  u32 color;          // offset 24  - ARGB; 0 if unset
+  u32 device_id;      // offset 28  - thread's current device; UINT32_MAX unknown
+  u64 payload;        // offset 32
+  u64 range_id;       // offset 40  - RANGE_START/END pairing
+  u64 message_ptr;    // offset 48  - user pointer; BPF resolves via probe_read
+} __attribute__((aligned(8)));
+
+_Static_assert(sizeof(struct cupti_nvtx_event) == 56,
+               "cupti_nvtx_event size mismatch with parcagpu/src/nvtx.h");
+
 #endif // CUPTI_BPF_H

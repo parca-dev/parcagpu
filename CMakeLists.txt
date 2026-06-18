@@ -9,6 +9,13 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Max records buffered per nvtx_event_batch probe fire. NVTX events are an
+# order of magnitude rarer than PC samples, so 256 keeps wakeup overhead in
+# the weeds without delaying ranges noticeably. Allowed: 128/256/512/1024.
+set(PARCAGPU_NVTX_BATCH_SIZE 256 CACHE STRING
+    "Max NVTX events per nvtx_event_batch probe (128/256/512/1024)")
+add_compile_definitions(PARCAGPU_NVTX_BATCH_SIZE=${PARCAGPU_NVTX_BATCH_SIZE})
+
 # Default to Release with debug symbols
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
@@ -85,6 +92,7 @@ add_custom_command(
 set(PROTON_SOURCES
     ${PROTON_DIR}/csrc/lib/Driver/GPU/CuptiApi.cpp
     ${PROTON_DIR}/csrc/lib/Driver/GPU/CudaApi.cpp
+    ${PROTON_DIR}/csrc/lib/Driver/GPU/NvtxApi.cpp
     ${PROTON_DIR}/csrc/lib/Profiler/Cupti/CuptiCallbacks.cpp
 )
 
@@ -94,6 +102,7 @@ add_library(parcagpucupti SHARED
     src/pc_sampling.cpp
     src/correlation_filter.cpp
     src/env_config.cpp
+    src/nvtx_collector.cpp
     ${PROTON_SOURCES}
 )
 
@@ -187,5 +196,25 @@ if(BUILD_TESTS)
             libcupti.so
             ${CMAKE_BINARY_DIR}/lib/libcupti.so.12
         COMMENT "Creating libcupti.so.12 symlink"
+    )
+
+    # Focused NVTX collector test. Fires synthesized CUPTI NVTX callbacks
+    # at the registered handler in libparcagpucupti.so and asserts via the
+    # collector's test-only stats accessors.
+    add_executable(test_nvtx
+        test/test_nvtx.c
+    )
+    target_include_directories(test_nvtx PRIVATE
+        ${CUDA_INCLUDE_DIR}
+    )
+    target_link_libraries(test_nvtx
+        dl
+        -Wl,--no-as-needed
+        cuda_mock
+        cupti_mock
+        -Wl,--as-needed
+    )
+    set_target_properties(test_nvtx PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
 endif()
