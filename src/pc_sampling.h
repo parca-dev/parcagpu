@@ -87,6 +87,7 @@ struct ConfigureData {
   uint32_t contextId;
   uint32_t numStallReasons{};
   uint32_t numValidStallReasons{};
+  int hardwareBufferMB{}; // PARCAGPU_PC_HW_BUFFER_MB; 0 = CUPTI default
   char **stallReasonNames{};
   uint32_t *stallReasonIndices{};
   std::map<size_t, size_t> stallReasonIndexToMetricIndex{};
