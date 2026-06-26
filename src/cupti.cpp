@@ -260,6 +260,14 @@ public:
     proton::setRuntimeCallbacks(subscriber, /*enable=*/true);
     proton::setLaunchCallbacks(subscriber, /*enable=*/true);
 
+    // Driver-API graph launches (cuGraphLaunch/_ptsz); not covered by setLaunch/
+    // setRuntimeCallbacks. Only these two cbids -- not setGraphCallbacks(), which
+    // also subscribes capture cbids that emit uncorrelated events.
+    cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
+                        CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch);
+    cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
+                        CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
+
     // Enable resource callbacks only if PC sampling is enabled
     if (pcSamplingEnabled) {
       proton::setResourceCallbacks(subscriber, /*enable=*/true);
@@ -305,6 +313,11 @@ public:
     if (subscriber) {
       proton::setRuntimeCallbacks(subscriber, /*enable=*/false);
       proton::setLaunchCallbacks(subscriber, /*enable=*/false);
+      // Mirror the graph-launch callbacks enabled in init().
+      cuptiEnableCallback(0, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
+                          CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch);
+      cuptiEnableCallback(0, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
+                          CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
       if (pcSamplingEnabled) {
         proton::setResourceCallbacks(subscriber, /*enable=*/false);
       }

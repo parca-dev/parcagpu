@@ -294,6 +294,20 @@ static void (*parcagpuCuptiCallback)(void *userdata, CUpti_CallbackDomain domain
 // Defined in mock_cupti.c — feeds correlation IDs to cuptiPCSamplingGetData.
 extern void __mock_pc_enqueue_correlation(uint32_t correlation_id);
 
+// Defined in mock_cupti.c — whether a (domain, cbid) was subscribed.
+extern int __mock_cupti_is_callback_enabled(CUpti_CallbackDomain domain,
+                                            CUpti_CallbackId cbid);
+
+// Dispatch to the shim only if subscribed, mirroring real CUPTI gating.
+static void fire_cupti_callback(CUpti_CallbackDomain domain,
+                                CUpti_CallbackId cbid,
+                                const CUpti_CallbackData *cbdata) {
+    if (!__mock_cupti_is_callback_enabled(domain, cbid)) {
+        return;
+    }
+    parcagpuCuptiCallback(NULL, domain, cbid, cbdata);
+}
+
 //=============================================================================
 // Launched Kernels Queue
 // Track which correlation IDs have had their callbacks executed
@@ -385,12 +399,12 @@ NOINLINE CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned i
     // DRIVER ENTER callback
     tls_cbdata.callbackSite = CUPTI_API_ENTER;
     tls_cbdata.correlationId = tls_correlation_id;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
+    fire_cupti_callback(CUPTI_CB_DOMAIN_DRIVER_API,
                          CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, &tls_cbdata);
 
     // DRIVER EXIT callback
     tls_cbdata.callbackSite = CUPTI_API_EXIT;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
+    fire_cupti_callback(CUPTI_CB_DOMAIN_DRIVER_API,
                          CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, &tls_cbdata);
 
     return CUDA_SUCCESS;
@@ -403,12 +417,12 @@ NOINLINE CUresult cuGraphLaunch(CUgraphExec hGraphExec, CUstream hStream) {
     // DRIVER ENTER callback
     tls_cbdata.callbackSite = CUPTI_API_ENTER;
     tls_cbdata.correlationId = tls_correlation_id;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
+    fire_cupti_callback(CUPTI_CB_DOMAIN_DRIVER_API,
                          CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch, &tls_cbdata);
 
     // DRIVER EXIT callback
     tls_cbdata.callbackSite = CUPTI_API_EXIT;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
+    fire_cupti_callback(CUPTI_CB_DOMAIN_DRIVER_API,
                          CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch, &tls_cbdata);
 
     // Enqueue for activity generation
@@ -427,7 +441,7 @@ NOINLINE cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 block
     // RUNTIME ENTER callback
     tls_cbdata.callbackSite = CUPTI_API_ENTER;
     tls_cbdata.correlationId = tls_correlation_id;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API,
+    fire_cupti_callback(CUPTI_CB_DOMAIN_RUNTIME_API,
                          CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000, &tls_cbdata);
 
     // Runtime internally calls driver - call through cuLaunchKernel so it appears in stack
@@ -435,7 +449,7 @@ NOINLINE cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 block
 
     // RUNTIME EXIT callback
     tls_cbdata.callbackSite = CUPTI_API_EXIT;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API,
+    fire_cupti_callback(CUPTI_CB_DOMAIN_RUNTIME_API,
                          CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000, &tls_cbdata);
 
     return cudaSuccess;
@@ -448,22 +462,22 @@ NOINLINE cudaError_t cudaGraphLaunch(cudaGraphExec_t graphExec, cudaStream_t str
     // RUNTIME ENTER callback
     tls_cbdata.callbackSite = CUPTI_API_ENTER;
     tls_cbdata.correlationId = tls_correlation_id;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API,
+    fire_cupti_callback(CUPTI_CB_DOMAIN_RUNTIME_API,
                          CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000, &tls_cbdata);
 
     // Runtime internally calls driver - use inline driver callback with cuGraphLaunch cbid
     // (We don't call cuGraphLaunch here to avoid double-queueing)
     tls_cbdata.callbackSite = CUPTI_API_ENTER;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
+    fire_cupti_callback(CUPTI_CB_DOMAIN_DRIVER_API,
                          CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch, &tls_cbdata);
 
     tls_cbdata.callbackSite = CUPTI_API_EXIT;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_DRIVER_API,
+    fire_cupti_callback(CUPTI_CB_DOMAIN_DRIVER_API,
                          CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch, &tls_cbdata);
 
     // RUNTIME EXIT callback
     tls_cbdata.callbackSite = CUPTI_API_EXIT;
-    parcagpuCuptiCallback(NULL, CUPTI_CB_DOMAIN_RUNTIME_API,
+    fire_cupti_callback(CUPTI_CB_DOMAIN_RUNTIME_API,
                          CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000, &tls_cbdata);
 
     // Enqueue for activity generation

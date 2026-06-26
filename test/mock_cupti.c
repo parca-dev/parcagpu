@@ -45,6 +45,24 @@ CUptiResult cuptiSubscribe(CUpti_SubscriberHandle *subscriber,
     return CUPTI_SUCCESS;
 }
 
+// Subscribed (domain, cbid) pairs, so the harness can mirror real CUPTI dispatch.
+#define MOCK_MAX_ENABLED 512
+static struct {
+    CUpti_CallbackDomain domain;
+    CUpti_CallbackId cbid;
+} __enabled_cbs[MOCK_MAX_ENABLED];
+static size_t __enabled_cb_count = 0;
+
+int __mock_cupti_is_callback_enabled(CUpti_CallbackDomain domain,
+                                     CUpti_CallbackId cbid) {
+    for (size_t i = 0; i < __enabled_cb_count; i++) {
+        if (__enabled_cbs[i].domain == domain && __enabled_cbs[i].cbid == cbid) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 CUptiResult cuptiEnableCallback(uint32_t enable,
                                 CUpti_SubscriberHandle subscriber,
                                 CUpti_CallbackDomain domain,
@@ -52,6 +70,22 @@ CUptiResult cuptiEnableCallback(uint32_t enable,
     (void)subscriber;  // Mark as intentionally unused
     fprintf(stderr, "[MOCK_CUPTI] cuptiEnableCallback(enable=%u, domain=%u, cbid=%u)\n",
             enable, domain, cbid);
+    if (enable) {
+        if (!__mock_cupti_is_callback_enabled(domain, cbid) &&
+            __enabled_cb_count < MOCK_MAX_ENABLED) {
+            __enabled_cbs[__enabled_cb_count].domain = domain;
+            __enabled_cbs[__enabled_cb_count].cbid = cbid;
+            __enabled_cb_count++;
+        }
+    } else {
+        for (size_t i = 0; i < __enabled_cb_count; i++) {
+            if (__enabled_cbs[i].domain == domain &&
+                __enabled_cbs[i].cbid == cbid) {
+                __enabled_cbs[i] = __enabled_cbs[--__enabled_cb_count];
+                break;
+            }
+        }
+    }
     return CUPTI_SUCCESS;
 }
 
