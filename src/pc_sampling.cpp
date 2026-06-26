@@ -347,12 +347,23 @@ CUpti_PCSamplingConfigurationInfo ConfigureData::configureScratchBuffer() {
   return scratchBufferInfo;
 }
 
+// MB to force for the PC-sampling hardware buffer, from PARCAGPU_PC_HW_BUFFER_MB.
+// 0 (unset/invalid/negative) means "leave at CUPTI default" — see the note in
+// ConfigureData::initialize() for why we don't force it by default.
+int pcHardwareBufferMB() {
+  const char *env = getenv("PARCAGPU_PC_HW_BUFFER_MB");
+  if (!env)
+    return 0;
+  int mb = atoi(env);
+  return mb > 0 ? mb : 0;
+}
+
 CUpti_PCSamplingConfigurationInfo ConfigureData::configureHardwareBufferSize() {
   CUpti_PCSamplingConfigurationInfo hardwareBufferInfo{};
   hardwareBufferInfo.attributeType =
       CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_HARDWARE_BUFFER_SIZE;
   hardwareBufferInfo.attributeData.hardwareBufferSizeData.hardwareBufferSize =
-      HardwareBufferSize;
+      (size_t)hardwareBufferMB * 1024 * 1024;
   return hardwareBufferInfo;
 }
 
@@ -381,15 +392,33 @@ void ConfigureData::initialize(CUcontext context) {
   DEBUG_PRINTF("Initializing PC sampling for context %p (id %u)\n", context,
                contextId);
 
+  hardwareBufferMB = pcHardwareBufferMB();
+
   configurationInfos.emplace_back(configureStallReasons());
   configurationInfos.emplace_back(configureCollectionMode());
   configurationInfos.emplace_back(configureStartStopControl());
   configurationInfos.emplace_back(configureSamplingBuffer());
-  // Bigger scratch + hardware buffers so a busy workload (PyTorch-class)
-  // doesn't overflow CUPTI's defaults within minutes and start returning
-  // CUPTI_ERROR_OUT_OF_MEMORY from cuptiPCSamplingGetData.
+  // Bigger scratch buffer so a busy workload (PyTorch-class) doesn't overflow
+  // CUPTI's default within minutes and start returning CUPTI_ERROR_OUT_OF_MEMORY
+  // from cuptiPCSamplingGetData.
   configurationInfos.emplace_back(configureScratchBuffer());
-  configurationInfos.emplace_back(configureHardwareBufferSize());
+  // By default do NOT force the hardware buffer size. On Blackwell (sm_120/
+  // sm_121, e.g. GB10) under live injection + activity recording, setting
+  // CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_HARDWARE_BUFFER_SIZE makes every
+  // cuptiPCSamplingGetData return CUPTI_ERROR_OUT_OF_MEMORY (0 PCs drained) —
+  // confirmed independent of the value (even 16 MB fails) and not reproducible
+  // in a standalone CUPTI sample with the identical attribute set. CUPTI's
+  // default hardware buffer works; if it overflows it reports droppedSamples
+  // rather than wedging GetData.
+  //
+  // Escape hatch: set PARCAGPU_PC_HW_BUFFER_MB=<n> to force an n-MB hardware
+  // buffer (0 = leave at CUPTI default, same as unset). Lets ops re-enable /
+  // tune it on GPUs where the larger buffer helps busy workloads.
+  if (hardwareBufferMB > 0) {
+    DEBUG_PRINTF("[PARCAGPU] Forcing PC hardware buffer = %d MB "
+                 "(PARCAGPU_PC_HW_BUFFER_MB)\n", hardwareBufferMB);
+    configurationInfos.emplace_back(configureHardwareBufferSize());
+  }
   // Don't set sampling period — let CUPTI use its default.
   // Explicit period values silently break sampling on some GPUs (e.g.
   // Blackwell).

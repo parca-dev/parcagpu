@@ -18,6 +18,7 @@ static const char *knownVars[] = {
     "PARCAGPU_RATE_LIMIT",
     "PARCAGPU_SAMPLING_FACTOR",
     "PARCAGPU_PC_SAMPLING_RATE",
+    "PARCAGPU_PC_HW_BUFFER_MB",
 };
 static constexpr size_t numKnownVars =
     sizeof(knownVars) / sizeof(knownVars[0]);
@@ -86,6 +87,16 @@ void validateEnvVars() {
                    "invalid (must be >= 0), using default\n", val);
       fireError(0, val,
                 "env_config: PARCAGPU_PC_SAMPLING_RATE invalid");
+    }
+  }
+
+  val = std::getenv("PARCAGPU_PC_HW_BUFFER_MB");
+  if (val) {
+    int mb = std::atoi(val);
+    if (mb < 0) {
+      DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_PC_HW_BUFFER_MB=%s invalid "
+                   "(must be >= 0), ignoring\n", val);
+      fireError(0, val, "env_config: PARCAGPU_PC_HW_BUFFER_MB invalid");
     }
   }
 }

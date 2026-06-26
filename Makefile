@@ -1,4 +1,4 @@
-.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-pc-mock-graph
+.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock
 
 LIB_NAME = libparcagpucupti.so
 
@@ -159,13 +159,10 @@ test-multi: local bpf-test
 test-pc-real: local bpf-test microbenchmarks
 	sudo -E test/test-pc-real.sh
 
-# Mock PC sampling test — no GPU required, uses mock CUPTI/CUDA.
+# Mock PC sampling test — no GPU required, uses mock CUPTI/CUDA. Also covers
+# graph launches (guards driver cuGraphLaunch CBID subscription).
 test-pc-mock: local bpf-test
 	sudo -E test/test-pc-mock.sh
-
-# Mock graph-launch test — guards driver cuGraphLaunch CBID subscription. No GPU.
-test-pc-mock-graph: local bpf-test
-	sudo -E test/test-pc-mock-graph.sh
 
 format:
 	@echo "=== Formatting source files ==="
