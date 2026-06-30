@@ -37,9 +37,27 @@ static std::atomic<uint32_t> g_bufferCycle{0};
 // runtime calls)
 thread_local uint32_t runtimeEnterCorrelationId = 0;
 
-// Thread-local rate limiter for callback probes (default 100/sec,
-// configurable via PARCAGPU_RATE_LIMIT).
+// Configured probe rates (tokens/sec), read from env once in init_debug.
+// Globals because the buckets below are thread_local: setRate from init_debug
+// would only reach the single thread that ran it.
+std::atomic<double> g_eagerRateLimit{100.0};
+std::atomic<double> g_graphRateLimit{20.0};
+
+// Thread-local rate limiters. Graph launches get a separate, lower bucket
+// (PARCAGPU_GRAPH_RATE_LIMIT) so graph replays don't flood cupti_events and
+// eager bursts can't starve graph sampling.
 thread_local TokenBucket callbackLimiter(100.0);
+thread_local TokenBucket graphCallbackLimiter(20.0);
+
+// Copy the configured rates into this thread's buckets, once per thread.
+static inline void applyRateLimitsOnce() {
+  thread_local bool applied = false;
+  if (!applied) {
+    callbackLimiter.setRate(g_eagerRateLimit.load(std::memory_order_relaxed));
+    graphCallbackLimiter.setRate(g_graphRateLimit.load(std::memory_order_relaxed));
+    applied = true;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // PC sampling probabilistic control.
@@ -179,7 +197,15 @@ void init_debug() {
     if (rateEnv != nullptr) {
       double rate = atof(rateEnv);
       if (rate > 0) {
-        callbackLimiter.setRate(rate);
+        g_eagerRateLimit.store(rate, std::memory_order_relaxed);
+      }
+    }
+
+    const char *graphRateEnv = getenv("PARCAGPU_GRAPH_RATE_LIMIT");
+    if (graphRateEnv != nullptr) {
+      double rate = atof(graphRateEnv);
+      if (rate > 0) {
+        g_graphRateLimit.store(rate, std::memory_order_relaxed);
       }
     }
 
@@ -657,7 +683,7 @@ private:
         return;
       }
 
-      // Check if this is a graph launch (never rate limit these)
+      // Check if this is a graph launch (rate-limited via a separate bucket).
       bool isGraphLaunch = false;
       if (signedCbid < 0) {
         // Driver API: cuGraphLaunch = 514, cuGraphLaunch_ptsz = 515
@@ -673,15 +699,17 @@ private:
                  CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000);
       }
 
-      // Rate limit probes using token bucket.  Skip rate limiting for graph
-      // launches (they share one correlation ID across many kernels) and when
-      // PC sampling is active (every kernel needs its correlation callback so
-      // PC samples can be matched with CPU stacks on the agent side).
-      if (!isGraphLaunch && !g_pcSamplingState.active) {
-        if (!callbackLimiter.tryAcquire()) {
-          DEBUG_PRINTF(
-              "[PARCAGPU] Rate limited: skipping probe for correlationId=%u\n",
-              correlationId);
+      // Rate limit via per-class buckets (eager vs graph). Skip when PC
+      // sampling is active: every kernel needs its correlation callback to
+      // match PC samples to CPU stacks on the agent side.
+      if (!g_pcSamplingState.active) {
+        applyRateLimitsOnce();
+        TokenBucket &limiter =
+            isGraphLaunch ? graphCallbackLimiter : callbackLimiter;
+        if (!limiter.tryAcquire()) {
+          DEBUG_PRINTF("[PARCAGPU] Rate limited: skipping probe for "
+                       "correlationId=%u (graph=%d)\n",
+                       correlationId, isGraphLaunch);
           return;
         }
       }
