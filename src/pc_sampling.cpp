@@ -46,8 +46,8 @@ static uint64_t emitMetadataNowNs();
 static constexpr uint32_t PCSampleBatchSize = 128;
 
 __attribute__((noinline)) void firePCSampleBatch(
-    const void **ptrs, uint32_t count) {
-  PARCAGPU_PC_SAMPLE_BATCH(ptrs, count);
+    const void **ptrs, uint32_t count, uint32_t dev) {
+  PARCAGPU_PC_SAMPLE_BATCH(ptrs, count, dev);
 }
 
 namespace {
@@ -570,6 +570,10 @@ void PCSampling::initialize(CUcontext context) {
             &clockKHz, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, dev);
         proton::cuda::deviceGetAttribute<false>(
             &smCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev);
+        // Stash on the ConfigureData too, since processPCSamplingData may
+        // run on a different thread where `context` isn't current — a
+        // context's device never changes, so this stays valid forever.
+        configData->device = (uint32_t)dev;
         const uint32_t factor = getGPUSamplingFrequency();
         const uint64_t emittedNs = emitMetadataNowNs();
         fireGpuConfig((uint32_t)dev, factor, (uint32_t)clockKHz,
@@ -673,12 +677,12 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData) {
   for (size_t i = 0; i < pcSamplingData->totalNumPcs; ++i) {
     batchPtrs[batchCount++] = &pcSamplingData->pPcData[i];
     if (batchCount == PCSampleBatchSize) {
-      firePCSampleBatch(batchPtrs, batchCount);
+      firePCSampleBatch(batchPtrs, batchCount, configureData->device);
       batchCount = 0;
     }
   }
   if (batchCount > 0) {
-    firePCSampleBatch(batchPtrs, batchCount);
+    firePCSampleBatch(batchPtrs, batchCount, configureData->device);
   }
 }
 
