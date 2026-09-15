@@ -85,6 +85,10 @@ struct ConfigureData {
 
   CUcontext context{};
   uint32_t contextId;
+  // Device this context is bound to for its lifetime (see cuCtxCreate /
+  // cuCtxGetDevice). Resolved once in PCSampling::initialize() and reused
+  // by every pc_sample_batch fired from this context.
+  uint32_t device{};
   uint32_t numStallReasons{};
   uint32_t numValidStallReasons{};
   int hardwareBufferMB{}; // PARCAGPU_PC_HW_BUFFER_MB; 0 = CUPTI default
