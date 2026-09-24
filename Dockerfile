@@ -8,19 +8,14 @@
 # CUDA header image (can be overridden at build time)
 ARG CUDA_HEADERS=ghcr.io/parca-dev/cuda-headers:12
 
+# Build toolchain image, see Dockerfile.builder (can be overridden at build time)
+ARG BUILDER=ghcr.io/parca-dev/parcagpu-builder:24.04
+
 # Import CUDA headers
 FROM ${CUDA_HEADERS} AS cuda-headers
 
-# Build stage
-FROM ubuntu:24.04 AS builder
-
-# Install only build tools (no CUDA toolkit needed)
-RUN apt-get update && apt-get install -y \
-    cmake \
-    make \
-    g++ \
-    systemtap-sdt-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Build stage (no CUDA toolkit needed)
+FROM ${BUILDER} AS builder
 
 WORKDIR /build
 
