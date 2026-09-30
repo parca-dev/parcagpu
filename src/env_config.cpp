@@ -16,6 +16,7 @@ namespace parcagpu {
 static const char *knownVars[] = {
     "PARCAGPU_DEBUG",
     "PARCAGPU_RATE_LIMIT",
+    "PARCAGPU_GRAPH_RATE_LIMIT",
     "PARCAGPU_SAMPLING_FACTOR",
     "PARCAGPU_PC_SAMPLING_RATE",
     "PARCAGPU_PC_HW_BUFFER_MB",
@@ -66,6 +67,16 @@ void validateEnvVars() {
       DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_RATE_LIMIT=%s invalid "
                    "(must be > 0), using default\n", val);
       fireError(0, val, "env_config: PARCAGPU_RATE_LIMIT invalid");
+    }
+  }
+
+  val = std::getenv("PARCAGPU_GRAPH_RATE_LIMIT");
+  if (val) {
+    double rate = std::atof(val);
+    if (rate <= 0) {
+      DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_GRAPH_RATE_LIMIT=%s invalid "
+                   "(must be > 0), using default\n", val);
+      fireError(0, val, "env_config: PARCAGPU_GRAPH_RATE_LIMIT invalid");
     }
   }
 
