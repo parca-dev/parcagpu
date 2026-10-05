@@ -265,6 +265,28 @@ CUptiResult cuptiPCSamplingStop(CUpti_PCSamplingStopParams *params) {
     return CUPTI_SUCCESS;
 }
 
+// Sampling period the mock reports, like a GB10's CUPTI default (2^10
+// cycles). MOCK_PC_PERIOD overrides; 0 makes the getter fail.
+CUptiResult cuptiPCSamplingGetConfigurationAttribute(
+    CUpti_PCSamplingConfigurationInfoParams *params) {
+    const char *e = getenv("MOCK_PC_PERIOD");
+    uint32_t period = e ? (uint32_t)atoi(e) : 10;
+    for (size_t i = 0; i < params->numAttributes; i++) {
+        CUpti_PCSamplingConfigurationInfo *info =
+            &params->pPCSamplingConfigurationInfo[i];
+        if (info->attributeType !=
+            CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD)
+            continue;
+        if (period == 0) {
+            info->attributeStatus = CUPTI_ERROR_NOT_SUPPORTED;
+            return CUPTI_ERROR_NOT_SUPPORTED;
+        }
+        info->attributeData.samplingPeriodData.samplingPeriod = period;
+        info->attributeStatus = CUPTI_SUCCESS;
+    }
+    return CUPTI_SUCCESS;
+}
+
 CUptiResult cuptiPCSamplingSetConfigurationAttribute(
     CUpti_PCSamplingConfigurationInfoParams *params) {
     (void)params;

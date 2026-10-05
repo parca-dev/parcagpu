@@ -12,6 +12,18 @@
 #include <stdexcept>
 #include <tuple>
 
+// Proton's CUPTI dispatch table has no getter for PC sampling attributes;
+// declare one here (same macro, same lazily-dlopen'd libcupti) rather than
+// patching the submodule.
+namespace proton::cupti {
+template <bool CheckSuccess>
+CUptiResult pcSamplingGetConfigurationAttribute(
+    CUpti_PCSamplingConfigurationInfoParams *pParams);
+DEFINE_DISPATCH(ExternLibCupti, pcSamplingGetConfigurationAttribute,
+                cuptiPCSamplingGetConfigurationAttribute,
+                CUpti_PCSamplingConfigurationInfoParams *)
+} // namespace proton::cupti
+
 namespace parcagpu {
 
 // CUDA driver version for 12.8.1 (minimum for PC sampling)
@@ -211,6 +223,27 @@ uint32_t getGPUSamplingFrequency() {
     }
   }
   return samplingPeriod;
+}
+
+// The sampling period CUPTI is actually using on `context`, as n in 2^n
+// cycles, or 0 if it can't be read. This, not PARCAGPU_SAMPLING_FACTOR, is
+// what the agent must use to turn sample counts into time: the shim doesn't
+// set the period, and CUPTI's default depends on the GPU (10 on a GB10).
+uint32_t readSamplingPeriod(CUcontext context) {
+  CUpti_PCSamplingConfigurationInfo info{};
+  info.attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD;
+  CUpti_PCSamplingConfigurationInfoParams params{};
+  params.size = CUpti_PCSamplingConfigurationInfoParamsSize;
+  params.ctx = context;
+  params.numAttributes = 1;
+  params.pPCSamplingConfigurationInfo = &info;
+  auto r = proton::cupti::pcSamplingGetConfigurationAttribute<false>(&params);
+  if (r != CUPTI_SUCCESS || info.attributeStatus != CUPTI_SUCCESS) {
+    DEBUG_PRINTF("Reading PC sampling period failed: %d/%d (ctx=%p)\n", r,
+                 info.attributeStatus, context);
+    return 0;
+  }
+  return info.attributeData.samplingPeriodData.samplingPeriod;
 }
 
 // Get number of stall reasons
@@ -574,7 +607,16 @@ void PCSampling::initialize(CUcontext context) {
         // run on a different thread where `context` isn't current — a
         // context's device never changes, so this stays valid forever.
         configData->device = (uint32_t)dev;
-        const uint32_t factor = getGPUSamplingFrequency();
+        // Report the period CUPTI really samples at. If it can't be read,
+        // send no gpu_config rather than a wrong one: the agent then keeps
+        // the (correct) raw sample counts and only lacks the ns conversion.
+        const uint32_t factor = readSamplingPeriod(context);
+        if (factor == 0) {
+          fireError(0, "could not read PC sampling period; gpu_config not "
+                       "emitted",
+                    "pc_sampling");
+          return;
+        }
         const uint64_t emittedNs = emitMetadataNowNs();
         fireGpuConfig((uint32_t)dev, factor, (uint32_t)clockKHz,
                       (uint32_t)smCount);
