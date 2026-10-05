@@ -109,8 +109,8 @@ public:
   PCSampling() = default;
   ~PCSampling() = default;
 
-  // Check if PC sampling is supported (CUPTI >= 12.8.1).
-  // Enabled by default; set PARCAGPU_SAMPLING_FACTOR=0 to disable.
+  // Check if PC sampling is supported (CUPTI >= 12.8.1). Off unless
+  // PARCAGPU_PC_SAMPLING_RATE is set.
   static bool isSupported();
 
   void initialize(CUcontext context);
