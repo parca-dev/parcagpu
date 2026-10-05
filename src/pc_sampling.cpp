@@ -452,9 +452,19 @@ void ConfigureData::initialize(CUcontext context) {
                  "(PARCAGPU_PC_HW_BUFFER_MB)\n", hardwareBufferMB);
     configurationInfos.emplace_back(configureHardwareBufferSize());
   }
-  // Don't set sampling period — let CUPTI use its default.
-  // Explicit period values silently break sampling on some GPUs (e.g.
-  // Blackwell).
+  // Sampling period: CUPTI's per-GPU default unless PARCAGPU_SAMPLING_FACTOR
+  // is set. gpu_config reports whatever CUPTI ends up using (read back in
+  // PCSampling::initialize), so the agent's ns conversion is right either way.
+  // Only valid values ([5,31]) are applied; anything else keeps the default.
+  // An explicit period works under live injection + activity tracing on a
+  // GB10 (samples scale as 2^-n), despite an earlier note that it broke
+  // sampling on Blackwell.
+  if (const char *f = std::getenv("PARCAGPU_SAMPLING_FACTOR");
+      f && atoi(f) >= 5 && atoi(f) <= 31) {
+    DEBUG_PRINTF("[PARCAGPU] Setting PC sampling period = %u "
+                 "(PARCAGPU_SAMPLING_FACTOR)\n", getGPUSamplingFrequency());
+    configurationInfos.emplace_back(configureSamplingPeriod());
+  }
 
   setConfigurationAttribute(context, configurationInfos);
 
