@@ -172,9 +172,9 @@ CUptiResult cuptiActivityGetNumDroppedRecords(CUcontext context,
 }
 
 CUptiResult cuptiGetContextId(CUcontext context, uint32_t *contextId) {
-    (void)context;  // Mark as intentionally unused
-    // Return a fixed context ID for testing
-    *contextId = 1;
+    // Mock contexts are small integers (1 + GPU index, see test_cupti_prof),
+    // so the context pointer doubles as its ID. NULL keeps the old fixed ID.
+    *contextId = context ? (uint32_t)(uintptr_t)context : 1;
     return CUPTI_SUCCESS;
 }
 
@@ -239,7 +239,43 @@ CUptiResult cuptiGetVersion(uint32_t *version) {
     return CUPTI_SUCCESS;
 }
 
-static int __pc_sampling_started = 0;
+// Per-context PC sampling state, like real CUPTI: start/stop take a context,
+// and starting a started context or stopping a stopped one is an error. The
+// counters are printed by __mock_pc_report so tests can assert
+// the profiler never stops a context it did not start.
+#define MOCK_MAX_CTX 64
+static int __pc_started[MOCK_MAX_CTX + 1];
+static int __pc_starts, __pc_stops, __pc_bad_starts, __pc_bad_stops;
+static int __pc_cur_started, __pc_max_started;
+static int __pc_getdata_unknown;
+// MOCK_PC_UNKNOWN_CTX=<id>: GetData on that context returns
+// CUPTI_ERROR_UNKNOWN, as real CUPTI does when another process is already
+// sampling the GPU. Starts on it are counted to check the profiler backs off.
+static int __pc_unknown_ctx = -1;
+static int __pc_unknown_ctx_starts;
+
+static int __mock_ctx_index(CUcontext ctx) {
+    uintptr_t id = ctx ? (uintptr_t)ctx : 1;
+    return id <= MOCK_MAX_CTX ? (int)id : 0;
+}
+
+__attribute__((constructor)) static void __mock_pc_init(void) {
+    const char *e = getenv("MOCK_PC_UNKNOWN_CTX");
+    if (e)
+        __pc_unknown_ctx = atoi(e);
+}
+
+// Exported: test_cupti_prof ends in _exit(), which skips destructors, so the
+// harness calls this explicitly.
+void __mock_pc_report(void) {
+    fprintf(stderr,
+            "[MOCK_CUPTI] pc_sampling summary: starts=%d stops=%d "
+            "bad_starts=%d bad_stops=%d max_concurrent=%d still_started=%d "
+            "getdata_unknown=%d unknown_ctx_starts=%d\n",
+            __pc_starts, __pc_stops, __pc_bad_starts, __pc_bad_stops,
+            __pc_max_started, __pc_cur_started, __pc_getdata_unknown,
+            __pc_unknown_ctx_starts);
+}
 
 CUptiResult cuptiPCSamplingEnable(CUpti_PCSamplingEnableParams *params) {
     (void)params;
@@ -254,14 +290,31 @@ CUptiResult cuptiPCSamplingDisable(CUpti_PCSamplingDisableParams *params) {
 }
 
 CUptiResult cuptiPCSamplingStart(CUpti_PCSamplingStartParams *params) {
-    (void)params;
-    __pc_sampling_started = 1;
+    int i = __mock_ctx_index(params->ctx);
+    if (i == __pc_unknown_ctx)
+        __atomic_fetch_add(&__pc_unknown_ctx_starts, 1, __ATOMIC_RELAXED);
+    if (__atomic_exchange_n(&__pc_started[i], 1, __ATOMIC_ACQ_REL)) {
+        __atomic_fetch_add(&__pc_bad_starts, 1, __ATOMIC_RELAXED);
+        return CUPTI_ERROR_INVALID_OPERATION;
+    }
+    __atomic_fetch_add(&__pc_starts, 1, __ATOMIC_RELAXED);
+    int cur = __atomic_add_fetch(&__pc_cur_started, 1, __ATOMIC_ACQ_REL);
+    int max = __atomic_load_n(&__pc_max_started, __ATOMIC_RELAXED);
+    while (cur > max &&
+           !__atomic_compare_exchange_n(&__pc_max_started, &max, cur, 0,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        ;
     return CUPTI_SUCCESS;
 }
 
 CUptiResult cuptiPCSamplingStop(CUpti_PCSamplingStopParams *params) {
-    (void)params;
-    __pc_sampling_started = 0;
+    int i = __mock_ctx_index(params->ctx);
+    if (!__atomic_exchange_n(&__pc_started[i], 0, __ATOMIC_ACQ_REL)) {
+        __atomic_fetch_add(&__pc_bad_stops, 1, __ATOMIC_RELAXED);
+        return CUPTI_ERROR_INVALID_OPERATION;
+    }
+    __atomic_fetch_add(&__pc_stops, 1, __ATOMIC_RELAXED);
+    __atomic_sub_fetch(&__pc_cur_started, 1, __ATOMIC_ACQ_REL);
     return CUPTI_SUCCESS;
 }
 
@@ -363,6 +416,11 @@ void __mock_pc_enqueue_correlation(uint32_t correlation_id) {
 CUptiResult cuptiPCSamplingGetData(CUpti_PCSamplingGetDataParams *params) {
     CUpti_PCSamplingData *data = params->pcSamplingData;
 
+    if (__mock_ctx_index(params->ctx) == __pc_unknown_ctx) {
+        __atomic_fetch_add(&__pc_getdata_unknown, 1, __ATOMIC_RELAXED);
+        return CUPTI_ERROR_UNKNOWN;
+    }
+
     if (data->collectNumPcs == 0) {
         data->totalNumPcs = 0;
         data->remainingNumPcs = 0;
@@ -438,23 +496,30 @@ CUptiResult cuptiGetSassToSourceCorrelation(
 // Fires CONTEXT_CREATED and MODULE_LOADED with the real cubin.
 // =========================================================================
 
-void __mock_cupti_fire_resource_callbacks(void) {
+void __mock_cupti_fire_resource_callbacks(int num_contexts) {
     if (!__cupti_runtime_api_callback)
         return;
 
     __load_cubin();
 
-    fprintf(stderr, "[MOCK_CUPTI] Firing resource callbacks\n");
+    fprintf(stderr, "[MOCK_CUPTI] Firing resource callbacks (%d contexts)\n",
+            num_contexts);
 
-    // 1. CONTEXT_CREATED
+    // 1. CONTEXT_CREATED, one context per simulated GPU (ctx = 1 + index).
     CUpti_ResourceData resData;
+    if (num_contexts < 1)
+        num_contexts = 1;
+    for (int c = 1; c <= num_contexts && c <= MOCK_MAX_CTX; c++) {
+        memset(&resData, 0, sizeof(resData));
+        resData.context = (CUcontext)(uintptr_t)c;
+        __cupti_runtime_api_callback(
+            __cupti_runtime_api_userdata,
+            CUPTI_CB_DOMAIN_RESOURCE,
+            CUPTI_CBID_RESOURCE_CONTEXT_CREATED,
+            &resData);
+    }
     memset(&resData, 0, sizeof(resData));
     resData.context = (CUcontext)(uintptr_t)0x1;
-    __cupti_runtime_api_callback(
-        __cupti_runtime_api_userdata,
-        CUPTI_CB_DOMAIN_RESOURCE,
-        CUPTI_CBID_RESOURCE_CONTEXT_CREATED,
-        &resData);
 
     // 2. MODULE_LOADED with the real cubin.
     CUpti_ModuleResourceData modData;

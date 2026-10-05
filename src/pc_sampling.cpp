@@ -583,26 +583,44 @@ void PCSampling::initialize(CUcontext context) {
       });
 }
 
-void PCSampling::start(CUcontext context) {
+bool PCSampling::start(CUcontext context) {
+  uint32_t contextId = 0;
+  proton::cupti::getContextId<true>(context, &contextId);
+  if (!contextInitialized.contain(contextId) ||
+      contextUnavailable.contain(contextId))
+    return false;
+
   std::lock_guard<std::mutex> lock(pcSamplingMutex);
-  if (samplingActive)
-    return;
-  if (startPCSampling(context)) {
-    samplingActive = true;
-    samplingContext = context;
-    DEBUG_PRINTF("PC sampling started (kernels serialized)\n");
-  }
+  if (samplingContexts.count(context))
+    return false;
+  if (!startPCSampling(context))
+    return false;
+  samplingContexts.insert(context);
+  numSampling.fetch_add(1, std::memory_order_release);
+  DEBUG_PRINTF("PC sampling started on ctx=%p (kernels serialized)\n",
+               context);
+  return true;
 }
 
 void PCSampling::stop(CUcontext context) {
   std::lock_guard<std::mutex> lock(pcSamplingMutex);
-  if (!samplingActive)
+  auto it = samplingContexts.find(context);
+  if (it == samplingContexts.end())
     return;
   stopPCSampling(context);
-  samplingActive = false;
-  DEBUG_PRINTF("PC sampling stopped (kernels concurrent)\n");
+  samplingContexts.erase(it);
+  numSampling.fetch_sub(1, std::memory_order_release);
+  DEBUG_PRINTF("PC sampling stopped on ctx=%p (kernels concurrent)\n",
+               context);
   // Drain data collected during this window.
   collectData(context);
+}
+
+bool PCSampling::isSampling(CUcontext context) {
+  if (numSampling.load(std::memory_order_acquire) == 0)
+    return false;
+  std::lock_guard<std::mutex> lock(pcSamplingMutex);
+  return samplingContexts.count(context) != 0;
 }
 
 __attribute__((noinline)) void fireError(int32_t code, const char *message,
@@ -771,8 +789,10 @@ void PCSampling::collectData(CUcontext context) {
   uint32_t contextId = 0;
   proton::cupti::getContextId<true>(context, &contextId);
 
-  if (!contextInitialized.contain(contextId)) {
-    DEBUG_PRINTF("Context %u not initialized, skipping data collection\n",
+  if (!contextInitialized.contain(contextId) ||
+      contextUnavailable.contain(contextId)) {
+    DEBUG_PRINTF("Context %u not initialized or unavailable, skipping data "
+                 "collection\n",
                  contextId);
     return;
   }
@@ -798,6 +818,32 @@ void PCSampling::collectData(CUcontext context) {
     if (res == CUPTI_SUCCESS) {
       processPCSamplingData(configureData);
       continue;
+    }
+    if (res == CUPTI_ERROR_UNKNOWN) {
+      // Another process already samples this GPU. CUPTI let enable/start
+      // succeed but GetData fails and no samples will ever arrive. Stop
+      // (unless we're nested inside stop(), which is stopping it anyway)
+      // and don't start this context again.
+      if (!contextUnavailable.contain(contextId)) {
+        contextUnavailable.insert(contextId);
+        DEBUG_PRINTF("PC sampling unavailable on ctx=%p: GetData returned "
+                     "CUPTI_ERROR_UNKNOWN (GPU likely sampled by another "
+                     "process); disabling for this context\n", context);
+        fireError((int32_t)res,
+                  "PC sampling GetData failed (GPU likely sampled by another "
+                  "process); disabled for this context",
+                  "pc_sampling");
+      }
+      std::unique_lock<std::mutex> lock(pcSamplingMutex, std::try_to_lock);
+      if (lock.owns_lock()) {
+        auto it = samplingContexts.find(context);
+        if (it != samplingContexts.end()) {
+          stopPCSampling(context);
+          samplingContexts.erase(it);
+          numSampling.fetch_sub(1, std::memory_order_release);
+        }
+      }
+      break;
     }
     if (res == CUPTI_ERROR_OUT_OF_MEMORY) {
       // CUPTI's PC-sampling state for this context is wedged — stop+start
@@ -874,12 +920,15 @@ void PCSampling::finalize(CUcontext context) {
                                           contextId),
                               initializedContextIds.end());
 
-  // Stop sampling if it was started on this context.
+  // Stop sampling if it was started on this context (and only then: other
+  // contexts may be sampling too).
   {
     std::lock_guard<std::mutex> lock2(pcSamplingMutex);
-    if (samplingActive) {
+    auto it = samplingContexts.find(context);
+    if (it != samplingContexts.end()) {
       stopPCSampling(context);
-      samplingActive = false;
+      samplingContexts.erase(it);
+      numSampling.fetch_sub(1, std::memory_order_release);
     }
   }
 
