@@ -112,9 +112,11 @@ struct PCRateController {
 };
 static PCRateController g_pcController;
 
-// Per-thread sampling state.
+// Per-thread sampling state. A thread owns at most one window at a time, on
+// the context it started; other threads may own windows on other contexts.
 struct PCSamplingState {
-  bool active = false;        // Currently sampling
+  bool active = false;        // This thread owns an open window
+  CUcontext ctx = nullptr;    // Context the window was started on
   uint64_t windowStartNs = 0; // When the current window opened
   uint64_t lastCheckNs = 0;   // Last time we rolled the dice
   unsigned int rngSeed = 0;   // Thread-local RNG state
@@ -610,10 +612,14 @@ private:
               st.lastCheckNs = now;
               const double p = g_pcController.probability.load(
                   std::memory_order_relaxed);
-              if (threadRandom(st) < p) {
+              // start() is false if this context is already sampling
+              // (another thread's window) or can't sample; only a window
+              // we actually started is ours to close.
+              if (threadRandom(st) < p &&
+                  profiler.pcSampling.start(cbdata->context)) {
                 st.active = true;
+                st.ctx = cbdata->context;
                 st.windowStartNs = now;
-                profiler.pcSampling.start(cbdata->context);
               }
             }
           }
@@ -633,18 +639,21 @@ private:
       // are cheap (single API call returning 0 PCs) and missed drains lose
       // samples (CUPTI_ERROR_OUT_OF_MEMORY when staging fills). Window close
       // is still kernel-launch aligned: only check elapsed-time on a launch
-      // EXIT, so the window starts and ends at kernel boundaries.
+      // EXIT, so the window starts and ends at kernel boundaries. Drain and
+      // stop the window's own context, not this callback's: the thread may
+      // have switched devices since the window opened.
       if (profiler.pcSamplingEnabled) {
         auto &st = g_pcSamplingState;
 
         if (st.active) {
           if (isKernelLaunchCb &&
               (nowNs() - st.windowStartNs >= kPCSamplingIntervalNs)) {
-            profiler.pcSampling.stop(cbdata->context);
+            profiler.pcSampling.stop(st.ctx);
             st.active = false;
+            st.ctx = nullptr;
             controllerMaybeUpdate();
           } else {
-            profiler.pcSampling.collectData(cbdata->context);
+            profiler.pcSampling.collectData(st.ctx);
           }
         }
 
@@ -699,10 +708,11 @@ private:
                  CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000);
       }
 
-      // Rate limit via per-class buckets (eager vs graph). Skip when PC
-      // sampling is active: every kernel needs its correlation callback to
-      // match PC samples to CPU stacks on the agent side.
-      if (!g_pcSamplingState.active) {
+      // Rate limit via per-class buckets (eager vs graph). Skip when this
+      // launch's context is PC sampling, whichever thread opened the window:
+      // every kernel needs its correlation callback to match PC samples to
+      // CPU stacks on the agent side.
+      if (!profiler.pcSampling.isSampling(cbdata->context)) {
         applyRateLimitsOnce();
         TokenBucket &limiter =
             isGraphLaunch ? graphCallbackLimiter : callbackLimiter;

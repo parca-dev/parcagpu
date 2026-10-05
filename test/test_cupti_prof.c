@@ -387,6 +387,15 @@ static __thread uint32_t tls_correlation_id;
 static __thread CUpti_CallbackData tls_cbdata;
 static __thread bool tls_should_generate_activities;
 
+// Number of simulated GPUs; each gets its own mock CUcontext (1 + index) and
+// a launch's context follows the same correlationId % num_gpus mapping as
+// the kernel activity's deviceId.
+static int g_num_gpus = 1;
+
+static CUcontext mock_context_for(uint32_t correlationId) {
+    return (CUcontext)(uintptr_t)(1 + correlationId % (uint32_t)g_num_gpus);
+}
+
 // Driver API kernel launch - calls the callback with cuLaunchKernel in the stack
 NOINLINE CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
                                   unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY,
@@ -501,6 +510,7 @@ void simulate_runtime_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbi
     // Set up thread-local data for the fake CUDA API functions
     tls_correlation_id = correlationId;
     memset(&tls_cbdata, 0, sizeof(tls_cbdata));
+    tls_cbdata.context = mock_context_for(correlationId);
     tls_should_generate_activities = should_generate_activities;
 
     if (cbid == CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000) {
@@ -528,6 +538,7 @@ void simulate_driver_kernel_launch(uint32_t correlationId, CUpti_CallbackId cbid
     // Set up thread-local data for the fake CUDA API functions
     tls_correlation_id = correlationId;
     memset(&tls_cbdata, 0, sizeof(tls_cbdata));
+    tls_cbdata.context = mock_context_for(correlationId);
     tls_should_generate_activities = should_generate_activities;
 
     if (cbid == CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch) {
@@ -870,6 +881,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    g_num_gpus = config.num_gpus > 0 ? config.num_gpus : 1;
     fprintf(stderr, "[Process %d] Loading library: %s\n", proc_id, lib_path);
     fprintf(stderr, "[Process %d] Configuration:\n", proc_id);
     fprintf(stderr, "  Processes: %d\n", config.num_procs);
@@ -922,12 +934,12 @@ int main(int argc, char **argv) {
 
     // Fire resource callbacks (CONTEXT_CREATED, MODULE_LOADED) so that
     // PC sampling initialization runs in the profiler library.
-    typedef void (*FireResourceCallbacksFunc)(void);
+    typedef void (*FireResourceCallbacksFunc)(int);
     FireResourceCallbacksFunc fireResourceCbs =
         (FireResourceCallbacksFunc)dlsym(RTLD_DEFAULT,
                                          "__mock_cupti_fire_resource_callbacks");
     if (fireResourceCbs) {
-        fireResourceCbs();
+        fireResourceCbs(config.num_gpus);
     }
 
     // Load kernel names if specified
@@ -980,6 +992,12 @@ int main(int argc, char **argv) {
         free(child_pids);
         fprintf(stderr, "[Process 0] All child processes completed.\n");
     }
+
+    // Mock CUPTI's PC sampling counters (start/stop per context); _exit()
+    // below skips destructors, so print them now.
+    void (*pcReport)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "__mock_pc_report");
+    if (pcReport)
+        pcReport();
 
     _exit(0);
 }

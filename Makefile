@@ -1,4 +1,4 @@
-.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-graph-rate-limit
+.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-graph-rate-limit test-pc-contexts
 
 LIB_NAME = libparcagpucupti.so
 
@@ -167,6 +167,10 @@ test-pc-mock: local bpf-test
 # Drives test_cupti_prof at a production TRT-LLM 4-GPU peak (graph rate-limit stress). No GPU.
 test-graph-rate-limit: local
 	test/test-graph-rate-limit.sh
+
+# PC sampling start/stop bookkeeping across several mock contexts. No GPU/root.
+test-pc-contexts: local
+	test/test-pc-contexts.sh
 
 format:
 	@echo "=== Formatting source files ==="

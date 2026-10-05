@@ -115,13 +115,20 @@ public:
 
   void initialize(CUcontext context);
 
-  // Start PC sampling — kernels become serialized until stop().
-  // No-op if already started. Thread-safe.
-  void start(CUcontext context);
+  // Start PC sampling on `context` — its kernels become serialized until
+  // stop(context). Contexts are independent: CUPTI supports one sampled
+  // context per GPU, so a process driving several GPUs can sample them all
+  // at once. Returns true only if this call started sampling; false if the
+  // context is already sampling, not initialized, unavailable (another
+  // process owns the GPU's sampler), or CUPTI refused. Thread-safe.
+  bool start(CUcontext context);
 
-  // Stop PC sampling, drain accumulated data, and emit probes.
-  // Kernels resume concurrent execution. No-op if not started.
+  // Stop PC sampling on `context` and drain its data. Kernels resume
+  // concurrent execution. No-op unless start(context) succeeded earlier.
   void stop(CUcontext context);
+
+  // True while `context` is sampling. Cheap when nothing is sampling.
+  bool isSampling(CUcontext context);
 
   // Emit stall reason map and replay cubin probes for late-attaching tracers.
   // Call periodically regardless of sampling state.
@@ -148,10 +155,15 @@ private:
   // Protected by contextMutex.
   std::vector<uint32_t> initializedContextIds;
 
-  // Tracks whether CUPTI PC sampling is currently active (start/stop).
-  // Only one context can be sampling at a time in KERNEL_SERIALIZED mode.
-  std::atomic<bool> samplingActive{false};
-  CUcontext samplingContext{};
+  // Contexts currently sampling (between a successful start and its stop).
+  // Protected by pcSamplingMutex; numSampling mirrors its size so the
+  // per-callback isSampling() check skips the lock when nothing samples.
+  std::set<CUcontext> samplingContexts;
+  std::atomic<int> numSampling{0};
+  // Contexts whose GPU sampler is owned by another process. CUPTI reports
+  // success from enable/start there and fails only GetData/Stop with
+  // CUPTI_ERROR_UNKNOWN; we stop and never restart those contexts.
+  proton::ThreadSafeSet<uint32_t> contextUnavailable;
   std::mutex pcSamplingMutex{};
   std::mutex contextMutex{};
 
