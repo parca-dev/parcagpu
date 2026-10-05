@@ -5,7 +5,8 @@
 //      a hold time, e.g. `./pc_multi 1 20 & sleep 2; ./pc_multi 1 5`.
 //
 // Build: nvcc -O2 -lineinfo -o pc_multi test/pc_multi.cu -lcuda -lcupti
-// Run:   ./pc_multi [ndev=all] [seconds=3]   (PC_MULTI_NOSAMPLE=1 for baseline)
+// Run:   ./pc_multi [ndev=all] [seconds=3]   (PC_MULTI_NOSAMPLE=1 for baseline,
+//        PC_MULTI_PERIOD=n for an explicit 2^n-cycle sampling period)
 // Prints per-device CUPTI return codes and sample counts. Exit 0 only if every
 // device produced samples.
 
@@ -132,7 +133,7 @@ static void setup(Dev &d) {
   d.cfgBuf = allocData(1024, d.nStall);
   d.outBuf = allocData(1024, d.nStall);
 
-  CUpti_PCSamplingConfigurationInfo info[5]{};
+  CUpti_PCSamplingConfigurationInfo info[6]{};
   info[0].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_STALL_REASON;
   info[0].attributeData.stallReasonData.stallReasonCount = d.nStall;
   info[0].attributeData.stallReasonData.pStallReasonIndex = idx.data();
@@ -152,6 +153,13 @@ static void setup(Dev &d) {
   cp.size = CUpti_PCSamplingConfigurationInfoParamsSize;
   cp.ctx = d.ctx;
   cp.numAttributes = 5;
+  // PC_MULTI_PERIOD=<5..31>: set an explicit sampling period (2^n cycles)
+  // instead of CUPTI's default.
+  if (const char *per = getenv("PC_MULTI_PERIOD")) {
+    info[5].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD;
+    info[5].attributeData.samplingPeriodData.samplingPeriod = atoi(per);
+    cp.numAttributes = 6;
+  }
   cp.pPCSamplingConfigurationInfo = info;
   d.configRes = cuptiPCSamplingSetConfigurationAttribute(&cp);
 }
