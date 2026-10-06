@@ -48,7 +48,8 @@ probes (and profiling is on), so the shim costs little until one attaches.
 
 #### Runtime config file
 
-`PARCAGPU_CONFIG_FILE` names a file, re-read about once a second, of
+`PARCAGPU_CONFIG_FILE` names a file, re-read about once a second (checked
+from the shim's CUDA API callbacks; the shim starts no threads), of
 `KEY=VALUE` lines using the variable names above (the `PARCAGPU_` prefix is
 optional; `#` starts a comment). A key in the file overrides the environment;
 removing it, or the file, reverts to the environment's value. Mounting the

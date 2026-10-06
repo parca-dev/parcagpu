@@ -11,8 +11,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <pthread.h>
-#include <signal.h>
 #include <string>
 #include <sys/stat.h>
 #include <time.h>
@@ -24,7 +22,8 @@ std::atomic<bool> g_profilingActive{true};
 static constexpr uint64_t kNsPerSec = 1'000'000'000ULL;
 // How often the config file is checked for changes.
 static constexpr uint64_t kFileCheckNs = kNsPerSec;
-// How often to check whether a profiler has attached or detached.
+// How often to check whether a profiler has attached or detached. Checks run
+// on CUDA API callbacks, so with no API calls (and so no kernels) they wait.
 static constexpr uint64_t kAttachPollNs = kNsPerSec / 4;
 static constexpr double kMinDutyPeriodSec = 0.1;
 static constexpr size_t kMaxConfigFileBytes = 64 * 1024;
@@ -182,7 +181,7 @@ struct FileStamp {
   }
 };
 
-struct ConfigThread {
+struct ConfigState {
   const char *path = nullptr; // PARCAGPU_CONFIG_FILE, or null
   LiveSettings env{};         // what keys absent from the file revert to
   LiveSettings cur{};
@@ -201,7 +200,7 @@ static void logSettings(const char *why, const LiveSettings &s) {
 
 // Re-read the config file if it changed (a ConfigMap update swaps a symlink,
 // which changes the inode stat() follows). Returns true if settings changed.
-static bool reloadIfChanged(ConfigThread &t) {
+static bool reloadIfChanged(ConfigState &t) {
   FileStamp st;
   struct stat sb;
   if (stat(t.path, &sb) == 0) {
@@ -272,16 +271,14 @@ static bool gateAt(const LiveSettings &s, uint64_t now, uint64_t &next) {
   return on;
 }
 
-static void sleepUntil(uint64_t ns) {
-  struct timespec ts = {(time_t)(ns / kNsPerSec), (long)(ns % kNsPerSec)};
-  while (clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &ts, nullptr) ==
-         EINTR) {
-  }
-}
+std::atomic<uint64_t> g_nextConfigStepNs{UINT64_MAX};
 
-// One pass of the config thread: re-read the file if due, then update the
-// gate and kernel activity recording. Returns when the next pass is due.
-static uint64_t configStep(ConfigThread &t, uint64_t &nextFileCheck) {
+static ConfigState g_config;      // touched only by the thread holding the step
+static uint64_t g_nextFileCheck;  // likewise
+
+// Re-read the file if due, then update the gate and kernel activity
+// recording. Returns when the next step is due.
+static uint64_t configStep(ConfigState &t, uint64_t &nextFileCheck) {
   uint64_t now = realtimeNs();
   if (t.path && now >= nextFileCheck) {
     if (reloadIfChanged(t))
@@ -297,15 +294,19 @@ static uint64_t configStep(ConfigThread &t, uint64_t &nextFileCheck) {
   return next;
 }
 
-static void *configThreadMain(void *arg) {
-  auto &t = *static_cast<ConfigThread *>(arg);
-  uint64_t nextFileCheck = realtimeNs() + kFileCheckNs;
-  for (;;)
-    sleepUntil(configStep(t, nextFileCheck));
+void runtimeConfigStep() {
+  uint64_t due = g_nextConfigStepNs.load(std::memory_order_relaxed);
+  // Claim the step; other threads see UINT64_MAX and skip until it's done.
+  if (due == UINT64_MAX ||
+      !g_nextConfigStepNs.compare_exchange_strong(due, UINT64_MAX,
+                                                  std::memory_order_acquire))
+    return;
+  uint64_t next = configStep(g_config, g_nextFileCheck);
+  g_nextConfigStepNs.store(next, std::memory_order_release);
 }
 
 void startRuntimeConfig() {
-  static ConfigThread t; // lives as long as the thread; never destroyed early
+  ConfigState &t = g_config;
   t.path = getenv("PARCAGPU_CONFIG_FILE");
   if (t.path && *t.path == '\0')
     t.path = nullptr;
@@ -313,25 +314,11 @@ void startRuntimeConfig() {
   t.cur = t.env;
   logSettings("env", t.cur);
 
-  // Settle the gate and kernel recording before the first kernel runs.
-  uint64_t nextFileCheck = 0;
-  configStep(t, nextFileCheck);
-
-  // Block signals in the thread so the host process's handlers never run on
-  // it.
-  sigset_t all, old;
-  sigfillset(&all);
-  pthread_sigmask(SIG_SETMASK, &all, &old);
-  pthread_t tid;
-  int rc = pthread_create(&tid, nullptr, configThreadMain, &t);
-  pthread_sigmask(SIG_SETMASK, &old, nullptr);
-  if (rc != 0) {
-    DEBUG_PRINTF("[PARCAGPU] can't start config thread: %s\n", strerror(rc));
-    fireError(rc, "can't start config thread", "runtime_config");
-    return;
-  }
-  pthread_setname_np(tid, "parcagpu-config");
-  pthread_detach(tid);
+  // Settle the gate and kernel recording before the first kernel runs; CUDA
+  // API callbacks drive later steps (runtimeConfigTick).
+  g_nextFileCheck = 0;
+  g_nextConfigStepNs.store(configStep(t, g_nextFileCheck),
+                           std::memory_order_release);
 }
 
 } // namespace parcagpu

@@ -5,6 +5,8 @@
 #define PARCAGPU_RUNTIME_CONFIG_H_
 
 #include <atomic>
+#include <cstdint>
+#include <time.h>
 
 namespace parcagpu {
 
@@ -38,11 +40,26 @@ inline bool profilingActive() {
   return g_profilingActive.load(std::memory_order_relaxed);
 }
 
-// Read the env settings, settle the gate, and start the background thread
-// that re-reads the config file, follows the duty cycle, and turns kernel
-// activity recording on and off as profilers attach and detach. Call once,
-// from CuptiProfiler::initialize() after kernel activity is enabled.
+// Read the env settings and settle the gate and kernel activity recording.
+// Call once, from CuptiProfiler::initialize() after kernel activity is
+// enabled. There is no background thread: runtimeConfigTick(), called on
+// every CUPTI callback, re-reads the config file, follows the duty cycle and
+// turns kernel activity recording on and off as profilers attach and detach.
 void startRuntimeConfig();
+
+// When the next config step is due (CLOCK_REALTIME ns); UINT64_MAX while a
+// step runs or before startRuntimeConfig().
+extern std::atomic<uint64_t> g_nextConfigStepNs;
+void runtimeConfigStep();
+
+// Cheap enough for every callback: one coarse clock read and a load.
+inline void runtimeConfigTick() {
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME_COARSE, &ts);
+  uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+  if (now >= g_nextConfigStepNs.load(std::memory_order_relaxed))
+    runtimeConfigStep();
+}
 
 // Defined in cupti.cpp, which owns the state these settings feed.
 LiveSettings currentLiveSettings(); // the rate/debug fields as set from env

@@ -557,6 +557,7 @@ private:
     // whole body as untrusted and swallow exceptions at the boundary.
     try {
     auto &profiler = CuptiProfiler::instance();
+    runtimeConfigTick();
 
     if (domain == CUPTI_CB_DOMAIN_RESOURCE) {
       // Handle resource callbacks for PC sampling (only if enabled)
