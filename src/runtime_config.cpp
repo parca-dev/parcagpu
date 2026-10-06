@@ -237,8 +237,11 @@ static bool reloadIfChanged(ConfigThread &t) {
 }
 
 static void setActive(bool on) {
-  if (g_profilingActive.exchange(on, std::memory_order_relaxed) != on)
-    DEBUG_PRINTF("[PARCAGPU] profiling %s\n", on ? "on" : "off");
+  if (g_profilingActive.exchange(on, std::memory_order_relaxed) == on)
+    return;
+  DEBUG_PRINTF("[PARCAGPU] profiling %s\n", on ? "on" : "off");
+  if (on)
+    onProfilingResumed();
 }
 
 // Record kernel activity only while profiling is on and a profiler is

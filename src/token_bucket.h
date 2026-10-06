@@ -24,6 +24,14 @@ public:
       tokens = rate;
   }
 
+  // Drop saved-up tokens, e.g. after a pause in which they accumulated, so
+  // the next burst is at most one token.
+  void reset() {
+    if (tokens > 1.0)
+      tokens = 1.0;
+    lastRefillNs = 0;
+  }
+
   // Returns true if a token was available and consumed.
   bool tryAcquire() {
     refill();

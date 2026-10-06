@@ -12,6 +12,8 @@
 #        ENABLED=1, PC_SAMPLING_RATE=0               -> on, PC sampling paused
 #        ENABLED=1                                   -> PC sampling resumes
 #      No window may open before the last rewrite.
+#   4. 200 ms duty windows: correlations per window stay at the rate limit,
+#      without a burst of tokens saved up while off (needs bpftrace).
 #
 # Prerequisites: make local
 set -euo pipefail
@@ -34,7 +36,7 @@ check() { # check <name> <condition-result 0/1> <detail>
 }
 starts() { sed -n 's/.*pc_sampling summary: starts=\([0-9]*\).*/\1/p' "$1"; }
 # Fractional seconds of the debug-log timestamps on lines matching $2.
-phases() { grep "$2" "$1" | sed -n 's/^\[[0-9]*\.\([0-9]\{3\}\).*/\1/p'; }
+phases() { { grep "$2" "$1" || true; } | sed -n 's/^\[[0-9]*\.\([0-9]\{3\}\).*/\1/p'; }
 harness() { "$TEST_BIN" "$LIB" --threads=2 --num-gpus=2 --launch-rate=500 "$@"; }
 
 # Correlation probes only fire with a consumer attached; bpftrace provides one.
@@ -44,7 +46,17 @@ if command -v bpftrace >/dev/null && sudo -n true 2>/dev/null; then
 fi
 attach() { # attach <pid>: enable the cuda_correlation probe until the pid exits
   [ "$have_bpftrace" = 1 ] || return 0
-  sudo -n bpftrace -p "$1" -e \
+  # $1 is a (sub)shell running harness(); find test_cupti_prof itself -- the
+  # newest one, as tests run one at a time -- and wait for the shim to be
+  # mapped (bpftrace -p resolves probes once).
+  local i pid=""
+  for i in $(seq 1 50); do
+    pid="$(pgrep -n -x test_cupti_prof || true)"
+    [ -n "$pid" ] && grep -q libparcagpucupti "/proc/$pid/maps" 2>/dev/null && break
+    sleep 0.1
+  done
+  [ -n "$pid" ] || { echo "attach: no test_cupti_prof running" >&2; return 0; }
+  sudo -n bpftrace -p "$pid" -e \
     "usdt:$LIB:parcagpu:cuda_correlation { @n = count(); }" >/dev/null 2>&1 &
 }
 
@@ -74,6 +86,27 @@ if [ "$have_bpftrace" = 1 ]; then
     "$([ "$on" -gt 0 ] && [ "$off" = 0 ] && echo 1 || echo 0)" "on=$on off=$off"
 else
   echo "skip duty: correlations (needs bpftrace and passwordless sudo)"
+fi
+
+# 4. Short duty windows: the rate-limit buckets must not save up tokens while
+#    profiling is off and burst them at the start of each window. Expect
+#    rate (100/s) x threads (2) x window (0.2 s) = 40 correlations per window.
+if [ "$have_bpftrace" = 1 ]; then
+  # PC sampling off: a sampling context bypasses the rate limit.
+  (unset PARCAGPU_PC_SAMPLING_RATE
+   PARCAGPU_DUTY_CYCLE=0.1 PARCAGPU_DUTY_PERIOD=2 harness --duration=9) \
+    >"$TMP/4.log" 2>&1 &
+  pid=$!
+  attach "$pid"
+  wait "$pid"
+  # Skip the first window: the probe may have attached part way through it.
+  max="$({ grep 'Inserted correlationId' "$TMP/4.log" || true; } |
+    sed -n 's/^\[\([0-9]*\)\..*/\1/p' | awk '{c[int($1/2)]++}
+      END {n = asorti(c, k); for (i = 2; i <= n; i++) if (c[k[i]] > m) m = c[k[i]]; print m + 0}')"
+  check "duty: no token burst per window" "$([ "$max" -gt 0 ] && [ "$max" -le 60 ] && echo 1 || echo 0)" \
+    "max $max correlations in a window, want <= 60"
+else
+  echo "skip duty: token burst (needs bpftrace and passwordless sudo)"
 fi
 
 # 3. Config file, rewritten (atomically, like a ConfigMap) while running.

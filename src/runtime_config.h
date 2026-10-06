@@ -47,6 +47,8 @@ void startRuntimeConfig();
 // Defined in cupti.cpp, which owns the state these settings feed.
 LiveSettings currentLiveSettings(); // the rate/debug fields as set from env
 void applyLiveSettings(const LiveSettings &s);
+// Called on each off->on transition of the gate.
+void onProfilingResumed();
 // Whether a profiler is consuming the kernel probes.
 bool profilerAttached();
 // Enable or disable CUPTI kernel activity recording. Returns false if CUPTI

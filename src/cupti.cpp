@@ -41,7 +41,8 @@ thread_local uint32_t runtimeEnterCorrelationId = 0;
 // Configured probe rates (tokens/sec), from env in init_debug and from the
 // config file (applyLiveSettings). Globals because the buckets below are
 // thread_local: setRate from one thread would only reach that thread's.
-// g_rateLimitGen bumps on every change so each thread re-applies them.
+// g_rateLimitGen bumps on every change, and whenever profiling resumes, so
+// each thread re-applies them and drops tokens saved up while paused.
 std::atomic<double> g_eagerRateLimit{100.0};
 std::atomic<double> g_graphRateLimit{20.0};
 std::atomic<uint32_t> g_rateLimitGen{1};
@@ -59,6 +60,8 @@ static inline void applyRateLimitsOnce() {
   if (applied != gen) {
     callbackLimiter.setRate(g_eagerRateLimit.load(std::memory_order_relaxed));
     graphCallbackLimiter.setRate(g_graphRateLimit.load(std::memory_order_relaxed));
+    callbackLimiter.reset();
+    graphCallbackLimiter.reset();
     applied = gen;
   }
 }
@@ -812,6 +815,10 @@ void applyLiveSettings(const LiveSettings &s) {
                                     std::memory_order_relaxed);
     resetPCProbability();
   }
+}
+
+void onProfilingResumed() {
+  g_rateLimitGen.fetch_add(1, std::memory_order_release);
 }
 
 bool profilerAttached() { return PARCAGPU_CUDA_CORRELATION_ENABLED(); }
