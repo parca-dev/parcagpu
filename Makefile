@@ -1,4 +1,4 @@
-.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-graph-rate-limit test-pc-contexts
+.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-graph-rate-limit test-pc-contexts test-runtime-config
 
 LIB_NAME = libparcagpucupti.so
 
@@ -171,6 +171,9 @@ test-graph-rate-limit: local
 # PC sampling start/stop bookkeeping across several mock contexts. No GPU/root.
 test-pc-contexts: local
 	test/test-pc-contexts.sh
+
+test-runtime-config: local
+	test/test-runtime-config.sh
 
 format:
 	@echo "=== Formatting source files ==="

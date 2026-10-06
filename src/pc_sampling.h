@@ -36,7 +36,7 @@
 namespace parcagpu {
 
 // Debug logging control — defined in cupti.cpp.
-extern bool debug_enabled;
+extern std::atomic<bool> debug_enabled;
 extern void init_debug();
 
 // Notify the PC rate controller of a batch of samples just drained from CUPTI.

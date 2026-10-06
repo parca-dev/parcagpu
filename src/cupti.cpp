@@ -20,12 +20,13 @@
 #include "correlation_filter.h"
 #include "env_config.h"
 #include "pc_sampling.h"
+#include "runtime_config.h"
 #include "token_bucket.h"
 
 namespace parcagpu {
 
 // Debug logging control
-bool debug_enabled = false;
+std::atomic<bool> debug_enabled{false};
 
 // Global correlation tracking instances
 static CorrelationFilter g_correlationFilter;
@@ -37,11 +38,14 @@ static std::atomic<uint32_t> g_bufferCycle{0};
 // runtime calls)
 thread_local uint32_t runtimeEnterCorrelationId = 0;
 
-// Configured probe rates (tokens/sec), read from env once in init_debug.
-// Globals because the buckets below are thread_local: setRate from init_debug
-// would only reach the single thread that ran it.
+// Configured probe rates (tokens/sec), from env in init_debug and from the
+// config file (applyLiveSettings). Globals because the buckets below are
+// thread_local: setRate from one thread would only reach that thread's.
+// g_rateLimitGen bumps on every change, and whenever profiling resumes, so
+// each thread re-applies them and drops tokens saved up while paused.
 std::atomic<double> g_eagerRateLimit{100.0};
 std::atomic<double> g_graphRateLimit{20.0};
+std::atomic<uint32_t> g_rateLimitGen{1};
 
 // Thread-local rate limiters. Graph launches get a separate, lower bucket
 // (PARCAGPU_GRAPH_RATE_LIMIT) so graph replays don't flood cupti_events and
@@ -49,13 +53,16 @@ std::atomic<double> g_graphRateLimit{20.0};
 thread_local TokenBucket callbackLimiter(100.0);
 thread_local TokenBucket graphCallbackLimiter(20.0);
 
-// Copy the configured rates into this thread's buckets, once per thread.
+// Copy the configured rates into this thread's buckets when they change.
 static inline void applyRateLimitsOnce() {
-  thread_local bool applied = false;
-  if (!applied) {
+  thread_local uint32_t applied = 0;
+  uint32_t gen = g_rateLimitGen.load(std::memory_order_acquire);
+  if (applied != gen) {
     callbackLimiter.setRate(g_eagerRateLimit.load(std::memory_order_relaxed));
     graphCallbackLimiter.setRate(g_graphRateLimit.load(std::memory_order_relaxed));
-    applied = true;
+    callbackLimiter.reset();
+    graphCallbackLimiter.reset();
+    applied = gen;
   }
 }
 
@@ -104,7 +111,8 @@ static constexpr double kPCInitialProbabilityAtDefaultRate = 0.02;
 static constexpr double kPCDefaultTargetRate = 100.0;
 
 struct PCRateController {
-  double targetRate = kPCDefaultTargetRate;       // immutable after init
+  // From env in init_debug; the config file may change it (0 pauses).
+  std::atomic<double> targetRate{kPCDefaultTargetRate};
   std::atomic<double> probability{kPCInitialProbabilityAtDefaultRate};
   std::atomic<uint64_t> samplesTotal{0};
   std::atomic<uint64_t> lastCheckNs{0};
@@ -156,7 +164,9 @@ void recordPCSamples(uint64_t n) {
 // returns immediately unless kPCControlPeriodNs has elapsed since the last
 // adjustment. Safe under concurrent calls (CAS on lastCheckNs).
 static void controllerMaybeUpdate() {
-  if (g_pcController.targetRate <= 0.0)
+  const double targetRate =
+      g_pcController.targetRate.load(std::memory_order_relaxed);
+  if (targetRate <= 0.0)
     return;
   uint64_t now = nowNs();
   uint64_t last = g_pcController.lastCheckNs.load(std::memory_order_relaxed);
@@ -175,19 +185,27 @@ static void controllerMaybeUpdate() {
   if (elapsed == 0)
     return;
   double observedRate = (double)delta * 1e9 / (double)elapsed;
-  double err =
-      (observedRate - g_pcController.targetRate) / g_pcController.targetRate;
+  double err = (observedRate - targetRate) / targetRate;
   if (std::abs(err) <= kPCControlTolerance)
     return;
-  double ratio =
-      g_pcController.targetRate / std::max(observedRate, 1e-3);
+  double ratio = targetRate / std::max(observedRate, 1e-3);
   ratio = std::clamp(ratio, 1.0 / kPCControlStepShrink, kPCControlStepGrow);
   double oldP = g_pcController.probability.load(std::memory_order_relaxed);
   double newP = std::clamp(oldP * ratio, kPCProbMin, kPCProbMax);
   g_pcController.probability.store(newP, std::memory_order_relaxed);
   DEBUG_PRINTF("[PARCAGPU] PC rate controller: observed=%.2f target=%.2f "
                "old_p=%.5f new_p=%.5f\n",
-               observedRate, g_pcController.targetRate, oldP, newP);
+               observedRate, targetRate, oldP, newP);
+}
+
+// Initial dice-roll probability for the current target rate.
+static void resetPCProbability() {
+  double scaled = kPCInitialProbabilityAtDefaultRate *
+                  (g_pcController.targetRate.load(std::memory_order_relaxed) /
+                   kPCDefaultTargetRate);
+  double initP = std::clamp(scaled, kPCProbMin, kPCProbMax);
+  g_pcController.probability.store(initP, std::memory_order_relaxed);
+  g_pcController.lastCheckNs.store(nowNs(), std::memory_order_relaxed);
 }
 
 void init_debug() {
@@ -224,13 +242,7 @@ void init_debug() {
     // low for a window to open, the controller starves and can never
     // climb. Scaling avoids that for the common "user wants lots of
     // samples on a sparse workload" case.
-    {
-      double scaled = kPCInitialProbabilityAtDefaultRate *
-                      (g_pcController.targetRate / kPCDefaultTargetRate);
-      double initP = std::clamp(scaled, kPCProbMin, kPCProbMax);
-      g_pcController.probability.store(initP, std::memory_order_relaxed);
-    }
-    g_pcController.lastCheckNs.store(nowNs(), std::memory_order_relaxed);
+    resetPCProbability();
 
     validateEnvVars();
     initialized = true;
@@ -323,6 +335,7 @@ public:
     }
 
     DEBUG_PRINTF("[PARCAGPU] Successfully initialized CUPTI callbacks\n");
+    startRuntimeConfig();
     return true;
   }
 
@@ -330,6 +343,7 @@ public:
     if (!initialized.exchange(false)) {
       return; // Already cleaned up
     }
+    shuttingDown.store(true, std::memory_order_relaxed);
 
     DEBUG_PRINTF("[PARCAGPU] Cleanup started\n");
 
@@ -379,6 +393,11 @@ public:
     DEBUG_PRINTF("[PARCAGPU] Cleanup completed\n");
   }
 
+  bool pcSamplingOn() const { return pcSamplingEnabled; }
+
+  // Set once cleanup starts; the config thread then leaves CUPTI alone.
+  static inline std::atomic<bool> shuttingDown{false};
+
 private:
   std::atomic<bool> initialized{false};
   bool pcSamplingEnabled = false;
@@ -402,7 +421,9 @@ private:
 
   static void allocBuffer(uint8_t **buffer, size_t *bufferSize,
                           size_t *maxNumRecords) {
-    if (!PARCAGPU_CUDA_CORRELATION_ENABLED()) {
+    // Returning no buffer makes CUPTI drop kernel records, which is what
+    // keeps the shim's cost near zero while nothing consumes them.
+    if (!PARCAGPU_CUDA_CORRELATION_ENABLED() || !profilingActive()) {
       *buffer = nullptr;
       return;
     }
@@ -536,6 +557,7 @@ private:
     // whole body as untrusted and swallow exceptions at the boundary.
     try {
     auto &profiler = CuptiProfiler::instance();
+    runtimeConfigTick();
 
     if (domain == CUPTI_CB_DOMAIN_RESOURCE) {
       // Handle resource callbacks for PC sampling (only if enabled)
@@ -607,7 +629,8 @@ private:
             auto &st = g_pcSamplingState;
             uint64_t now = nowNs();
 
-            if (!st.active &&
+            if (!st.active && profilingActive() &&
+                g_pcController.targetRate.load(std::memory_order_relaxed) > 0 &&
                 (now - st.lastCheckNs >= kPCSamplingIntervalNs)) {
               st.lastCheckNs = now;
               const double p = g_pcController.probability.load(
@@ -641,13 +664,15 @@ private:
       // is still kernel-launch aligned: only check elapsed-time on a launch
       // EXIT, so the window starts and ends at kernel boundaries. Drain and
       // stop the window's own context, not this callback's: the thread may
-      // have switched devices since the window opened.
+      // have switched devices since the window opened. Once profiling is
+      // turned off, close the window on the next API EXIT of any kind.
       if (profiler.pcSamplingEnabled) {
         auto &st = g_pcSamplingState;
 
         if (st.active) {
-          if (isKernelLaunchCb &&
-              (nowNs() - st.windowStartNs >= kPCSamplingIntervalNs)) {
+          if (!profilingActive() ||
+              (isKernelLaunchCb &&
+               nowNs() - st.windowStartNs >= kPCSamplingIntervalNs)) {
             profiler.pcSampling.stop(st.ctx);
             st.active = false;
             st.ctx = nullptr;
@@ -660,8 +685,9 @@ private:
         profiler.pcSampling.emitMetadata();
       }
 
-      // Skip correlation/rate-limiter work when no profiler is attached.
-      if (!PARCAGPU_CUDA_CORRELATION_ENABLED())
+      // Skip correlation/rate-limiter work when no profiler is attached or
+      // profiling is turned off.
+      if (!PARCAGPU_CUDA_CORRELATION_ENABLED() || !profilingActive())
         return;
 
       const char *name =
@@ -759,6 +785,68 @@ private:
     }
   }
 };
+
+LiveSettings currentLiveSettings() {
+  LiveSettings s{};
+  s.debug = debug_enabled.load(std::memory_order_relaxed);
+  s.rateLimit = g_eagerRateLimit.load(std::memory_order_relaxed);
+  s.graphRateLimit = g_graphRateLimit.load(std::memory_order_relaxed);
+  s.pcSamplingRate = g_pcController.targetRate.load(std::memory_order_relaxed);
+  return s;
+}
+
+void applyLiveSettings(const LiveSettings &s) {
+  debug_enabled.store(s.debug, std::memory_order_relaxed);
+  if (s.rateLimit != g_eagerRateLimit.load(std::memory_order_relaxed) ||
+      s.graphRateLimit != g_graphRateLimit.load(std::memory_order_relaxed)) {
+    g_eagerRateLimit.store(s.rateLimit, std::memory_order_relaxed);
+    g_graphRateLimit.store(s.graphRateLimit, std::memory_order_relaxed);
+    g_rateLimitGen.fetch_add(1, std::memory_order_release);
+  }
+  if (s.pcSamplingRate !=
+      g_pcController.targetRate.load(std::memory_order_relaxed)) {
+    if (!CuptiProfiler::instance().pcSamplingOn() && s.pcSamplingRate > 0) {
+      DEBUG_PRINTF("[PARCAGPU] Warning: PC_SAMPLING_RATE has no effect: PC "
+                   "sampling is off (set PARCAGPU_PC_SAMPLING_RATE in the env "
+                   "to enable it at startup)\n");
+      fireError(0, "PC_SAMPLING_RATE needs PC sampling enabled at startup",
+                "config_file");
+    }
+    g_pcController.targetRate.store(s.pcSamplingRate,
+                                    std::memory_order_relaxed);
+    resetPCProbability();
+  }
+}
+
+void onProfilingResumed() {
+  g_rateLimitGen.fetch_add(1, std::memory_order_release);
+}
+
+bool profilerAttached() { return PARCAGPU_CUDA_CORRELATION_ENABLED(); }
+
+bool setKernelActivity(bool on) {
+  if (CuptiProfiler::shuttingDown.load(std::memory_order_relaxed))
+    return false;
+  CUptiResult r =
+      on ? proton::cupti::activityEnable<false>(
+               CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL)
+         : proton::cupti::activityDisable<false>(
+               CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+  if (r != CUPTI_SUCCESS) {
+    DEBUG_PRINTF("[PARCAGPU] kernel activity %s failed: %d\n",
+                 on ? "enable" : "disable", r);
+    return false;
+  }
+  DEBUG_PRINTF("[PARCAGPU] kernel activity recording %s\n", on ? "on" : "off");
+  // Hand back the partly filled buffer now, so its kernels reach the
+  // profiler promptly.
+  if (!on) {
+    if (auto fr = proton::cupti::activityFlushAll<false>(0);
+        fr != CUPTI_SUCCESS)
+      DEBUG_PRINTF("[PARCAGPU] activityFlushAll failed: %d\n", fr);
+  }
+  return true;
+}
 
 } // namespace parcagpu
 

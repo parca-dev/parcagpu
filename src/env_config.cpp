@@ -19,6 +19,10 @@ static const char *knownVars[] = {
     "PARCAGPU_SAMPLING_FACTOR",
     "PARCAGPU_PC_SAMPLING_RATE",
     "PARCAGPU_PC_HW_BUFFER_MB",
+    "PARCAGPU_CONFIG_FILE",
+    "PARCAGPU_ENABLED",
+    "PARCAGPU_DUTY_CYCLE",
+    "PARCAGPU_DUTY_PERIOD",
 };
 static constexpr size_t numKnownVars =
     sizeof(knownVars) / sizeof(knownVars[0]);

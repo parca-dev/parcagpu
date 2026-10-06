@@ -34,8 +34,40 @@ export CUDA_INJECTION64_PATH=/path/to/libparcagpucupti.so
 |---|---|---|
 | `PARCAGPU_DEBUG` | off | Enable debug logging |
 | `PARCAGPU_RATE_LIMIT` | 100 | Token-bucket rate limit for callback probes (events/sec per thread) |
-| `PARCAGPU_PC_SAMPLING_RATE` | (unset) | Setting this env var to a non-negative number enables PC sampling. The value is the target samples/sec; a controller adjusts the per-window dice-roll probability internally to converge on this rate. Set to 0 to enable sampling with rate control disabled (controller off, fixed probability). |
-| `PARCAGPU_SAMPLING_FACTOR` | 20 | Hardware PC sampling period (log2 cycles between samples). Only takes effect when PC sampling is enabled via `PARCAGPU_PC_SAMPLING_RATE`. |
+| `PARCAGPU_GRAPH_RATE_LIMIT` | 20 | Same, for graph launches (a separate bucket) |
+| `PARCAGPU_PC_SAMPLING_RATE` | (unset) | Setting this enables PC sampling. The value is the target samples/sec (0 or invalid means the default, 100); a controller adjusts the per-window dice-roll probability to converge on it. |
+| `PARCAGPU_SAMPLING_FACTOR` | (CUPTI's) | Hardware PC sampling period (log2 cycles between samples, 5-31). Unset uses CUPTI's per-GPU default. Only matters with PC sampling on. |
+| `PARCAGPU_PC_HW_BUFFER_MB` | (CUPTI's) | PC sampling hardware buffer size |
+| `PARCAGPU_ENABLED` | 1 | `0` turns profiling off: no kernel activity recording, no probes, no new PC sampling windows |
+| `PARCAGPU_DUTY_CYCLE` | 1 | Fraction (0-1] of each duty period that profiling is on |
+| `PARCAGPU_DUTY_PERIOD` | 10 | Duty period in seconds (>= 0.1). Periods are aligned to wall-clock time, so all processes on a node (e.g. tensor-parallel ranks) are on at the same time. |
+| `PARCAGPU_CONFIG_FILE` | (unset) | File of settings that can change while the process runs (see below) |
+
+Kernel activity recording only runs while a profiler is attached to the
+probes (and profiling is on), so the shim costs little until one attaches.
+
+#### Runtime config file
+
+`PARCAGPU_CONFIG_FILE` names a file, re-read about once a second (checked
+from the shim's CUDA API callbacks; the shim starts no threads), of
+`KEY=VALUE` lines using the variable names above (the `PARCAGPU_` prefix is
+optional; `#` starts a comment). A key in the file overrides the environment;
+removing it, or the file, reverts to the environment's value. Mounting the
+file from a ConfigMap (not via `subPath`, which never updates) lets you change
+every profiled process on a node at once.
+
+```
+# parcagpu.conf
+ENABLED=1
+DUTY_CYCLE=0.1
+DUTY_PERIOD=30
+RATE_LIMIT=50
+```
+
+Settable in the file: `DEBUG` (boolean), `RATE_LIMIT`, `GRAPH_RATE_LIMIT`,
+`PC_SAMPLING_RATE` (0 pauses PC sampling; PC sampling itself must be enabled
+in the environment at startup), `ENABLED`, `DUTY_CYCLE`, `DUTY_PERIOD`.
+`SAMPLING_FACTOR` and `PC_HW_BUFFER_MB` are environment-only.
 
 ### Monitoring with bpftrace
 
