@@ -122,7 +122,7 @@ struct cupti_nvtx_event {
   u64 timestamp_ns;   // offset 0   - CLOCK_MONOTONIC at callback entry
   u32 tid;            // offset 8
   u32 correlation_id; // offset 12
-  u32 domain_id;      // offset 16  - 0 = default (v1 always 0)
+  u32 domain_id;      // offset 16  - 0 = default; else see NVTX_RESOURCE_DOMAIN
   u16 kind;           // offset 20  - NVTX_KIND_*
   u16 flags;          // offset 22  - reserved; 0 in v1
   u32 color;          // offset 24  - ARGB; 0 if unset

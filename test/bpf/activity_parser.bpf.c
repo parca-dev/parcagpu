@@ -66,6 +66,8 @@ struct cubin_event {
 #define EVENT_TYPE_CUBIN_UNLOADED 3
 #define EVENT_TYPE_PC_SAMPLE 4
 #define EVENT_TYPE_ERROR 5
+#define EVENT_TYPE_NVTX 6
+#define EVENT_TYPE_NVTX_NAME 7
 
 // PC sample event sent to user-space.
 struct pc_sample_event {
@@ -88,6 +90,28 @@ struct error_event {
   char message[MAX_ERROR_MSG];
   char component[MAX_ERROR_COMPONENT];
 };
+
+// NVTX event sent to user-space: the collector's record plus its message.
+struct nvtx_event {
+  u32 event_type; // EVENT_TYPE_NVTX
+  u32 _pad;
+  struct cupti_nvtx_event data;
+  char message[NVTX_MAX_MSG_LEN];
+};
+
+// NVTX resource name (thread, stream, device, domain).
+#define MAX_NVTX_NAME 128
+struct nvtx_name_event {
+  u32 event_type; // EVENT_TYPE_NVTX_NAME
+  u32 kind;       // NVTX_RESOURCE_*
+  u64 id;
+  char name[MAX_NVTX_NAME];
+};
+
+// Upper bound on events per nvtx_event_batch fire. Matches the largest
+// PARCAGPU_NVTX_BATCH_SIZE CMake allows; larger batches are truncated and
+// counted in STAT_NVTX_TRUNCATED.
+#define MAX_NVTX_BATCH 1024
 
 // Ring buffer for sending events to user-space.
 struct {
@@ -117,7 +141,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, u32);
     __type(value, u64);
-    __uint(max_entries, 4);
+    __uint(max_entries, 8);
 } stats SEC(".maps");
 
 enum stat_key {
@@ -125,14 +149,19 @@ enum stat_key {
   STAT_ACTIVITIES = 1, // total activity records scanned
   STAT_KERNELS = 2,    // kernel activities emitted
   STAT_DROPS = 3,      // ring buffer full (events dropped)
+  STAT_NVTX_BATCHES = 4,   // nvtx_event_batch probe invocations
+  STAT_NVTX_EVENTS = 5,    // NVTX records read from batches
+  STAT_NVTX_TRUNCATED = 6, // NVTX records past MAX_NVTX_BATCH (skipped)
 };
 
-static __always_inline void bump_stat(enum stat_key key) {
+static __always_inline void add_stat(enum stat_key key, u64 n) {
   u32 k = key;
   u64 *val = bpf_map_lookup_elem(&stats, &k);
   if (val)
-    __sync_fetch_and_add(val, 1);
+    __sync_fetch_and_add(val, n);
 }
+
+static __always_inline void bump_stat(enum stat_key key) { add_stat(key, 1); }
 
 SEC("usdt/parcagpu/activity_batch")
 int BPF_USDT(handle_activity_batch, u64 ptrs_base, u32 num_activities) {
@@ -364,6 +393,64 @@ int BPF_USDT(handle_error, s32 code, u64 message_ptr, u64 component_ptr) {
   if (component_ptr)
     bpf_probe_read_user_str(evt->component, sizeof(evt->component),
                             (void *)component_ptr);
+  bpf_ringbuf_submit(evt, 0);
+  return 0;
+}
+
+SEC("usdt/parcagpu/nvtx_event_batch")
+int BPF_USDT(handle_nvtx_event_batch, u64 ptrs_base, u32 count) {
+  bump_stat(STAT_NVTX_BATCHES);
+
+  if (count > MAX_NVTX_BATCH) {
+    add_stat(STAT_NVTX_TRUNCATED, count - MAX_NVTX_BATCH);
+    count = MAX_NVTX_BATCH;
+  }
+
+  for (u32 i = 0; i < MAX_NVTX_BATCH; i++) {
+    if (i >= count)
+      break;
+
+    u64 rec_ptr = 0;
+    if (bpf_probe_read_user(&rec_ptr, sizeof(rec_ptr),
+                            (void *)(ptrs_base + (u64)i * sizeof(u64))) != 0 ||
+        rec_ptr == 0)
+      continue;
+
+    struct nvtx_event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+    if (!evt) {
+      bump_stat(STAT_DROPS);
+      continue;
+    }
+    if (bpf_probe_read_user(&evt->data, sizeof(evt->data), (void *)rec_ptr) !=
+        0) {
+      bpf_ringbuf_discard(evt, 0);
+      continue;
+    }
+    bump_stat(STAT_NVTX_EVENTS);
+    evt->event_type = EVENT_TYPE_NVTX;
+    evt->_pad = 0;
+    evt->message[0] = '\0';
+    if (evt->data.message_ptr)
+      bpf_probe_read_user_str(evt->message, sizeof(evt->message),
+                              (void *)evt->data.message_ptr);
+    bpf_ringbuf_submit(evt, 0);
+  }
+  return 0;
+}
+
+SEC("usdt/parcagpu/nvtx_resource_name")
+int BPF_USDT(handle_nvtx_resource_name, u32 kind, u64 id, u64 name_ptr) {
+  struct nvtx_name_event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+  if (!evt) {
+    bump_stat(STAT_DROPS);
+    return 0;
+  }
+  evt->event_type = EVENT_TYPE_NVTX_NAME;
+  evt->kind = kind;
+  evt->id = id;
+  evt->name[0] = '\0';
+  if (name_ptr)
+    bpf_probe_read_user_str(evt->name, sizeof(evt->name), (void *)name_ptr);
   bpf_ringbuf_submit(evt, 0);
   return 0;
 }

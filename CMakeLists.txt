@@ -218,4 +218,20 @@ if(BUILD_TESTS)
     set_target_properties(test_nvtx PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
+
+    # Real header-only nvtx3 client for test-nvtx-real.sh. Finds parcagpu
+    # only through NVTX_INJECTION64_PATH; no CUDA.
+    add_executable(nvtx_client
+        test/nvtx_client.c
+    )
+    target_include_directories(nvtx_client PRIVATE
+        ${CUDA_INCLUDE_DIR}
+    )
+    target_link_libraries(nvtx_client
+        dl
+        pthread
+    )
+    set_target_properties(nvtx_client PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
 endif()
