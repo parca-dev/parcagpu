@@ -38,6 +38,8 @@ static std::atomic<uint32_t> g_bufferCycle{0};
 // runtime calls)
 thread_local uint32_t runtimeEnterCorrelationId = 0;
 
+uint32_t currentRuntimeCorrelationId() { return runtimeEnterCorrelationId; }
+
 // Configured probe rates (tokens/sec), read from env once in init_debug.
 // Globals because the buckets below are thread_local: setRate from init_debug
 // would only reach the single thread that ran it.
@@ -302,11 +304,9 @@ public:
       proton::setResourceCallbacks(subscriber, /*enable=*/true);
     }
 
-    // Subscribe to NVTX domain. enable() sets NVTX_INJECTION64_PATH so the
-    // NVTX shim attaches; failure here is non-fatal (NVTX is auxiliary).
-    if (!nvtxCollector.enable(subscriber)) {
-      DEBUG_PRINTF("[PARCAGPU] NVTX subscription partially failed (non-fatal)\n");
-    }
+    // NVTX goes through our own injection (nvtx_injection.cpp), not CUPTI.
+    // Point NVTX clients that haven't initialized yet at this library.
+    parcagpu::nvtx::onCudaInjected();
 
     // Register activity buffer callbacks (using Proton's pattern)
     result = proton::cupti::activityRegisterCallbacks<true>(allocBuffer,
@@ -358,11 +358,10 @@ public:
       if (pcSamplingEnabled) {
         proton::setResourceCallbacks(subscriber, /*enable=*/false);
       }
-      nvtxCollector.disable(subscriber);
     }
     // Flush this thread's pending NVTX batch; other live threads drain
     // via the pthread_key destructor on their own exit.
-    nvtxCollector.flushCurrentThread();
+    parcagpu::nvtx::flushCurrentThread();
 
     // Cleanup runs from atexit and may also reach us via a libcupti callback
     // whose caller wasn't built with C++ EH; throwing from here aborts the
@@ -397,9 +396,6 @@ private:
 
   // PC sampling state — owned by this profiler, destroyed with it.
   parcagpu::PCSampling pcSampling;
-
-  // NVTX collector — owns per-thread batching state via pthread_key.
-  parcagpu::NvtxCollector nvtxCollector;
 
   // Outstanding event counter for flushing
   size_t outstandingEvents = 0;
@@ -598,15 +594,6 @@ private:
       default:
         break;
       }
-    } else if (domain == CUPTI_CB_DOMAIN_NVTX) {
-      DEBUG_PRINTF("[PARCAGPU] NVTX domain callback: cbid=%u\n", cbid);
-      // NVTX callbacks fire once per call (no ENTER/EXIT split). Pass the
-      // calling thread's most recent runtime correlation so NVTX events
-      // that bracket a CUDA call can be joined to its kernel_executed
-      // probe later. device_id is resolved inside the collector via
-      // cuCtxGetDevice for the correlation_id==0 case.
-      profiler.nvtxCollector.onCallback(cbid, cbdata_void,
-                                        runtimeEnterCorrelationId);
     } else {
       // Handle both Runtime and Driver API callbacks
       const CUpti_CallbackData *cbdata =
