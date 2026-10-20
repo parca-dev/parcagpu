@@ -30,7 +30,7 @@ enum nvtx_event_kind {
 // joining correlation_id against the kernel_executed probe stream when one
 // is in flight.
 struct nvtx_event {
-  uint64_t timestamp_ns;     // CLOCK_MONOTONIC at callback entry
+  uint64_t timestamp_ns;     // CLOCK_MONOTONIC (not wall clock) at the NVTX call
   uint32_t tid;              // syscall(SYS_gettid)
   uint32_t correlation_id;   // in-flight CUDA runtime correlation; 0 if none
   uint32_t domain_id;        // 0 = default domain; else see NVTX_RESOURCE_DOMAIN

@@ -92,7 +92,6 @@ add_custom_command(
 set(PROTON_SOURCES
     ${PROTON_DIR}/csrc/lib/Driver/GPU/CuptiApi.cpp
     ${PROTON_DIR}/csrc/lib/Driver/GPU/CudaApi.cpp
-    ${PROTON_DIR}/csrc/lib/Driver/GPU/NvtxApi.cpp
     ${PROTON_DIR}/csrc/lib/Profiler/Cupti/CuptiCallbacks.cpp
 )
 
