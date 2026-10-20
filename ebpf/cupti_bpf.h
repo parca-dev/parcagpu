@@ -113,6 +113,7 @@ struct cupti_pc_data {
 #define NVTX_RESOURCE_CUDA_STREAM 2
 #define NVTX_RESOURCE_CUDA_DEVICE 3
 #define NVTX_RESOURCE_CUDA_KERNEL 4
+#define NVTX_RESOURCE_DOMAIN      5
 
 // Must match parcagpu/src/nvtx_collector.cpp kMsgCap.
 #define NVTX_MAX_MSG_LEN 240

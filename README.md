@@ -28,6 +28,28 @@ export CUDA_INJECTION64_PATH=/path/to/libparcagpucupti.so
 ./my_cuda_app
 ```
 
+### NVTX Annotations
+
+The library is also an NVTX injection library (`InitializeInjectionNvtx2`).
+To capture NVTX ranges and marks (torch.cuda.nvtx, the Python `nvtx`
+package, TensorRT-LLM, cuDNN, ...), point `NVTX_INJECTION64_PATH` at the same
+library:
+
+```bash
+export CUDA_INJECTION64_PATH=/path/to/libparcagpucupti.so
+export NVTX_INJECTION64_PATH=/path/to/libparcagpucupti.so
+./my_cuda_app
+```
+
+Each NVTX client copy loads its injection on its first NVTX call. Libraries
+often make that call before CUDA initializes (at import time), and a client
+that finds no injection stays a no-op for the rest of the process. So set
+`NVTX_INJECTION64_PATH` in the launcher. As a fallback, parcagpu sets it at
+`cuInit` if it's unset, which only covers clients that haven't made an NVTX
+call yet. The injection slot holds one library, so this can't be combined
+with Nsight Systems' NVTX capture. Events are only recorded while a consumer
+is attached to the `nvtx_event_batch` probe.
+
 ### Environment Variables
 
 | Variable | Default | Description |
@@ -102,6 +124,8 @@ Defined in `src/probes.d`, provider `parcagpu`:
 | `cubin_loaded` | cubinCrc, cubin, cubinSize | Module load event |
 | `cubin_unloaded` | cubinCrc | Module unload event |
 | `error` | code, message, component | Profiler error event |
+| `nvtx_event_batch` | ptrs, count | Batch of NVTX events (`struct nvtx_event`, `src/nvtx.h`); flushed at 256 events or when the oldest is 100ms old |
+| `nvtx_resource_name` | kind, id, name | NVTX name for an OS thread, CUDA device/stream or domain (`NVTX_RESOURCE_*`) |
 
 ## Requirements
 

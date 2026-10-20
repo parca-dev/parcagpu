@@ -16,11 +16,11 @@ extern "C" {
 // Layout must not change without coordinating with parca-prof's BPF and Go
 // interpreter (support/ebpf/cuda.ebpf.c, interpreter/gpu/nvtx.go).
 enum nvtx_event_kind {
-  NVTX_KIND_RANGE_PUSH  = 1,  // nvtxRangePushA / nvtxRangePushEx
-  NVTX_KIND_RANGE_POP   = 2,  // nvtxRangePop
-  NVTX_KIND_RANGE_START = 3,  // nvtxRangeStartA / nvtxRangeStartEx
-  NVTX_KIND_RANGE_END   = 4,  // nvtxRangeEnd
-  NVTX_KIND_MARK        = 5,  // nvtxMarkA / nvtxMarkEx
+  NVTX_KIND_RANGE_PUSH  = 1,  // nvtx[Domain]RangePush{A,Ex}
+  NVTX_KIND_RANGE_POP   = 2,  // nvtx[Domain]RangePop
+  NVTX_KIND_RANGE_START = 3,  // nvtx[Domain]RangeStart{A,Ex}
+  NVTX_KIND_RANGE_END   = 4,  // nvtx[Domain]RangeEnd
+  NVTX_KIND_MARK        = 5,  // nvtx[Domain]Mark{A,Ex}
 };
 
 // device_id is captured inline so that NVTX events with correlation_id == 0
@@ -32,8 +32,8 @@ enum nvtx_event_kind {
 struct nvtx_event {
   uint64_t timestamp_ns;     // CLOCK_MONOTONIC at callback entry
   uint32_t tid;              // syscall(SYS_gettid)
-  uint32_t correlation_id;   // current CUPTI correlation; 0 if none
-  uint32_t domain_id;        // 0 = default domain (v1 only emits 0)
+  uint32_t correlation_id;   // in-flight CUDA runtime correlation; 0 if none
+  uint32_t domain_id;        // 0 = default domain; else see NVTX_RESOURCE_DOMAIN
   uint16_t kind;             // enum nvtx_event_kind
   uint16_t flags;            // reserved; 0 in v1
   uint32_t color;            // ARGB from nvtxEventAttributes_t::color; 0 if unset
@@ -49,6 +49,10 @@ enum nvtx_resource_kind {
   NVTX_RESOURCE_CUDA_STREAM = 2,
   NVTX_RESOURCE_CUDA_DEVICE = 3,
   NVTX_RESOURCE_CUDA_KERNEL = 4,
+  // id is the nvtx_event domain_id, name the nvtxDomainCreateA name. Fired
+  // on domain creation and re-fired periodically while the domain is in use,
+  // so a consumer that attached late still learns the name.
+  NVTX_RESOURCE_DOMAIN      = 5,
 };
 
 #ifdef __cplusplus

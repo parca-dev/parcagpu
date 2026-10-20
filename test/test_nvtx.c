@@ -1,198 +1,284 @@
 // Copyright 2026 The Parca Authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Focused unit test for NVTX callback handling in libparcagpucupti.so.
-// The library subscribes to CUPTI_CB_DOMAIN_NVTX during InitializeInjection;
-// we then synthesize NVTX cbdata and dispatch it via the registered callback
-// (resolved through the mock CUPTI's __cupti_runtime_api_callback global),
-// and assert via the test-only `parcagpu_nvtx_test_*` accessors that the
-// collector captured / batched / named as expected.
+// Focused unit test for the NVTX injection in libparcagpucupti.so. The test
+// plays the part of an NVTX v3 client copy: it builds the per-module function
+// tables a client exposes through its export table, calls
+// InitializeInjectionNvtx2, and then calls through whatever the library
+// installed. Assertions go through the test-only `parcagpu_nvtx_test_*`
+// accessors.
 //
 // No GPU, no live USDT consumer. The collector's `force_capture` test hook
 // makes the early-exit (semaphore-cold) path always proceed, so we can
 // observe behavior in this environment.
 
-#include <assert.h>
+#define _GNU_SOURCE // dladdr
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
-#include <cuda.h>
-#include <cupti.h>
-// cupti.h transitively includes cupti_nvtx_cbid.h on CUDA 12.x.
+#define NVTX_NO_IMPL
+#include <nvtx3/nvToolsExt.h>
 
-// ---- NVTX param struct shadows (copied from generated_nvtx_meta.h) ------
-// The library's collector reads these layouts; we synthesize them here.
+#include "../src/nvtx.h"
+
+// ---- A fake NVTX client ----------------------------------------------------
 
 typedef struct {
-  const char *message;
-} nvtx_RangePushA_params;
-typedef struct {
-  void *dummy;
-} nvtx_RangePop_params;
-typedef struct {
-  const char *message;
-} nvtx_MarkA_params;
-typedef struct {
-  const char *message;
-} nvtx_RangeStartA_params;
-typedef struct {
-  uint64_t id;
-} nvtx_RangeEnd_params;
-typedef struct {
-  uint32_t threadId;
-  const char *name;
-} nvtx_NameOsThreadA_params;
-typedef struct {
-  void *stream;
-  const char *name;
-} nvtx_NameCudaStreamA_params;
+  NvtxFunctionPointer core[NVTX_CBID_CORE_SIZE];
+  NvtxFunctionPointer core2[NVTX_CBID_CORE2_SIZE];
+  NvtxFunctionPointer cuda[NVTX_CBID_CUDA_SIZE];
+  NvtxFunctionPointer cudart[NVTX_CBID_CUDART_SIZE];
+  NvtxFunctionPointer *coreTbl[NVTX_CBID_CORE_SIZE];
+  NvtxFunctionPointer *core2Tbl[NVTX_CBID_CORE2_SIZE];
+  NvtxFunctionPointer *cudaTbl[NVTX_CBID_CUDA_SIZE];
+  NvtxFunctionPointer *cudartTbl[NVTX_CBID_CUDART_SIZE];
+} Client;
 
-// Same layout as the collector's nvtxEventAttributes_v2 shadow.
-typedef struct {
-  uint16_t version;
-  uint16_t size;
-  uint32_t category;
-  int32_t  colorType;
-  uint32_t color;
-  int32_t  payloadType;
-  int32_t  reserved0;
-  union { uint64_t ull; int64_t ll; double d; uint32_t ui; int32_t i; float f; } payload;
-  int32_t  messageType;
-  union { const char *ascii; const void *wide; } message;
-} nvtx_EventAttribs;
+// GetModuleFunctionTable has no context argument, so the export table of
+// whichever client is initializing is selected through this global.
+static Client *g_initClient;
 
-// ---- Function-pointer types for the dispatched callback + accessors -----
+static int getModuleFunctionTable(NvtxCallbackModule m, NvtxFunctionTable *out,
+                                  unsigned int *size) {
+  Client *c = g_initClient;
+  switch (m) {
+  case NVTX_CB_MODULE_CORE:   *out = c->coreTbl;   *size = NVTX_CBID_CORE_SIZE;   return 1;
+  case NVTX_CB_MODULE_CORE2:  *out = c->core2Tbl;  *size = NVTX_CBID_CORE2_SIZE;  return 1;
+  case NVTX_CB_MODULE_CUDA:   *out = c->cudaTbl;   *size = NVTX_CBID_CUDA_SIZE;   return 1;
+  case NVTX_CB_MODULE_CUDART: *out = c->cudartTbl; *size = NVTX_CBID_CUDART_SIZE; return 1;
+  default: return 0;
+  }
+}
 
-typedef void (*CuptiCb_t)(void *, CUpti_CallbackDomain, CUpti_CallbackId,
-                          const void *);
+static const NvtxExportTableCallbacks g_callbacks = {
+    sizeof(NvtxExportTableCallbacks), getModuleFunctionTable};
+
+static const void *getExportTable(uint32_t id) {
+  return id == NVTX_ETID_CALLBACKS ? &g_callbacks : NULL;
+}
+
+static void clientInit(Client *c) {
+  memset(c, 0, sizeof(*c));
+  for (int i = 0; i < NVTX_CBID_CORE_SIZE; ++i) c->coreTbl[i] = &c->core[i];
+  for (int i = 0; i < NVTX_CBID_CORE2_SIZE; ++i) c->core2Tbl[i] = &c->core2[i];
+  for (int i = 0; i < NVTX_CBID_CUDA_SIZE; ++i) c->cudaTbl[i] = &c->cuda[i];
+  for (int i = 0; i < NVTX_CBID_CUDART_SIZE; ++i) c->cudartTbl[i] = &c->cudart[i];
+}
+
+// Typed views of the installed slots.
+typedef void (*MarkA_t)(const char *);
+typedef int (*PushA_t)(const char *);
+typedef int (*PushEx_t)(const nvtxEventAttributes_t *);
+typedef int (*Pop_t)(void);
+typedef nvtxRangeId_t (*StartA_t)(const char *);
+typedef void (*End_t)(nvtxRangeId_t);
+typedef void (*NameOsThreadA_t)(uint32_t, const char *);
+typedef nvtxDomainHandle_t (*DomainCreateA_t)(const char *);
+typedef nvtxStringHandle_t (*RegisterStringA_t)(nvtxDomainHandle_t, const char *);
+typedef int (*DomainPushEx_t)(nvtxDomainHandle_t, const nvtxEventAttributes_t *);
+typedef int (*DomainPop_t)(nvtxDomainHandle_t);
+typedef void (*NameCudaStreamA_t)(void *, const char *);
+
+// ---- Library hooks -----------------------------------------------------------
+
+typedef int (*InitNvtx_t)(NvtxGetExportTableFunc_t);
 typedef int (*InitFn_t)(void);
 typedef void (*ForceCapFn_t)(int);
 typedef uint64_t (*StatFn_t)(void);
 typedef void (*ResetFn_t)(void);
+typedef const char *(*LastEventFn_t)(struct nvtx_event *);
 
 static void fail(const char *what) {
   fprintf(stderr, "FAIL: %s\n", what);
   exit(1);
 }
 
-static void fire(CuptiCb_t cb, void *ud, CUpti_CallbackId cbid,
-                 const void *params, const void *retval) {
-  CUpti_NvtxData nd;
-  memset(&nd, 0, sizeof(nd));
-  nd.functionName = "(test)";
-  nd.functionParams = params;
-  nd.functionReturnValue = retval;
-  cb(ud, CUPTI_CB_DOMAIN_NVTX, cbid, &nd);
-}
+#define EXPECT(cond, what)                                                     \
+  do {                                                                         \
+    if (!(cond))                                                               \
+      fail(what);                                                              \
+  } while (0)
 
 int main(void) {
   const char *libpath = getenv("PARCAGPU_TEST_LIB");
   if (!libpath)
     libpath = "./libparcagpucupti.so";
+  unsetenv("NVTX_INJECTION64_PATH");
 
   void *h = dlopen(libpath, RTLD_NOW | RTLD_GLOBAL);
   if (!h)
     fail(dlerror());
 
-  InitFn_t init = (InitFn_t)dlsym(h, "InitializeInjection");
-  if (!init)
-    fail("missing InitializeInjection");
-  if (init() != 1)
-    fail("InitializeInjection returned non-1");
-
-  // Resolve the mock CUPTI's stored callback + userdata; the lib registered
-  // these via cuptiSubscribe during init.
-  void **cb_slot = (void **)dlsym(RTLD_DEFAULT, "__cupti_runtime_api_callback");
-  void **ud_slot = (void **)dlsym(RTLD_DEFAULT, "__cupti_runtime_api_userdata");
-  if (!cb_slot || !*cb_slot)
-    fail("mock callback not registered");
-  CuptiCb_t cb = (CuptiCb_t)*cb_slot;
-  void *ud = ud_slot ? *ud_slot : NULL;
-
-  // Test hooks.
+  InitNvtx_t initNvtx = (InitNvtx_t)dlsym(h, "InitializeInjectionNvtx2");
+  InitFn_t initCuda = (InitFn_t)dlsym(h, "InitializeInjection");
   ForceCapFn_t force =
       (ForceCapFn_t)dlsym(h, "parcagpu_nvtx_test_force_capture");
   StatFn_t events  = (StatFn_t)dlsym(h, "parcagpu_nvtx_test_events_captured");
   StatFn_t batches = (StatFn_t)dlsym(h, "parcagpu_nvtx_test_batches_fired");
   StatFn_t names   = (StatFn_t)dlsym(h, "parcagpu_nvtx_test_resource_names_fired");
   ResetFn_t reset  = (ResetFn_t)dlsym(h, "parcagpu_nvtx_test_reset");
-  if (!force || !events || !batches || !names || !reset)
-    fail("missing test accessors");
+  LastEventFn_t last = (LastEventFn_t)dlsym(h, "parcagpu_nvtx_test_last_event");
+  if (!initNvtx || !initCuda || !force || !events || !batches || !names ||
+      !reset || !last)
+    fail("missing library entry points");
 
   force(1);
 
-  // -------- Case 1: stacked push/pop + mark --------
-  reset();
-  nvtx_RangePushA_params push = { "iter_0" };
-  fire(cb, ud, CUPTI_CBID_NVTX_nvtxRangePushA, &push, NULL);
-  nvtx_MarkA_params mark = { "checkpoint" };
-  fire(cb, ud, CUPTI_CBID_NVTX_nvtxMarkA, &mark, NULL);
-  nvtx_RangePop_params pop = { NULL };
-  fire(cb, ud, CUPTI_CBID_NVTX_nvtxRangePop, &pop, NULL);
-  if (events() != 3) { fprintf(stderr, "events=%lu want=3\n", events()); fail("case1 count"); }
-  if (batches() != 0) { fail("case1 should not have fired yet"); }
+  // -------- Case 1: injection installs handlers into a client --------
+  // Like an NVTX client at its first call, typically before cuInit.
+  static Client a;
+  clientInit(&a);
+  g_initClient = &a;
+  EXPECT(initNvtx(getExportTable) == 1, "InitializeInjectionNvtx2 != 1");
+  EXPECT(a.core[NVTX_CBID_CORE_RangePushA] != NULL, "RangePushA not installed");
+  EXPECT(a.core2[NVTX_CBID_CORE2_DomainRangePushEx] != NULL,
+         "DomainRangePushEx not installed");
+  EXPECT(a.core[NVTX_CBID_CORE_RangePushW] == NULL,
+         "RangePushW should stay unassigned (no-op)");
 
-  // -------- Case 2: non-stacked start/end with returned rangeId --------
-  reset();
-  nvtx_RangeStartA_params start = { "phase_A" };
-  uint64_t rangeId = 0x1122334455667788ULL;
-  fire(cb, ud, CUPTI_CBID_NVTX_nvtxRangeStartA, &start, &rangeId);
-  nvtx_RangeEnd_params end = { 0x1122334455667788ULL };
-  fire(cb, ud, CUPTI_CBID_NVTX_nvtxRangeEnd, &end, NULL);
-  if (events() != 2) { fail("case2 count"); }
+  struct nvtx_event ev;
+  const char *msg;
 
-  // -------- Case 3: Ex variant with color + payload --------
+  // -------- Case 2: stacked push/pop + mark, before CUDA init --------
   reset();
-  nvtx_EventAttribs attr;
+  PushA_t pushA = (PushA_t)a.core[NVTX_CBID_CORE_RangePushA];
+  Pop_t pop = (Pop_t)a.core[NVTX_CBID_CORE_RangePop];
+  MarkA_t markA = (MarkA_t)a.core[NVTX_CBID_CORE_MarkA];
+  EXPECT(pushA("iter_0") == 0, "first push level != 0");
+  markA("checkpoint");
+  msg = last(&ev);
+  EXPECT(ev.kind == NVTX_KIND_MARK && strcmp(msg, "checkpoint") == 0,
+         "mark not captured");
+  EXPECT(ev.domain_id == 0, "core API should use default domain");
+  EXPECT(ev.device_id == UINT32_MAX, "device resolved before cuInit");
+  EXPECT(pop() == 0, "pop level != 0");
+  EXPECT(events() == 3, "case2 count");
+  EXPECT(batches() == 0, "case2 should not have fired yet");
+
+  // -------- Case 3: non-stacked start/end, range ids from the injection ----
+  reset();
+  StartA_t startA = (StartA_t)a.core[NVTX_CBID_CORE_RangeStartA];
+  End_t end = (End_t)a.core[NVTX_CBID_CORE_RangeEnd];
+  nvtxRangeId_t r1 = startA("phase_A");
+  nvtxRangeId_t r2 = startA("phase_B");
+  EXPECT(r1 != 0 && r2 != 0 && r1 != r2, "range ids not unique");
+  end(r1);
+  last(&ev);
+  EXPECT(ev.kind == NVTX_KIND_RANGE_END && ev.range_id == r1, "end range id");
+  EXPECT(events() == 3, "case3 count");
+
+  // -------- Case 4: Ex variant with color + payload --------
+  reset();
+  nvtxEventAttributes_t attr;
   memset(&attr, 0, sizeof(attr));
-  attr.version    = 2;
-  attr.size       = sizeof(attr);
-  attr.colorType  = 1;  // NVTX_COLOR_ARGB
-  attr.color      = 0xff112233u;
-  attr.payload.ull = 0xdeadbeefcafef00dULL;
-  attr.messageType = 1; // NVTX_MESSAGE_TYPE_ASCII
+  attr.version = NVTX_VERSION;
+  attr.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+  attr.colorType = NVTX_COLOR_ARGB;
+  attr.color = 0xff112233u;
+  attr.payloadType = NVTX_PAYLOAD_TYPE_UNSIGNED_INT64;
+  attr.payload.ullValue = 0xdeadbeefcafef00dULL;
+  attr.messageType = NVTX_MESSAGE_TYPE_ASCII;
   attr.message.ascii = "ex_event";
-  struct { const void *eventAttrib; } ex = { &attr };
-  fire(cb, ud, CUPTI_CBID_NVTX_nvtxRangePushEx, &ex, NULL);
-  if (events() != 1) { fail("case3 push count"); }
+  ((PushEx_t)a.core[NVTX_CBID_CORE_RangePushEx])(&attr);
+  msg = last(&ev);
+  EXPECT(ev.color == 0xff112233u, "ex color");
+  EXPECT(ev.payload == 0xdeadbeefcafef00dULL, "ex payload");
+  EXPECT(strcmp(msg, "ex_event") == 0, "ex message");
+  pop();
 
-  // -------- Case 4: resource naming fires nvtx_resource_name --------
+  // -------- Case 5: domains + registered strings (Python nvtx's path) -------
   reset();
-  nvtx_NameOsThreadA_params name_thr = { 1234, "worker" };
-  fire(cb, ud, CUPTI_CBID_NVTX_nvtxNameOsThreadA, &name_thr, NULL);
-  nvtx_NameCudaStreamA_params name_stream =
-      { (void *)(uintptr_t)0xabc, "compute_stream" };
-  fire(cb, ud, CUPTI_CBID_NVTX_nvtxNameCudaStreamA, &name_stream, NULL);
-  if (names() != 2) { fprintf(stderr, "names=%lu want=2\n", names()); fail("case4 names"); }
-  if (events() != 0) { fail("case4 should not capture events"); }
+  DomainCreateA_t createA =
+      (DomainCreateA_t)a.core2[NVTX_CBID_CORE2_DomainCreateA];
+  RegisterStringA_t regA =
+      (RegisterStringA_t)a.core2[NVTX_CBID_CORE2_DomainRegisterStringA];
+  DomainPushEx_t dpush =
+      (DomainPushEx_t)a.core2[NVTX_CBID_CORE2_DomainRangePushEx];
+  DomainPop_t dpop = (DomainPop_t)a.core2[NVTX_CBID_CORE2_DomainRangePop];
 
-  // -------- Case 5: batch fires when full --------
+  nvtxDomainHandle_t d = createA("TensorRT-LLM");
+  EXPECT(d != NULL, "domain create");
+  EXPECT(names() == 1, "domain name should be announced on create");
+  nvtxStringHandle_t s = regA(d, "forward_step");
+  EXPECT(s != NULL && regA(d, "forward_step") == s, "registered string dedup");
+
+  memset(&attr, 0, sizeof(attr));
+  attr.version = NVTX_VERSION;
+  attr.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+  attr.messageType = NVTX_MESSAGE_TYPE_REGISTERED;
+  attr.message.registered = s;
+  dpush(d, &attr);
+  msg = last(&ev);
+  EXPECT(ev.kind == NVTX_KIND_RANGE_PUSH, "domain push kind");
+  EXPECT(ev.domain_id != 0, "domain push should carry the domain id");
+  EXPECT(strcmp(msg, "forward_step") == 0, "registered string not resolved");
+  uint32_t trtDomain = ev.domain_id;
+  dpop(d);
+  last(&ev);
+  EXPECT(ev.kind == NVTX_KIND_RANGE_POP && ev.domain_id == trtDomain,
+         "domain pop");
+  EXPECT(events() == 2, "case5 count");
+  EXPECT(names() == 1, "no re-announce within the interval");
+
+  // -------- Case 6: a second client copy shares domains --------
+  // E.g. torch and the Python nvtx package in the same process.
+  reset();
+  static Client b;
+  clientInit(&b);
+  g_initClient = &b;
+  EXPECT(initNvtx(getExportTable) == 1, "second client init");
+  nvtxDomainHandle_t d2 =
+      ((DomainCreateA_t)b.core2[NVTX_CBID_CORE2_DomainCreateA])("TensorRT-LLM");
+  EXPECT(d2 == d, "same domain name should map to the same handle");
+  EXPECT(names() == 0, "existing domain should not be re-announced on create");
+
+  // -------- Case 7: resource naming fires nvtx_resource_name --------
+  reset();
+  ((NameOsThreadA_t)a.core[NVTX_CBID_CORE_NameOsThreadA])(1234, "worker");
+  ((NameCudaStreamA_t)a.cudart[NVTX_CBID_CUDART_NameCudaStreamA])(
+      (void *)(uintptr_t)0xabc, "compute_stream");
+  EXPECT(names() == 2, "case7 names");
+  EXPECT(events() == 0, "case7 should not capture events");
+
+  // -------- Case 8: batch fires when full --------
   reset();
   // The default batch size from CMakeLists.txt is 256. Push that many
   // events on this thread; that should fire exactly one batch.
-  for (int i = 0; i < 256; ++i) {
-    nvtx_MarkA_params m = { "x" };
-    fire(cb, ud, CUPTI_CBID_NVTX_nvtxMarkA, &m, NULL);
-  }
-  if (events() != 256) { fail("case5 events"); }
-  if (batches() != 1)  { fprintf(stderr, "batches=%lu want=1\n", batches()); fail("case5 batches"); }
+  for (int i = 0; i < 256; ++i)
+    markA("x");
+  EXPECT(events() == 256, "case8 events");
+  EXPECT(batches() == 1, "case8 batches");
   // One more event — should sit in a new batch, not fire yet.
-  nvtx_MarkA_params one = { "tail" };
-  fire(cb, ud, CUPTI_CBID_NVTX_nvtxMarkA, &one, NULL);
-  if (events() != 257) { fail("case5 tail event"); }
-  if (batches() != 1)  { fail("case5 should still be 1 batch"); }
+  markA("tail");
+  EXPECT(events() == 257, "case8 tail event");
+  EXPECT(batches() == 1, "case8 should still be 1 batch");
 
-  // -------- Case 6: force-capture off restores cold path --------
+  // -------- Case 8b: a batch also fires once its oldest event is stale ------
+  reset();
+  usleep(150 * 1000); // > kMaxBatchAgeNs; "tail" above is now stale
+  markA("late");
+  EXPECT(batches() == 1, "stale batch should fire on the next event");
+
+  // -------- Case 9: force-capture off restores cold path --------
   force(0);
   reset();
-  nvtx_RangePushA_params hot = { "skipped" };
-  fire(cb, ud, CUPTI_CBID_NVTX_nvtxRangePushA, &hot, NULL);
+  pushA("skipped");
+  pop();
   // No USDT consumer attached, so without force-capture nothing should
   // run past the early exit.
-  if (events() != 0) { fprintf(stderr, "events=%lu want=0\n", events()); fail("case6 cold path"); }
+  EXPECT(events() == 0, "case9 cold path");
+
+  // -------- Case 10: cuInit points NVTX_INJECTION64_PATH at the library ----
+  EXPECT(initCuda() == 1, "InitializeInjection returned non-1");
+  Dl_info info;
+  EXPECT(dladdr((void *)initNvtx, &info) && info.dli_fname, "dladdr");
+  const char *inj = getenv("NVTX_INJECTION64_PATH");
+  EXPECT(inj && strcmp(inj, info.dli_fname) == 0,
+         "NVTX_INJECTION64_PATH should point at libparcagpucupti.so");
 
   fprintf(stderr, "PASS\n");
   return 0;

@@ -103,6 +103,7 @@ add_library(parcagpucupti SHARED
     src/correlation_filter.cpp
     src/env_config.cpp
     src/nvtx_collector.cpp
+    src/nvtx_injection.cpp
     ${PROTON_SOURCES}
 )
 
@@ -198,9 +199,9 @@ if(BUILD_TESTS)
         COMMENT "Creating libcupti.so.12 symlink"
     )
 
-    # Focused NVTX collector test. Fires synthesized CUPTI NVTX callbacks
-    # at the registered handler in libparcagpucupti.so and asserts via the
-    # collector's test-only stats accessors.
+    # Focused NVTX injection test. Acts as an NVTX client: calls
+    # InitializeInjectionNvtx2 in libparcagpucupti.so, calls through the
+    # installed handlers, and asserts via the collector's test-only accessors.
     add_executable(test_nvtx
         test/test_nvtx.c
     )

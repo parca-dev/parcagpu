@@ -13,13 +13,9 @@
 // other header that might pull in sdt.h without semaphores.
 #include "probes.h"
 
-#include <cupti.h>
-// cupti.h transitively includes cupti_nvtx_cbid.h on newer CUDA versions;
-// don't include it explicitly to avoid the double-typedef error.
+#include <dlfcn.h>
 
 #include "Driver/GPU/CudaApi.h"
-#include "Driver/GPU/CuptiApi.h"
-#include "Driver/GPU/NvtxApi.h"
 
 #include "nvtx.h"
 #include "nvtx_collector.h"
@@ -48,41 +44,14 @@ constexpr uint32_t kBatchSize = PARCAGPU_NVTX_BATCH_SIZE;
 // same cap with bpf_probe_read_user_str.
 constexpr size_t kMsgCap = 240;
 
-// Mirror of nvtxEventAttributes_v2 (nvtx3/nvToolsExt.h). We don't include the
-// NVTX header to avoid pulling its inline definitions into the build.
-// Layout must match exactly; verified against CUDA 12.x.
-struct EventAttribs {
-  uint16_t version;
-  uint16_t size;
-  uint32_t category;
-  int32_t  colorType;     // NVTX_COLOR_ARGB == 1
-  uint32_t color;
-  int32_t  payloadType;
-  int32_t  reserved0;
-  union {
-    uint64_t ull;
-    int64_t  ll;
-    double   d;
-    uint32_t ui;
-    int32_t  i;
-    float    f;
-  } payload;
-  int32_t  messageType;   // NVTX_MESSAGE_TYPE_ASCII == 1
-  union {
-    const char *ascii;
-    const void *wide;      // wchar_t* or registered string handle
-  } message;
-};
-
-constexpr int32_t kColorArgb       = 1;   // NVTX_COLOR_ARGB
-constexpr int32_t kMessageAscii    = 1;   // NVTX_MESSAGE_TYPE_ASCII
-constexpr int32_t kMessageRegistered = 3; // NVTX_MESSAGE_TYPE_REGISTERED
-
-// nvtxRangeId_t is uint64_t (per nvToolsExt.h).
-using NvtxRangeId = uint64_t;
+// A batch also fires once its oldest event is this old, checked as events
+// arrive, so threads that annotate a few times a second (e.g. one range per
+// inference step) still report promptly. Bounds probe fires to ~10/s/thread.
+constexpr uint64_t kMaxBatchAgeNs = 100ULL * 1'000'000ULL;
 
 struct ThreadState {
   uint32_t count;
+  uint64_t firstNs; // timestamp of events[0] in the pending batch
   struct nvtx_event events[kBatchSize];
   const void *eventPtrs[kBatchSize];
   char messagePool[kBatchSize][kMsgCap];
@@ -90,10 +59,11 @@ struct ThreadState {
 
 pthread_key_t g_tlsKey;
 std::once_flag g_tlsKeyOnce;
+std::atomic<bool> g_tlsKeyCreated{false};
 
 // ---- Test-only instrumentation -------------------------------------------
 // Production cost is one relaxed atomic increment per event/batch/name fire,
-// which is negligible next to the cost of the CUPTI callback itself. The
+// which is negligible next to the rest of captureEvent. The
 // `force-capture` flag lets unit tests exercise the collector without an
 // attached USDT consumer (no probe semaphore is hot, so the normal early
 // exits would skip everything). Accessed exclusively via the extern "C"
@@ -102,6 +72,19 @@ std::atomic<uint64_t> g_testEventsCaptured{0};
 std::atomic<uint64_t> g_testBatchesFired{0};
 std::atomic<uint64_t> g_testResourceNamesFired{0};
 std::atomic<bool>     g_testForceCapture{false};
+// Copy of the most recently captured event (and its message), for tests that
+// check field values rather than counts. Only written when force-capture is on.
+struct nvtx_event g_testLastEvent;
+char g_testLastMessage[kMsgCap];
+
+// Set once CUDA has called InitializeInjection. Before that, NVTX events can
+// arrive (NVTX clients initialize at their first call, often at import time),
+// and resolving the device would mean loading libcuda ourselves.
+std::atomic<bool> g_cudaReady{false};
+
+} // namespace
+
+namespace nvtx {
 
 bool captureEnabled() {
   return PARCAGPU_NVTX_EVENT_BATCH_ENABLED() ||
@@ -114,6 +97,10 @@ bool resourceNameEnabled() {
          debug_enabled;
 }
 
+} // namespace nvtx
+
+namespace {
+
 uint64_t nowNs() {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -121,11 +108,12 @@ uint64_t nowNs() {
 }
 
 uint32_t currentDeviceId() {
-  // ctxGetCurrent/ctxGetDevice are cheap and safe inside CUPTI callbacks:
-  // they don't touch sampling state or any CUPTI buffers. Note that
-  // proton::cuda::ctxGetCurrent<false> still throws if libcuda.so.1 itself
-  // can't be loaded or doesn't expose the symbol (the <false> only
-  // suppresses CUDA-return-value checks). Wrap the whole thing in a
+  if (!g_cudaReady.load(std::memory_order_acquire))
+    return UINT32_MAX;
+  // ctxGetCurrent/ctxGetDevice are cheap and don't touch sampling state or
+  // any CUPTI buffers. Note that proton::cuda::ctxGetCurrent<false> still
+  // throws if libcuda.so.1 itself can't be loaded or doesn't expose the
+  // symbol (the <false> only suppresses CUDA-return-value checks). Wrap the whole thing in a
   // catch-all: NVTX device-id resolution is best-effort, and a UINT32_MAX
   // sentinel is fine for downstream consumers.
   try {
@@ -171,8 +159,12 @@ void destroyThreadState(void *p) {
 }
 
 ThreadState *getThreadState() {
-  std::call_once(g_tlsKeyOnce,
-                 [] { pthread_key_create(&g_tlsKey, destroyThreadState); });
+  std::call_once(g_tlsKeyOnce, [] {
+    if (pthread_key_create(&g_tlsKey, destroyThreadState) == 0)
+      g_tlsKeyCreated.store(true, std::memory_order_release);
+  });
+  if (!g_tlsKeyCreated.load(std::memory_order_acquire))
+    return nullptr;
   auto *s = static_cast<ThreadState *>(pthread_getspecific(g_tlsKey));
   if (!s) {
     s = static_cast<ThreadState *>(std::calloc(1, sizeof(ThreadState)));
@@ -196,12 +188,12 @@ void copyMessage(char *dst, const char *src) {
   dst[i] = '\0';
 }
 
-void captureEvent(uint16_t kind, uint64_t rangeId, uint32_t color,
-                  uint64_t payload, const char *message,
-                  uint32_t correlationId) {
-  DEBUG_PRINTF("[PARCAGPU] nvtx in: kind=%u corr=%u range_id=%llu msg=%s\n",
-               (unsigned)kind, correlationId,
-               (unsigned long long)rangeId, message ? message : "(null)");
+} // namespace
+
+namespace nvtx {
+
+void captureEvent(uint16_t kind, uint32_t domainId, uint64_t rangeId,
+                  uint32_t color, uint64_t payload, const char *message) {
   if (!captureEnabled())
     return;
   auto *s = getThreadState();
@@ -211,8 +203,8 @@ void captureEvent(uint16_t kind, uint64_t rangeId, uint32_t color,
   struct nvtx_event *ev = &s->events[i];
   ev->timestamp_ns   = nowNs();
   ev->tid            = static_cast<uint32_t>(syscall(SYS_gettid));
-  ev->correlation_id = correlationId;
-  ev->domain_id      = 0;
+  ev->correlation_id = currentRuntimeCorrelationId();
+  ev->domain_id      = domainId;
   ev->kind           = kind;
   ev->flags          = 0;
   ev->color          = color;
@@ -223,32 +215,21 @@ void captureEvent(uint16_t kind, uint64_t rangeId, uint32_t color,
   ev->message        = s->messagePool[i];
   s->eventPtrs[i]    = ev;
   s->count           = i + 1;
+  if (i == 0)
+    s->firstNs = ev->timestamp_ns;
+  if (g_testForceCapture.load(std::memory_order_relaxed)) {
+    g_testLastEvent = *ev;
+    copyMessage(g_testLastMessage, s->messagePool[i]);
+  }
   g_testEventsCaptured.fetch_add(1, std::memory_order_relaxed);
-  DEBUG_PRINTF("[PARCAGPU] nvtx capture: kind=%u tid=%u corr=%u dev=%u range_id=%llu msg=%s\n",
-               (unsigned)kind, ev->tid, ev->correlation_id, ev->device_id,
-               (unsigned long long)ev->range_id, s->messagePool[i]);
-  if (s->count == kBatchSize) {
+  DEBUG_PRINTF("[PARCAGPU] nvtx capture: kind=%u domain=%u tid=%u corr=%u dev=%u range_id=%llu msg=%s\n",
+               (unsigned)kind, domainId, ev->tid, ev->correlation_id,
+               ev->device_id, (unsigned long long)ev->range_id,
+               s->messagePool[i]);
+  if (s->count == kBatchSize ||
+      ev->timestamp_ns - s->firstNs >= kMaxBatchAgeNs) {
     flushBatchLocked(s);
   }
-}
-
-void captureFromEx(uint16_t kind, uint64_t rangeId, const void *attrPtr,
-                   uint32_t correlationId) {
-  uint32_t color = 0;
-  uint64_t payload = 0;
-  const char *message = nullptr;
-  if (attrPtr) {
-    const auto *a = static_cast<const EventAttribs *>(attrPtr);
-    if (a->colorType == kColorArgb)
-      color = a->color;
-    payload = a->payload.ull;
-    // Registered-string and wide-string messages are not decoded in v1;
-    // they show up in the log as empty body, which is honest about what
-    // we know without false data.
-    if (a->messageType == kMessageAscii)
-      message = a->message.ascii;
-  }
-  captureEvent(kind, rangeId, color, payload, message, correlationId);
 }
 
 void emitResourceName(uint32_t kind, uint64_t id, const char *name) {
@@ -262,169 +243,32 @@ void emitResourceName(uint32_t kind, uint64_t id, const char *name) {
   g_testResourceNamesFired.fetch_add(1, std::memory_order_relaxed);
 }
 
-constexpr CUpti_CallbackId kEnabledCbids[] = {
-    CUPTI_CBID_NVTX_nvtxMarkA,
-    CUPTI_CBID_NVTX_nvtxMarkEx,
-    CUPTI_CBID_NVTX_nvtxRangeStartA,
-    CUPTI_CBID_NVTX_nvtxRangeStartEx,
-    CUPTI_CBID_NVTX_nvtxRangeEnd,
-    CUPTI_CBID_NVTX_nvtxRangePushA,
-    CUPTI_CBID_NVTX_nvtxRangePushEx,
-    CUPTI_CBID_NVTX_nvtxRangePop,
-    CUPTI_CBID_NVTX_nvtxNameOsThreadA,
-    CUPTI_CBID_NVTX_nvtxNameCuStreamA,
-    CUPTI_CBID_NVTX_nvtxNameCudaStreamA,
-    CUPTI_CBID_NVTX_nvtxNameCuDeviceA,
-    CUPTI_CBID_NVTX_nvtxNameCudaDeviceA,
-};
+void onCudaInjected() {
+  g_cudaReady.store(true, std::memory_order_release);
 
-} // namespace
-
-bool NvtxCollector::enable(CUpti_SubscriberHandle subscriber) {
-  DEBUG_PRINTF("[PARCAGPU] NvtxCollector::enable() starting\n");
-  proton::nvtx::enable();
+  // Point NVTX clients that haven't initialized yet at this library. Clients
+  // that already made their first NVTX call before cuInit only see us if the
+  // launcher set NVTX_INJECTION64_PATH; that's the recommended setup. Never
+  // override an existing value (e.g. nsys's own injection).
+  Dl_info info;
+  if (dladdr(reinterpret_cast<void *>(&onCudaInjected), &info) &&
+      info.dli_fname) {
+    setenv("NVTX_INJECTION64_PATH", info.dli_fname, /*overwrite=*/0);
+  }
   const char *injectPath = getenv("NVTX_INJECTION64_PATH");
   DEBUG_PRINTF("[PARCAGPU] NVTX_INJECTION64_PATH=%s\n",
                injectPath ? injectPath : "(unset)");
-  bool ok = true;
-  for (auto cbid : kEnabledCbids) {
-    if (proton::cupti::enableCallback<false>(
-            /*enable=*/1, subscriber, CUPTI_CB_DOMAIN_NVTX, cbid) !=
-        CUPTI_SUCCESS) {
-      ok = false;
-    }
-  }
-  DEBUG_PRINTF("[PARCAGPU] NvtxCollector::enable() done ok=%d cbids=%zu\n",
-               (int)ok, sizeof(kEnabledCbids) / sizeof(kEnabledCbids[0]));
-  return ok;
 }
 
-void NvtxCollector::disable(CUpti_SubscriberHandle subscriber) {
-  for (auto cbid : kEnabledCbids) {
-    proton::cupti::enableCallback<false>(/*enable=*/0, subscriber,
-                                         CUPTI_CB_DOMAIN_NVTX, cbid);
-  }
-  proton::nvtx::disable();
-}
-
-void NvtxCollector::flushCurrentThread() {
+void flushCurrentThread() {
+  if (!g_tlsKeyCreated.load(std::memory_order_acquire))
+    return;
   auto *s = static_cast<ThreadState *>(pthread_getspecific(g_tlsKey));
   if (s)
     flushBatchLocked(s);
 }
 
-void NvtxCollector::onCallback(CUpti_CallbackId cbid, const void *cbdata_void,
-                               uint32_t correlationId) {
-  // Both semaphores cold? Nothing to do.
-  if (!captureEnabled() && !resourceNameEnabled())
-    return;
-
-  const auto *nvtxData = static_cast<const CUpti_NvtxData *>(cbdata_void);
-  if (!nvtxData)
-    return;
-  const void *params = nvtxData->functionParams;
-  if (!params)
-    return;
-
-  switch (cbid) {
-  // ---- Marks ------------------------------------------------------------
-  case CUPTI_CBID_NVTX_nvtxMarkA: {
-    struct P { const char *message; };
-    const auto *p = static_cast<const P *>(params);
-    captureEvent(NVTX_KIND_MARK, 0, 0, 0, p->message, correlationId);
-    break;
-  }
-  case CUPTI_CBID_NVTX_nvtxMarkEx: {
-    struct P { const void *eventAttrib; };
-    const auto *p = static_cast<const P *>(params);
-    captureFromEx(NVTX_KIND_MARK, 0, p->eventAttrib, correlationId);
-    break;
-  }
-
-  // ---- Stacked range push/pop ------------------------------------------
-  case CUPTI_CBID_NVTX_nvtxRangePushA: {
-    struct P { const char *message; };
-    const auto *p = static_cast<const P *>(params);
-    captureEvent(NVTX_KIND_RANGE_PUSH, 0, 0, 0, p->message, correlationId);
-    break;
-  }
-  case CUPTI_CBID_NVTX_nvtxRangePushEx: {
-    struct P { const void *eventAttrib; };
-    const auto *p = static_cast<const P *>(params);
-    captureFromEx(NVTX_KIND_RANGE_PUSH, 0, p->eventAttrib, correlationId);
-    break;
-  }
-  case CUPTI_CBID_NVTX_nvtxRangePop: {
-    captureEvent(NVTX_KIND_RANGE_POP, 0, 0, 0, nullptr, correlationId);
-    break;
-  }
-
-  // ---- Non-stacked range start/end -------------------------------------
-  case CUPTI_CBID_NVTX_nvtxRangeStartA: {
-    struct P { const char *message; };
-    const auto *p = static_cast<const P *>(params);
-    NvtxRangeId id = 0;
-    if (nvtxData->functionReturnValue)
-      id = *static_cast<const NvtxRangeId *>(nvtxData->functionReturnValue);
-    captureEvent(NVTX_KIND_RANGE_START, id, 0, 0, p->message, correlationId);
-    break;
-  }
-  case CUPTI_CBID_NVTX_nvtxRangeStartEx: {
-    struct P { const void *eventAttrib; };
-    const auto *p = static_cast<const P *>(params);
-    NvtxRangeId id = 0;
-    if (nvtxData->functionReturnValue)
-      id = *static_cast<const NvtxRangeId *>(nvtxData->functionReturnValue);
-    captureFromEx(NVTX_KIND_RANGE_START, id, p->eventAttrib, correlationId);
-    break;
-  }
-  case CUPTI_CBID_NVTX_nvtxRangeEnd: {
-    struct P { NvtxRangeId id; };
-    const auto *p = static_cast<const P *>(params);
-    captureEvent(NVTX_KIND_RANGE_END, p->id, 0, 0, nullptr, correlationId);
-    break;
-  }
-
-  // ---- Resource naming (one-shot, no batching) -------------------------
-  case CUPTI_CBID_NVTX_nvtxNameOsThreadA: {
-    struct P { uint32_t threadId; const char *name; };
-    const auto *p = static_cast<const P *>(params);
-    emitResourceName(NVTX_RESOURCE_OS_THREAD, p->threadId, p->name);
-    break;
-  }
-  case CUPTI_CBID_NVTX_nvtxNameCuStreamA: {
-    struct P { void *stream; const char *name; };
-    const auto *p = static_cast<const P *>(params);
-    emitResourceName(NVTX_RESOURCE_CUDA_STREAM,
-                     reinterpret_cast<uint64_t>(p->stream), p->name);
-    break;
-  }
-  case CUPTI_CBID_NVTX_nvtxNameCudaStreamA: {
-    struct P { void *stream; const char *name; };
-    const auto *p = static_cast<const P *>(params);
-    emitResourceName(NVTX_RESOURCE_CUDA_STREAM,
-                     reinterpret_cast<uint64_t>(p->stream), p->name);
-    break;
-  }
-  case CUPTI_CBID_NVTX_nvtxNameCuDeviceA: {
-    struct P { int device; const char *name; };
-    const auto *p = static_cast<const P *>(params);
-    emitResourceName(NVTX_RESOURCE_CUDA_DEVICE,
-                     static_cast<uint64_t>(p->device), p->name);
-    break;
-  }
-  case CUPTI_CBID_NVTX_nvtxNameCudaDeviceA: {
-    struct P { int device; const char *name; };
-    const auto *p = static_cast<const P *>(params);
-    emitResourceName(NVTX_RESOURCE_CUDA_DEVICE,
-                     static_cast<uint64_t>(p->device), p->name);
-    break;
-  }
-
-  default:
-    break;
-  }
-}
+} // namespace nvtx
 
 } // namespace parcagpu
 
@@ -448,6 +292,14 @@ uint64_t parcagpu_nvtx_test_batches_fired(void) {
 
 uint64_t parcagpu_nvtx_test_resource_names_fired(void) {
   return parcagpu::g_testResourceNamesFired.load(std::memory_order_relaxed);
+}
+
+// Copies the most recently captured event; returns its message (valid until
+// the next capture).
+const char *parcagpu_nvtx_test_last_event(struct nvtx_event *out) {
+  if (out)
+    *out = parcagpu::g_testLastEvent;
+  return parcagpu::g_testLastMessage;
 }
 
 void parcagpu_nvtx_test_reset(void) {
