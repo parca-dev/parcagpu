@@ -53,6 +53,8 @@ const (
 	eventTypeCubinUnloaded = 3
 	eventTypePCSample      = 4
 	eventTypeError         = 5
+	eventTypeNvtx          = 6
+	eventTypeNvtxName      = 7
 )
 
 // KernelEvent matches struct kernel_event in the BPF program.
@@ -104,12 +106,135 @@ type PCSampleEvent struct {
 	StallReasons     [64]StallReason
 }
 
+// NvtxEvent matches struct nvtx_event in the BPF program (the collector's
+// struct nvtx_event plus the resolved message).
+type NvtxEvent struct {
+	EventType     uint32
+	_             uint32
+	TimestampNs   uint64
+	Tid           uint32
+	CorrelationID uint32
+	DomainID      uint32
+	Kind          uint16
+	Flags         uint16
+	Color         uint32
+	DeviceID      uint32
+	Payload       uint64
+	RangeID       uint64
+	MessagePtr    uint64
+	Message       [240]byte
+}
+
+// NvtxNameEvent matches struct nvtx_name_event in the BPF program.
+type NvtxNameEvent struct {
+	EventType uint32
+	Kind      uint32
+	ID        uint64
+	Name      [128]byte
+}
+
 const (
-	statBatches    = 0
-	statActivities = 1
-	statKernels    = 2
-	statDrops      = 3
+	statBatches       = 0
+	statActivities    = 1
+	statKernels       = 2
+	statDrops         = 3
+	statNvtxBatches   = 4
+	statNvtxEvents    = 5
+	statNvtxTruncated = 6
 )
+
+var nvtxKindNames = map[uint16]string{1: "push", 2: "pop", 3: "start", 4: "end", 5: "mark"}
+
+// nvtxSummary aggregates NVTX events for the end-of-run report that
+// test-nvtx-real.sh checks.
+type nvtxSummary struct {
+	events     uint64
+	byKind     map[uint16]uint64
+	byDomain   map[uint32]uint64
+	byMessage  map[string]uint64
+	tids       map[uint32]bool
+	colored    uint64
+	payloadSum uint64
+	openRanges map[uint64]bool // RANGE_START ids without a matching END
+	badEnds    uint64          // RANGE_END ids never started
+	names      []NvtxNameEvent
+}
+
+func newNvtxSummary() *nvtxSummary {
+	return &nvtxSummary{
+		byKind:     map[uint16]uint64{},
+		byDomain:   map[uint32]uint64{},
+		byMessage:  map[string]uint64{},
+		tids:       map[uint32]bool{},
+		openRanges: map[uint64]bool{},
+	}
+}
+
+func (n *nvtxSummary) add(ev *NvtxEvent) {
+	n.events++
+	n.byKind[ev.Kind]++
+	n.byDomain[ev.DomainID]++
+	if msg := cString(ev.Message[:]); msg != "" {
+		n.byMessage[msg]++
+	}
+	n.tids[ev.Tid] = true
+	if ev.Color != 0 {
+		n.colored++
+	}
+	n.payloadSum += ev.Payload
+	switch ev.Kind {
+	case 3:
+		n.openRanges[ev.RangeID] = true
+	case 4:
+		if n.openRanges[ev.RangeID] {
+			delete(n.openRanges, ev.RangeID)
+		} else {
+			n.badEnds++
+		}
+	}
+}
+
+func (n *nvtxSummary) print(objs *activityParserObjects) {
+	var batches, recs, trunc, drops uint64
+	for key, dst := range map[uint32]*uint64{
+		statNvtxBatches: &batches, statNvtxEvents: &recs,
+		statNvtxTruncated: &trunc, statDrops: &drops,
+	} {
+		objs.Stats.Lookup(&key, dst)
+	}
+	fmt.Printf("nvtx: events=%d bpf_records=%d batches=%d truncated=%d drops=%d\n",
+		n.events, recs, batches, trunc, drops)
+	for k := uint16(1); k <= 5; k++ {
+		fmt.Printf("nvtx kind %s=%d\n", nvtxKindNames[k], n.byKind[k])
+	}
+	domainNames := map[uint64]string{}
+	for _, nm := range n.names {
+		if nm.Kind == 5 {
+			domainNames[nm.ID] = cString(nm.Name[:])
+		}
+	}
+	domains := make([]uint32, 0, len(n.byDomain))
+	for d := range n.byDomain {
+		domains = append(domains, d)
+	}
+	sort.Slice(domains, func(i, j int) bool { return domains[i] < domains[j] })
+	for _, d := range domains {
+		fmt.Printf("nvtx domain id=%d name=%q events=%d\n", d, domainNames[uint64(d)], n.byDomain[d])
+	}
+	msgs := make([]string, 0, len(n.byMessage))
+	for m := range n.byMessage {
+		msgs = append(msgs, m)
+	}
+	sort.Strings(msgs)
+	for _, m := range msgs {
+		fmt.Printf("nvtx message %q count=%d\n", m, n.byMessage[m])
+	}
+	fmt.Printf("nvtx threads=%d colored=%d payload_sum=%d open_ranges=%d bad_ends=%d\n",
+		len(n.tids), n.colored, n.payloadSum, len(n.openRanges), n.badEnds)
+	for _, nm := range n.names {
+		fmt.Printf("nvtx name kind=%d id=0x%x name=%q\n", nm.Kind, nm.ID, cString(nm.Name[:]))
+	}
+}
 
 // lineEntry is a single address→source mapping from the DWARF line table.
 type lineEntry struct {
@@ -441,6 +566,8 @@ func main() {
 		{"cubin_unloaded", objs.HandleCubinUnloaded},
 		{"pc_sample_batch", objs.HandlePcSampleBatch},
 		{"error", objs.HandleError},
+		{"nvtx_event_batch", objs.HandleNvtxEventBatch},
+		{"nvtx_resource_name", objs.HandleNvtxResourceName},
 	}
 
 	var links []link.Link
@@ -522,6 +649,9 @@ func main() {
 		select {
 		case <-sig:
 		case <-done:
+			// Batches fired at exit (atexit / TLS destructors) may still be
+			// in the ring buffer; let the reader drain them.
+			time.Sleep(time.Second)
 		}
 		rd.Close()
 	}()
@@ -531,6 +661,7 @@ func main() {
 
 	var eventCount uint64
 	var pcSampleCount uint64
+	nvtx := newNvtxSummary()
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -598,6 +729,27 @@ func main() {
 			comp := cString(event.Component[:])
 			log.Printf("ERROR [%s] code=%d: %s", comp, event.ErrorCode, msg)
 
+		case eventTypeNvtx:
+			var event NvtxEvent
+			if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &event); err != nil {
+				log.Printf("Parsing nvtx event: %v", err)
+				continue
+			}
+			nvtx.add(&event)
+			if *verbose {
+				fmt.Printf("nvtx: kind=%s domain=%d tid=%d range=%d color=0x%x payload=%d msg=%q\n",
+					nvtxKindNames[event.Kind], event.DomainID, event.Tid, event.RangeID,
+					event.Color, event.Payload, cString(event.Message[:]))
+			}
+
+		case eventTypeNvtxName:
+			var event NvtxNameEvent
+			if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &event); err != nil {
+				log.Printf("Parsing nvtx name event: %v", err)
+				continue
+			}
+			nvtx.names = append(nvtx.names, event)
+
 		case eventTypePCSample:
 			var event PCSampleEvent
 			if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &event); err != nil {
@@ -657,6 +809,7 @@ func main() {
 	log.Printf("  pc_samples=%d", pcSampleCount)
 	printStallReasonMap(&objs)
 	printCubins(cubins)
+	nvtx.print(&objs)
 }
 
 func printStats(objs *activityParserObjects, eventCount uint64) {

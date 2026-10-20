@@ -81,6 +81,7 @@ The activity parser attaches to all USDT probes via eBPF, captures events throug
 ```bash
 make test           # Basic mock CUPTI test (no GPU, no BPF)
 make test-nvtx      # NVTX collector unit test (no GPU, no BPF)
+make test-nvtx-real # Real NVTX clients + BPF parser, end to end (no GPU; sudo; NVTX_PYTHON=... adds the Python nvtx case)
 make test-pc-mock   # Mock PC sampling with BPF activity parser (no GPU, requires root)
 make test-pc-real   # Real PC sampling with GPU (requires root + GPU)
 make test-multi     # test_cupti_prof + BPF activity parser in parallel (requires root)

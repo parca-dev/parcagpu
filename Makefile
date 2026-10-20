@@ -1,4 +1,4 @@
-.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-graph-rate-limit test-pc-contexts test-nvtx
+.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-graph-rate-limit test-pc-contexts test-nvtx test-nvtx-real
 
 LIB_NAME = libparcagpucupti.so
 
@@ -165,6 +165,12 @@ test-multi: local bpf-test
 # Requires: real GPU, root (sudo) for BPF, pc_sample_toy compiled separately.
 test-pc-real: local bpf-test microbenchmarks
 	sudo -E test/test-pc-real.sh
+
+# Real NVTX clients (nvtx3 C headers; Python nvtx package if NVTX_PYTHON is
+# set) loading parcagpu via NVTX_INJECTION64_PATH, consumed by the BPF
+# parser. No GPU; requires root (sudo) for BPF.
+test-nvtx-real: local bpf-test
+	sudo -E test/test-nvtx-real.sh
 
 # Mock PC sampling test — no GPU required, uses mock CUPTI/CUDA. Also covers
 # graph launches (guards driver cuGraphLaunch CBID subscription).
