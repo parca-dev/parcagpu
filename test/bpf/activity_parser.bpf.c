@@ -92,6 +92,8 @@ struct error_event {
 };
 
 // NVTX event sent to user-space: the collector's record plus its message.
+// Records are variable-length: only the message bytes actually read (through
+// the NUL) are sent.
 struct nvtx_event {
   u32 event_type; // EVENT_TYPE_NVTX
   u32 _pad;
@@ -112,6 +114,15 @@ struct nvtx_name_event {
 // PARCAGPU_NVTX_BATCH_SIZE CMake allows; larger batches are truncated and
 // counted in STAT_NVTX_TRUNCATED.
 #define MAX_NVTX_BATCH 1024
+
+// Scratch space for building a variable-length nvtx_event before copying it
+// to the ring buffer; too big for the BPF stack.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, u32);
+    __type(value, struct nvtx_event);
+    __uint(max_entries, 1);
+} nvtx_scratch SEC(".maps");
 
 // Ring buffer for sending events to user-space.
 struct {
@@ -397,6 +408,43 @@ int BPF_USDT(handle_error, s32 code, u64 message_ptr, u64 component_ptr) {
   return 0;
 }
 
+struct nvtx_loop_ctx {
+  u64 ptrs_base;
+  struct nvtx_event *evt;
+};
+
+// bpf_loop callback: forwards record i of the batch. bpf_loop keeps the
+// verifier from walking every iteration of the variable-length copy.
+static long nvtx_forward_one(u64 i, void *data) {
+  struct nvtx_loop_ctx *c = data;
+  struct nvtx_event *evt = c->evt;
+
+  u64 rec_ptr = 0;
+  if (bpf_probe_read_user(&rec_ptr, sizeof(rec_ptr),
+                          (void *)(c->ptrs_base + i * sizeof(u64))) != 0 ||
+      rec_ptr == 0)
+    return 0;
+  if (bpf_probe_read_user(&evt->data, sizeof(evt->data), (void *)rec_ptr) != 0)
+    return 0;
+  bump_stat(STAT_NVTX_EVENTS);
+  evt->event_type = EVENT_TYPE_NVTX;
+  evt->_pad = 0;
+  long len = 0;
+  if (evt->data.message_ptr)
+    len = bpf_probe_read_user_str(evt->message, sizeof(evt->message),
+                                  (void *)evt->data.message_ptr);
+  if (len <= 0) {
+    evt->message[0] = '\0';
+    len = 1;
+  }
+  if (len > NVTX_MAX_MSG_LEN)
+    len = NVTX_MAX_MSG_LEN;
+  if (bpf_ringbuf_output(&events, evt,
+                         offsetof(struct nvtx_event, message) + len, 0) != 0)
+    bump_stat(STAT_DROPS);
+  return 0;
+}
+
 SEC("usdt/parcagpu/nvtx_event_batch")
 int BPF_USDT(handle_nvtx_event_batch, u64 ptrs_base, u32 count) {
   bump_stat(STAT_NVTX_BATCHES);
@@ -406,35 +454,14 @@ int BPF_USDT(handle_nvtx_event_batch, u64 ptrs_base, u32 count) {
     count = MAX_NVTX_BATCH;
   }
 
-  for (u32 i = 0; i < MAX_NVTX_BATCH; i++) {
-    if (i >= count)
-      break;
-
-    u64 rec_ptr = 0;
-    if (bpf_probe_read_user(&rec_ptr, sizeof(rec_ptr),
-                            (void *)(ptrs_base + (u64)i * sizeof(u64))) != 0 ||
-        rec_ptr == 0)
-      continue;
-
-    struct nvtx_event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
-    if (!evt) {
-      bump_stat(STAT_DROPS);
-      continue;
-    }
-    if (bpf_probe_read_user(&evt->data, sizeof(evt->data), (void *)rec_ptr) !=
-        0) {
-      bpf_ringbuf_discard(evt, 0);
-      continue;
-    }
-    bump_stat(STAT_NVTX_EVENTS);
-    evt->event_type = EVENT_TYPE_NVTX;
-    evt->_pad = 0;
-    evt->message[0] = '\0';
-    if (evt->data.message_ptr)
-      bpf_probe_read_user_str(evt->message, sizeof(evt->message),
-                              (void *)evt->data.message_ptr);
-    bpf_ringbuf_submit(evt, 0);
-  }
+  u32 zero = 0;
+  struct nvtx_loop_ctx c = {
+      .ptrs_base = ptrs_base,
+      .evt = bpf_map_lookup_elem(&nvtx_scratch, &zero),
+  };
+  if (!c.evt)
+    return 0;
+  bpf_loop(count, nvtx_forward_one, &c, 0);
   return 0;
 }
 

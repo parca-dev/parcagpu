@@ -4,8 +4,9 @@
 # TensorRT-LLM find it) and the BPF activity parser consumes the
 # nvtx_event_batch / nvtx_resource_name USDT probes. Checks exact event
 # counts, domain and registered-string resolution, thread naming, Ex
-# attributes, multi-batch and stale-batch flushing, and that events from
-# before a consumer attached are not captured. No GPU required.
+# attributes, long and truncated messages, multi-batch and stale-batch
+# flushing, and that events from before a consumer attached are not
+# captured. No GPU required.
 #
 # Cases:
 #   c       test/nvtx_client.c via the stock nvtx3 headers (always)
@@ -110,22 +111,24 @@ run_case() {
 # --- C client ---------------------------------------------------------------
 run_case c "$CLIENT"
 L="$WORK/c.bpf.log"
-check_line "c: all 2301 events received, none dropped" \
-  'nvtx: events=2301 bpf_records=2301 batches=[0-9]+ truncated=0 drops=0' "$L"
+check_line "c: all 2303 events received, none dropped" \
+  'nvtx: events=2303 bpf_records=2303 batches=[0-9]+ truncated=0 drops=0' "$L"
 BATCHES=$(grep '^nvtx: ' "$L" | grep -oE 'batches=[0-9]+' | cut -d= -f2)
-# 2251 main-thread events need >= 9 batches of 256; worker adds one; the
+# 2253 main-thread events need >= 9 batches of 256; worker adds one; the
 # spaced domain marks force extra stale-batch flushes.
 check_expr "c: multiple batches incl. stale flushes (got ${BATCHES:-0})" "[ \"${BATCHES:-0}\" -ge 12 ]"
 check_line "c: push count"  'nvtx kind push=1110' "$L"
 check_line "c: pop count"   'nvtx kind pop=1110' "$L"
 check_line "c: start count" 'nvtx kind start=8' "$L"
 check_line "c: end count"   'nvtx kind end=8' "$L"
-check_line "c: mark count"  'nvtx kind mark=65' "$L"
-check_line "c: default domain events" 'nvtx domain id=0 name="" events=290' "$L"
+check_line "c: mark count"  'nvtx kind mark=67' "$L"
+check_line "c: default domain events" 'nvtx domain id=0 name="" events=292' "$L"
 check_line "c: domain named and attributed" 'nvtx domain id=1 name="parcagpu-test" events=2011' "$L"
 check_line "c: registered string resolved" 'nvtx message "registered_step" count=1000' "$L"
 check_line "c: ascii domain message" 'nvtx message "domain_mark" count=5' "$L"
 check_line "c: worker thread marks" 'nvtx message "worker_mark" count=50' "$L"
+check_line "c: 600-byte message intact" 'nvtx message "long:x{595}" count=1' "$L"
+check_line "c: 2000-byte message cut at 1023" 'nvtx message "trunc:y{1017}" count=1' "$L"
 check_line "c: two threads, Ex color/payload, ranges paired" \
   'nvtx threads=2 colored=10 payload_sum=70 open_ranges=0 bad_ends=0' "$L"
 check_line "c: worker thread named" 'nvtx name kind=1 id=0x[0-9a-f]+ name="nvtx-worker"' "$L"
