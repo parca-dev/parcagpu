@@ -38,11 +38,17 @@ namespace {
 
 constexpr uint32_t kBatchSize = PARCAGPU_NVTX_BATCH_SIZE;
 
-// Per-event message copy length. NVTX messages in real workloads
-// (PyTorch op names, NCCL phase tags) sit well under this. We truncate
-// rather than spill into a variable-size pool — the BPF reader uses the
-// same cap with bpf_probe_read_user_str.
-constexpr size_t kMsgCap = 240;
+// Longest message copied per event, including the NUL; longer messages are
+// truncated. Most NVTX messages (PyTorch op names, NCCL phase tags) are
+// short, but vLLM's layerwise tracing emits dict strings of several hundred
+// bytes. The BPF reader uses the same cap (NVTX_MAX_MSG_LEN).
+constexpr size_t kMsgCap = 1024;
+
+// Messages of the pending batch are packed into a per-thread arena, so short
+// messages take only their own length and there is no allocation per event.
+// A batch fires early when the arena might not fit another kMsgCap message.
+constexpr size_t kArenaSize = 64 * 1024;
+static_assert(kArenaSize >= kMsgCap, "arena must hold at least one message");
 
 // A batch also fires once its oldest event is this old, checked as events
 // arrive, so threads that annotate a few times a second (e.g. one range per
@@ -51,10 +57,11 @@ constexpr uint64_t kMaxBatchAgeNs = 100ULL * 1'000'000ULL;
 
 struct ThreadState {
   uint32_t count;
-  uint64_t firstNs; // timestamp of events[0] in the pending batch
+  uint32_t arenaUsed; // bytes of arena holding the pending batch's messages
+  uint64_t firstNs;   // timestamp of events[0] in the pending batch
   struct nvtx_event events[kBatchSize];
   const void *eventPtrs[kBatchSize];
-  char messagePool[kBatchSize][kMsgCap];
+  char arena[kArenaSize];
 };
 
 pthread_key_t g_tlsKey;
@@ -148,6 +155,7 @@ void flushBatchLocked(ThreadState *s) {
   fireNvtxEventBatch(s->eventPtrs, s->count);
   g_testBatchesFired.fetch_add(1, std::memory_order_relaxed);
   s->count = 0;
+  s->arenaUsed = 0;
 }
 
 void destroyThreadState(void *p) {
@@ -175,17 +183,18 @@ ThreadState *getThreadState() {
   return s;
 }
 
-void copyMessage(char *dst, const char *src) {
-  if (!src) {
-    dst[0] = '\0';
-    return;
-  }
+// Copies src (truncated to kMsgCap - 1 bytes) and returns the bytes written,
+// including the NUL.
+size_t copyMessage(char *dst, const char *src) {
   size_t i = 0;
-  while (i + 1 < kMsgCap && src[i] != '\0') {
-    dst[i] = src[i];
-    ++i;
+  if (src) {
+    while (i + 1 < kMsgCap && src[i] != '\0') {
+      dst[i] = src[i];
+      ++i;
+    }
   }
   dst[i] = '\0';
+  return i + 1;
 }
 
 } // namespace
@@ -199,6 +208,8 @@ void captureEvent(uint16_t kind, uint32_t domainId, uint64_t rangeId,
   auto *s = getThreadState();
   if (!s)
     return;
+  if (kArenaSize - s->arenaUsed < kMsgCap)
+    flushBatchLocked(s);
   const uint32_t i = s->count;
   struct nvtx_event *ev = &s->events[i];
   ev->timestamp_ns   = nowNs();
@@ -211,21 +222,22 @@ void captureEvent(uint16_t kind, uint32_t domainId, uint64_t rangeId,
   ev->device_id      = currentDeviceId();
   ev->payload        = payload;
   ev->range_id       = rangeId;
-  copyMessage(s->messagePool[i], message);
-  ev->message        = s->messagePool[i];
+  char *msg          = s->arena + s->arenaUsed;
+  s->arenaUsed      += static_cast<uint32_t>(copyMessage(msg, message));
+  ev->message        = msg;
   s->eventPtrs[i]    = ev;
   s->count           = i + 1;
   if (i == 0)
     s->firstNs = ev->timestamp_ns;
   if (g_testForceCapture.load(std::memory_order_relaxed)) {
     g_testLastEvent = *ev;
-    copyMessage(g_testLastMessage, s->messagePool[i]);
+    copyMessage(g_testLastMessage, msg);
   }
   g_testEventsCaptured.fetch_add(1, std::memory_order_relaxed);
   DEBUG_PRINTF("[PARCAGPU] nvtx capture: kind=%u domain=%u tid=%u corr=%u dev=%u range_id=%llu msg=%s\n",
                (unsigned)kind, domainId, ev->tid, ev->correlation_id,
                ev->device_id, (unsigned long long)ev->range_id,
-               s->messagePool[i]);
+               msg);
   if (s->count == kBatchSize ||
       ev->timestamp_ns - s->firstNs >= kMaxBatchAgeNs) {
     flushBatchLocked(s);

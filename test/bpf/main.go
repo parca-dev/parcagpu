@@ -106,8 +106,9 @@ type PCSampleEvent struct {
 	StallReasons     [64]StallReason
 }
 
-// NvtxEvent matches struct nvtx_event in the BPF program (the collector's
-// struct nvtx_event plus the resolved message).
+// NvtxEvent matches the fixed part of struct nvtx_event in the BPF program
+// (the collector's struct nvtx_event); the NUL-terminated message follows it
+// and the record ends with the message.
 type NvtxEvent struct {
 	EventType     uint32
 	_             uint32
@@ -122,7 +123,6 @@ type NvtxEvent struct {
 	Payload       uint64
 	RangeID       uint64
 	MessagePtr    uint64
-	Message       [240]byte
 }
 
 // NvtxNameEvent matches struct nvtx_name_event in the BPF program.
@@ -170,11 +170,11 @@ func newNvtxSummary() *nvtxSummary {
 	}
 }
 
-func (n *nvtxSummary) add(ev *NvtxEvent) {
+func (n *nvtxSummary) add(ev *NvtxEvent, msg string) {
 	n.events++
 	n.byKind[ev.Kind]++
 	n.byDomain[ev.DomainID]++
-	if msg := cString(ev.Message[:]); msg != "" {
+	if msg != "" {
 		n.byMessage[msg]++
 	}
 	n.tids[ev.Tid] = true
@@ -735,11 +735,12 @@ func main() {
 				log.Printf("Parsing nvtx event: %v", err)
 				continue
 			}
-			nvtx.add(&event)
+			msg := cString(raw[binary.Size(event):])
+			nvtx.add(&event, msg)
 			if *verbose {
 				fmt.Printf("nvtx: kind=%s domain=%d tid=%d range=%d color=0x%x payload=%d msg=%q\n",
 					nvtxKindNames[event.Kind], event.DomainID, event.Tid, event.RangeID,
-					event.Color, event.Payload, cString(event.Message[:]))
+					event.Color, event.Payload, msg)
 			}
 
 		case eventTypeNvtxName:

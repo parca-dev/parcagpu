@@ -263,6 +263,41 @@ int main(void) {
   markA("late");
   EXPECT(batches() == 1, "stale batch should fire on the next event");
 
+  // -------- Case 8c: long messages, truncation and the message arena -------
+  // Messages up to 1023 bytes arrive intact; longer ones are cut there.
+  static char longMsg[2001];
+  memset(longMsg, 'x', 600);
+  longMsg[600] = '\0';
+  reset();
+  markA(longMsg);
+  msg = last(&ev);
+  EXPECT(strlen(msg) == 600 && memcmp(msg, longMsg, 600) == 0,
+         "600-byte message intact");
+  memset(longMsg, 'y', 2000);
+  longMsg[2000] = '\0';
+  markA(longMsg);
+  msg = last(&ev);
+  EXPECT(strlen(msg) == 1023 && memcmp(msg, longMsg, 1023) == 0,
+         "2000-byte message truncated to 1023");
+  // The pending batch's messages share a 64 KB arena; a batch fires early
+  // once it might not fit another 1024-byte message, well before 256 events.
+  // Case 8b left the batch empty, so it now holds the 601 + 1024 bytes
+  // above; at 601 bytes per message the first flush comes 105 events later
+  // and the next one 108 after that.
+  memset(longMsg, 'x', 600);
+  longMsg[600] = '\0';
+  reset();
+  for (int i = 0; i < 105; ++i)
+    markA(longMsg);
+  EXPECT(batches() == 0, "arena not yet full");
+  markA(longMsg);
+  EXPECT(batches() == 1, "full arena fires the batch");
+  for (int i = 0; i < 107; ++i)
+    markA(longMsg);
+  EXPECT(batches() == 1, "second arena not yet full");
+  markA(longMsg);
+  EXPECT(batches() == 2, "second full arena fires the batch");
+
   // -------- Case 9: force-capture off restores cold path --------
   force(0);
   reset();

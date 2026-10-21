@@ -95,11 +95,14 @@ struct cupti_pc_data {
 // collector batches records of this exact layout and exposes them via the
 // `nvtx_event_batch` USDT probe (pointer-array of count records). The BPF
 // reader follows each pointer, copies the record, and chases `message` via
-// bpf_probe_read_user_str up to NVTX_MAX_MSG_LEN bytes. Layout must stay
-// in lockstep with parcagpu's src/nvtx.h.
+// bpf_probe_read_user_str up to NVTX_MAX_MSG_LEN bytes (including the NUL).
+// Messages are mostly short, so readers should forward only the bytes the
+// read returned (bpf_ringbuf_output from a scratch buffer) rather than
+// reserving NVTX_MAX_MSG_LEN per record. Layout must stay in lockstep with
+// parcagpu's src/nvtx.h.
 //
 // The `message` field is a user pointer (8 bytes on the platforms we care
-// about). It points into the producing thread's per-thread message pool,
+// about). It points into the producing thread's per-thread message arena,
 // guaranteed to be live until the batch fires, so this BPF-side read is
 // safe even though batching defers the probe call.
 
@@ -116,7 +119,7 @@ struct cupti_pc_data {
 #define NVTX_RESOURCE_DOMAIN      5
 
 // Must match parcagpu/src/nvtx_collector.cpp kMsgCap.
-#define NVTX_MAX_MSG_LEN 240
+#define NVTX_MAX_MSG_LEN 1024
 
 struct cupti_nvtx_event {
   u64 timestamp_ns;   // offset 0   - CLOCK_MONOTONIC (not wall clock) at the NVTX call

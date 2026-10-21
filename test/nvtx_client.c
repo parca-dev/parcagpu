@@ -26,6 +26,9 @@
 #define CORE_PUSHES 100
 #define CORE_MARKS 10
 #define CORE_RANGES 5
+// One message that fits the collector's 1024-byte cap and one cut at it.
+#define LONG_MARK_LEN 600
+#define TRUNC_MARK_LEN 2000
 #define EX_PUSHES 10
 #define EX_COLOR 0xFF00FF00u
 #define EX_PAYLOAD 7
@@ -90,6 +93,14 @@ int main(int argc, char **argv) {
   for (int i = 0; i < CORE_RANGES; i++)
     nvtxRangeEnd(nvtxRangeStartA("core_range"));
 
+  static char long_mark[TRUNC_MARK_LEN + 1];
+  memcpy(long_mark, "long:", 5);
+  memset(long_mark + 5, 'x', LONG_MARK_LEN - 5);
+  nvtxMarkA(long_mark);
+  memcpy(long_mark, "trunc:", 6);
+  memset(long_mark + 6, 'y', TRUNC_MARK_LEN - 6);
+  nvtxMarkA(long_mark);
+
   nvtxEventAttributes_t ex = attribs();
   ex.colorType = NVTX_COLOR_ARGB;
   ex.color = EX_COLOR;
@@ -129,7 +140,7 @@ int main(int argc, char **argv) {
   pthread_join(t, NULL);
 
   printf("client: done, expected events=%d\n",
-         2 * CORE_PUSHES + CORE_MARKS + 2 * CORE_RANGES + 2 * EX_PUSHES +
+         2 * CORE_PUSHES + CORE_MARKS + 2 * CORE_RANGES + 2 + 2 * EX_PUSHES +
              2 * DOMAIN_PUSHES + 2 * DOMAIN_RANGES + DOMAIN_MARKS +
              WORKER_MARKS);
   // The main thread's last batch fires from the injection's atexit flush.
