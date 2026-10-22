@@ -17,6 +17,7 @@
 #include "Driver/GPU/CuptiApi.h"
 #include "Profiler/Cupti/CuptiCallbacks.h"
 #include "Utility/Singleton.h"
+#include "agent_ctl.h"
 #include "correlation_filter.h"
 #include "env_config.h"
 #include "nvtx_collector.h"
@@ -269,6 +270,8 @@ public:
 
     DEBUG_PRINTF("[PARCAGPU] Starting initialization\n");
 
+    parcagpu::agentCtlInit();
+
     // Check if PC sampling is supported
     pcSamplingEnabled = parcagpu::PCSampling::isSupported();
     if (pcSamplingEnabled) {
@@ -299,9 +302,14 @@ public:
     proton::cupti::enableCallback<true>(1, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
                                         CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
 
-    // Enable resource callbacks only if PC sampling is enabled
+    // Enable resource callbacks only if PC sampling is enabled. Context
+    // creation always: it feeds the device table reported to the agent.
     if (pcSamplingEnabled) {
       proton::setResourceCallbacks(subscriber, /*enable=*/true);
+    } else {
+      proton::cupti::enableCallback<false>(
+          1, subscriber, CUPTI_CB_DOMAIN_RESOURCE,
+          CUPTI_CBID_RESOURCE_CONTEXT_CREATED);
     }
 
     // NVTX goes through our own injection (nvtx_injection.cpp), not CUPTI.
@@ -357,6 +365,10 @@ public:
           CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
       if (pcSamplingEnabled) {
         proton::setResourceCallbacks(subscriber, /*enable=*/false);
+      } else {
+        proton::cupti::enableCallback<false>(
+            0, subscriber, CUPTI_CB_DOMAIN_RESOURCE,
+            CUPTI_CBID_RESOURCE_CONTEXT_CREATED);
       }
     }
     // Flush this thread's pending NVTX batch; other live threads drain
@@ -547,14 +559,19 @@ private:
     try {
     auto &profiler = CuptiProfiler::instance();
 
+    parcagpu::agentCtlPoll();
+
     if (domain == CUPTI_CB_DOMAIN_RESOURCE) {
-      // Handle resource callbacks for PC sampling (only if enabled)
+      const CUpti_ResourceData *resData =
+          static_cast<const CUpti_ResourceData *>(cbdata_void);
+      if (cbid == CUPTI_CBID_RESOURCE_CONTEXT_CREATED) {
+        parcagpu::agentCtlAddContext(resData->context);
+      }
+
+      // The rest is for PC sampling (only if enabled)
       if (!profiler.pcSamplingEnabled) {
         return;
       }
-
-      const CUpti_ResourceData *resData =
-          static_cast<const CUpti_ResourceData *>(cbdata_void);
 
       switch (cbid) {
       case CUPTI_CBID_RESOURCE_MODULE_LOADED: {

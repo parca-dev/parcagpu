@@ -61,6 +61,19 @@ is attached to the `nvtx_event_batch` probe.
 | `PARCAGPU_SAMPLING_FACTOR` | 20 | Hardware PC sampling period (log2 cycles between samples). Only takes effect when PC sampling is enabled via `PARCAGPU_PC_SAMPLING_RATE`. |
 | `PARCAGPU_PC_HW_BUFFER_MB` | (unset) | Force the CUPTI PC-sampling hardware buffer to this many MB. Unset or 0 leaves it at the CUPTI default. |
 
+### Runtime control from parca-agent
+
+parcagpu also takes configuration at runtime from parca-agent over
+[procctl](https://github.com/parca-dev/procctl) (vendored as `src/procctl.h`):
+each process creates a small sealed memfd named `procctl:parcagpu-v1` that the
+agent finds through `/proc` and writes to, and reports back the devices it
+uses. The schema is `src/parcagpu_ctl.h`.
+
+With no agent, an agent that sends no configuration, or an agent whose lease
+has expired (it stopped heartbeating), parcagpu runs on the environment
+variables above. A configuration that fails validation is not acknowledged and
+has no effect.
+
 ### Monitoring with bpftrace
 
 ```bash
@@ -82,6 +95,7 @@ The activity parser attaches to all USDT probes via eBPF, captures events throug
 make test           # Basic mock CUPTI test (no GPU, no BPF)
 make test-nvtx      # NVTX collector unit test (no GPU, no BPF)
 make test-nvtx-real # Real NVTX clients + BPF parser, end to end (no GPU; sudo; NVTX_PYTHON=... adds the Python nvtx case)
+make test-agent-ctl # Agent control over procctl, from a Go agent (no GPU, no root)
 make test-pc-mock   # Mock PC sampling with BPF activity parser (no GPU, requires root)
 make test-pc-real   # Real PC sampling with GPU (requires root + GPU)
 make test-multi     # test_cupti_prof + BPF activity parser in parallel (requires root)
@@ -145,6 +159,9 @@ Defined in `src/probes.d`, provider `parcagpu`:
 ├── src/
 │   ├── cupti.cpp         # Main CUPTI profiler implementation
 │   ├── pc_sampling.cpp   # PC sampling support
+│   ├── agent_ctl.cpp     # Runtime control from parca-agent (procctl)
+│   ├── parcagpu_ctl.h    # Its schema
+│   ├── procctl.h         # Vendored procctl (process side)
 │   ├── probes.d          # USDT probe definitions
 │   └── ...
 ├── ebpf/
@@ -155,6 +172,7 @@ Defined in `src/probes.d`, provider `parcagpu`:
 │   ├── mock_cuda.c       # Mock CUDA driver library
 │   ├── test-pc-mock.sh   # Mock PC sampling end-to-end test
 │   ├── test-pc-real.sh   # Real GPU PC sampling end-to-end test
+│   ├── agentctl/         # Agent control tests (Go, procctl agent side)
 │   └── bpf/              # BPF activity parser (Go + eBPF)
 ├── microbenchmarks/      # CUDA microbenchmarks (.cu)
 └── parcagpu.bt           # bpftrace monitoring script
