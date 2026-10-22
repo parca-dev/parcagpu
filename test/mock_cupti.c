@@ -2,6 +2,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <cuda.h>
 #include <cupti.h>
 #include <cupti_pcsampling.h>
@@ -171,7 +174,10 @@ CUptiResult cuptiActivityGetNumDroppedRecords(CUcontext context,
     return CUPTI_SUCCESS;
 }
 
+static void __pc_state_getid(void);
+
 CUptiResult cuptiGetContextId(CUcontext context, uint32_t *contextId) {
+    __pc_state_getid();
     // Mock contexts are small integers (1 + GPU index, see test_cupti_prof),
     // so the context pointer doubles as its ID. NULL keeps the old fixed ID.
     *contextId = context ? (uint32_t)(uintptr_t)context : 1;
@@ -253,6 +259,39 @@ static int __pc_getdata_unknown;
 // sampling the GPU. Starts on it are counted to check the profiler backs off.
 static int __pc_unknown_ctx = -1;
 static int __pc_unknown_ctx_starts;
+// Sampling period set per context (0 = not set).
+static uint32_t __pc_period[MOCK_MAX_CTX + 1];
+
+// MOCK_PC_STATE_FILE=<path>: a shared mapping of the per-context state, for
+// tests that watch it from outside the process: for each context index i
+// (0..MOCK_MAX_CTX), uint32 [2i] = sampling now, [2i+1] = starts so far;
+// then bad starts, bad stops, and cuptiGetContextId calls; then, per context
+// index, whether PC sampling is enabled.
+static uint32_t *__pc_state_file;
+#define MOCK_PC_ENABLED_WORD (2 * (MOCK_MAX_CTX + 1) + 3)
+#define MOCK_PC_STATE_WORDS (MOCK_PC_ENABLED_WORD + MOCK_MAX_CTX + 1)
+
+static void __pc_state_enabled(CUcontext ctx, uint32_t on);
+
+static void __pc_state_getid(void) {
+    if (__pc_state_file)
+        __atomic_fetch_add(&__pc_state_file[2 * (MOCK_MAX_CTX + 1) + 2], 1,
+                           __ATOMIC_RELEASE);
+}
+
+static void __pc_state_bad(int stop) {
+    if (__pc_state_file)
+        __atomic_fetch_add(&__pc_state_file[2 * (MOCK_MAX_CTX + 1) + stop], 1,
+                           __ATOMIC_RELEASE);
+}
+
+static void __pc_state_set(int i, int started) {
+    if (!__pc_state_file)
+        return;
+    __atomic_store_n(&__pc_state_file[2 * i], (uint32_t)started, __ATOMIC_RELEASE);
+    if (started)
+        __atomic_fetch_add(&__pc_state_file[2 * i + 1], 1, __ATOMIC_RELEASE);
+}
 
 static int __mock_ctx_index(CUcontext ctx) {
     uintptr_t id = ctx ? (uintptr_t)ctx : 1;
@@ -263,6 +302,24 @@ __attribute__((constructor)) static void __mock_pc_init(void) {
     const char *e = getenv("MOCK_PC_UNKNOWN_CTX");
     if (e)
         __pc_unknown_ctx = atoi(e);
+    const char *f = getenv("MOCK_PC_STATE_FILE");
+    if (f) {
+        size_t size = MOCK_PC_STATE_WORDS * sizeof(uint32_t);
+        int fd = open(f, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0 && ftruncate(fd, (off_t)size) == 0) {
+            void *m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (m != MAP_FAILED)
+                __pc_state_file = (uint32_t *)m;
+        }
+        if (fd >= 0)
+            close(fd);
+    }
+}
+
+static void __pc_state_enabled(CUcontext ctx, uint32_t on) {
+    if (__pc_state_file)
+        __atomic_store_n(&__pc_state_file[MOCK_PC_ENABLED_WORD + __mock_ctx_index(ctx)],
+                         on, __ATOMIC_RELEASE);
 }
 
 // Exported: test_cupti_prof ends in _exit(), which skips destructors, so the
@@ -278,13 +335,14 @@ void __mock_pc_report(void) {
 }
 
 CUptiResult cuptiPCSamplingEnable(CUpti_PCSamplingEnableParams *params) {
-    (void)params;
+    __pc_state_enabled(params->ctx, 1);
     fprintf(stderr, "[MOCK_CUPTI] cuptiPCSamplingEnable()\n");
     return CUPTI_SUCCESS;
 }
 
 CUptiResult cuptiPCSamplingDisable(CUpti_PCSamplingDisableParams *params) {
-    (void)params;
+    __pc_period[__mock_ctx_index(params->ctx)] = 0;
+    __pc_state_enabled(params->ctx, 0);
     fprintf(stderr, "[MOCK_CUPTI] cuptiPCSamplingDisable()\n");
     return CUPTI_SUCCESS;
 }
@@ -295,9 +353,11 @@ CUptiResult cuptiPCSamplingStart(CUpti_PCSamplingStartParams *params) {
         __atomic_fetch_add(&__pc_unknown_ctx_starts, 1, __ATOMIC_RELAXED);
     if (__atomic_exchange_n(&__pc_started[i], 1, __ATOMIC_ACQ_REL)) {
         __atomic_fetch_add(&__pc_bad_starts, 1, __ATOMIC_RELAXED);
+        __pc_state_bad(0);
         return CUPTI_ERROR_INVALID_OPERATION;
     }
     __atomic_fetch_add(&__pc_starts, 1, __ATOMIC_RELAXED);
+    __pc_state_set(i, 1);
     int cur = __atomic_add_fetch(&__pc_cur_started, 1, __ATOMIC_ACQ_REL);
     int max = __atomic_load_n(&__pc_max_started, __ATOMIC_RELAXED);
     while (cur > max &&
@@ -311,9 +371,11 @@ CUptiResult cuptiPCSamplingStop(CUpti_PCSamplingStopParams *params) {
     int i = __mock_ctx_index(params->ctx);
     if (!__atomic_exchange_n(&__pc_started[i], 0, __ATOMIC_ACQ_REL)) {
         __atomic_fetch_add(&__pc_bad_stops, 1, __ATOMIC_RELAXED);
+        __pc_state_bad(1);
         return CUPTI_ERROR_INVALID_OPERATION;
     }
     __atomic_fetch_add(&__pc_stops, 1, __ATOMIC_RELAXED);
+    __pc_state_set(i, 0);
     __atomic_sub_fetch(&__pc_cur_started, 1, __ATOMIC_ACQ_REL);
     return CUPTI_SUCCESS;
 }
@@ -324,6 +386,9 @@ CUptiResult cuptiPCSamplingGetConfigurationAttribute(
     CUpti_PCSamplingConfigurationInfoParams *params) {
     const char *e = getenv("MOCK_PC_PERIOD");
     uint32_t period = e ? (uint32_t)atoi(e) : 10;
+    uint32_t set = __pc_period[__mock_ctx_index(params->ctx)];
+    if (set && period)
+        period = set;
     for (size_t i = 0; i < params->numAttributes; i++) {
         CUpti_PCSamplingConfigurationInfo *info =
             &params->pPCSamplingConfigurationInfo[i];
@@ -342,7 +407,14 @@ CUptiResult cuptiPCSamplingGetConfigurationAttribute(
 
 CUptiResult cuptiPCSamplingSetConfigurationAttribute(
     CUpti_PCSamplingConfigurationInfoParams *params) {
-    (void)params;
+    for (size_t i = 0; i < params->numAttributes; i++) {
+        CUpti_PCSamplingConfigurationInfo *info =
+            &params->pPCSamplingConfigurationInfo[i];
+        if (info->attributeType ==
+            CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD)
+            __pc_period[__mock_ctx_index(params->ctx)] =
+                info->attributeData.samplingPeriodData.samplingPeriod;
+    }
     fprintf(stderr, "[MOCK_CUPTI] cuptiPCSamplingSetConfigurationAttribute()\n");
     return CUPTI_SUCCESS;
 }

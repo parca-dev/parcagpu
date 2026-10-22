@@ -69,10 +69,25 @@ each process creates a small sealed memfd named `procctl:parcagpu-v1` that the
 agent finds through `/proc` and writes to, and reports back the devices it
 uses. The schema is `src/parcagpu_ctl.h`.
 
+The agent drives PC sampling. CUPTI can PC sample one process per GPU at a
+time, so parca-agent hands each GPU to one process at a time and rotates it.
+Its configuration says, per device the process reported, whether to sample
+there, the sampling factor (`PARCAGPU_SAMPLING_FACTOR`'s meaning, applied
+live), and the duty cycle: windows of a given length (default 30 ms) with a
+given gap between them, each opening on the first kernel launch after the gap.
+A process sets a context up for PC sampling only when its device is granted,
+and disables it when the device is taken away: on a GB10 the GPU's sampler
+belongs to the first process that enabled PC sampling, until it disables it.
+parcagpu acknowledges a configuration once it has taken effect, so an ack with
+the device off means the GPU is free. A small thread makes that happen within
+~100 ms even when the application makes no CUDA calls; it never starts
+sampling itself. A device that another process samples, or whose setup
+failed, is reported as unavailable.
+
 With no agent, an agent that sends no configuration, or an agent whose lease
 has expired (it stopped heartbeating), parcagpu runs on the environment
-variables above. A configuration that fails validation is not acknowledged and
-has no effect.
+variables above. A configuration that fails validation is not acknowledged
+and has no effect.
 
 ### Monitoring with bpftrace
 
