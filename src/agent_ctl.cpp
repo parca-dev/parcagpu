@@ -49,6 +49,7 @@ namespace {
 constexpr uint64_t kLeaseCheckNs = 250'000'000ULL;
 constexpr uint32_t kMaxWindowMs = 10'000;
 constexpr uint32_t kMaxGapMs = 60'000;
+constexpr uint32_t kMaxRateLimit = 1'000'000;
 constexpr long kReleaseTickNs = 100'000'000L;
 
 procctl_t g_ctx;
@@ -60,6 +61,9 @@ std::atomic<bool> g_ready{false};
 // bit 63 active, bits 0-15 devices, 16-21 factor, 22-35 window ms, 36-51 gap
 // ms.
 std::atomic<uint64_t> g_config{0};
+// The rate limits, bits 0-31 and 32-63; 0 while inactive.
+std::atomic<uint64_t> g_rates{0};
+uint32_t g_envRateLimit = 0, g_envGraphRateLimit = 0; // under g_devMutex
 std::atomic<uint64_t> g_configGen{0};
 std::atomic<uint64_t> g_nextLeaseCheckNs{0};
 std::atomic<bool> g_leaseExpired{true};
@@ -116,6 +120,7 @@ void atforkChild() {
     procctl_close(&g_ctx);
   }
   g_config.store(0, std::memory_order_relaxed);
+  g_rates.store(0, std::memory_order_relaxed);
 }
 
 bool valid(const parcagpu_ctl_config &c, uint32_t numDevices) {
@@ -125,12 +130,15 @@ bool valid(const parcagpu_ctl_config &c, uint32_t numDevices) {
   if (c.pc_sampling_window_ms > kMaxWindowMs ||
       c.pc_sampling_gap_ms > kMaxGapMs)
     return false;
+  if (c.rate_limit > kMaxRateLimit || c.graph_rate_limit > kMaxRateLimit)
+    return false;
   return (c.pc_sampling_devices >> numDevices) == 0;
 }
 
 // A change to apply: a new generation (ack it after), or the lease expiring.
 struct Update {
   uint64_t packed = 0;
+  uint64_t rates = 0;
   uint64_t gen = 0;
   bool ack = false;
 };
@@ -157,6 +165,9 @@ bool decode(int n, const parcagpu_ctl_config &c, uint64_t gen, Update *u) {
     }
   }
   u->packed = n == -ENODATA ? 0 : pack(c);
+  u->rates = n == -ENODATA ? 0
+                           : (uint64_t)c.rate_limit |
+                                 ((uint64_t)c.graph_rate_limit << 32);
   u->gen = gen;
   u->ack = true;
   return true;
@@ -181,9 +192,13 @@ bool checkLease(Update *u) {
 }
 
 // Reports pc_state for the configuration just applied: ON where it grants
-// sampling, OFF elsewhere (sampling there has been stopped).
-void reportLocked(uint64_t packed) {
+// sampling, OFF elsewhere (sampling there has been stopped); and the rate
+// limits in effect.
+void reportLocked(uint64_t packed, uint64_t rates) {
   bool active = (packed >> 63) != 0;
+  uint32_t rate = (uint32_t)rates, graphRate = (uint32_t)(rates >> 32);
+  g_state.rate_limit = rate ? rate : g_envRateLimit;
+  g_state.graph_rate_limit = graphRate ? graphRate : g_envGraphRateLimit;
   for (uint32_t i = 0; i < g_state.num_devices; i++) {
     g_state.devices[i].pc_state =
         active && ((packed >> i) & 1) ? PARCAGPU_PC_ON : PARCAGPU_PC_OFF;
@@ -198,12 +213,13 @@ void apply(const Update &u) {
   t_applying = true;
   g_apply.load(std::memory_order_acquire)([&] {
     g_config.store(u.packed, std::memory_order_release);
+    g_rates.store(u.rates, std::memory_order_release);
     g_configGen.fetch_add(1, std::memory_order_release);
   });
   t_applying = false;
   {
     std::lock_guard<std::mutex> lock2(g_devMutex);
-    reportLocked(u.packed);
+    reportLocked(u.packed, u.rates);
   }
   if (u.ack) {
     g_appliedGen = u.gen;
@@ -358,6 +374,9 @@ AgentConfig agentCtlConfig() {
   c.factor = (uint32_t)((v >> 16) & 0x3f);
   c.windowMs = (uint32_t)((v >> 22) & 0x3fff);
   c.gapMs = (uint32_t)((v >> 36) & 0xffff);
+  uint64_t r = g_rates.load(std::memory_order_acquire);
+  c.rateLimit = (uint32_t)r;
+  c.graphRateLimit = (uint32_t)(r >> 32);
   return c;
 }
 
@@ -372,6 +391,16 @@ bool agentCtlAllows(CUcontext ctx, bool envDefault) {
   std::lock_guard<std::mutex> lock(g_devMutex);
   int slot = slotLocked(ctx);
   return slot >= 0 && ((v >> slot) & 1);
+}
+
+void agentCtlSetEnvRateLimits(uint32_t rateLimit, uint32_t graphRateLimit) {
+  if (!agentCtlReady())
+    return;
+  std::lock_guard<std::mutex> lock(g_devMutex);
+  g_envRateLimit = rateLimit;
+  g_envGraphRateLimit = graphRateLimit;
+  reportLocked(g_config.load(std::memory_order_acquire),
+               g_rates.load(std::memory_order_acquire));
 }
 
 void agentCtlSetCapable(bool capable) {

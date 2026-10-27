@@ -25,6 +25,9 @@ type config struct {
 	Factor   uint32
 	WindowMs uint32
 	GapMs    uint32
+	// Launch probe rate limits.
+	RateLimit      uint32
+	GraphRateLimit uint32
 }
 
 type device struct {
@@ -36,9 +39,11 @@ type device struct {
 }
 
 type state struct {
-	PCCapable  uint32
-	NumDevices uint32
-	Devices    [16]device
+	PCCapable      uint32
+	RateLimit      uint32
+	GraphRateLimit uint32
+	NumDevices     uint32
+	Devices        [16]device
 }
 
 const (
@@ -307,6 +312,8 @@ func TestConfigAck(t *testing.T) {
 		{"factor too large", &config{Factor: 32}, false},
 		{"window too long", &config{WindowMs: 10001}, false},
 		{"unknown device", &config{Devices: 1 << 2}, false},
+		{"rate limit too high", &config{RateLimit: 1000001}, false},
+		{"graph rate limit too high", &config{GraphRateLimit: 1000001}, false},
 		{"valid again", &config{Devices: 1, Factor: 31, WindowMs: 10000}, true},
 	} {
 		wait := 5 * time.Second
@@ -486,4 +493,31 @@ func TestLeaseExpiry(t *testing.T) {
 			})
 		})
 	}
+}
+
+// The agent's launch probe rate limits replace the environment's while it
+// sets them; parcagpu reports those in effect.
+func TestRateLimits(t *testing.T) {
+	p := start(t, []string{"PARCAGPU_RATE_LIMIT=50"}, "--num-gpus=1")
+	p.devices(1)
+	rates := func(want, wantGraph uint32) func() error {
+		return func() error {
+			s, err := p.state()
+			if err == nil && (s.RateLimit != want || s.GraphRateLimit != wantGraph) {
+				err = fmt.Errorf("rate limits %d %d", s.RateLimit, s.GraphRateLimit)
+			}
+			return err
+		}
+	}
+	p.eventually("the environment's", rates(50, 20))
+	if !p.write(&config{RateLimit: 1000, GraphRateLimit: 5}, 5*time.Second) {
+		t.Fatal("not acked")
+	}
+	p.eventually("the agent's", rates(1000, 5))
+	if !p.write(&config{GraphRateLimit: 7}, 5*time.Second) {
+		t.Fatal("not acked")
+	}
+	p.eventually("environment's kernel launch rate", rates(50, 7))
+	p.stopAgent()
+	p.eventually("the environment's after lease expiry", rates(50, 20))
 }

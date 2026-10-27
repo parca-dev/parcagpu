@@ -41,9 +41,10 @@ thread_local uint32_t runtimeEnterCorrelationId = 0;
 
 uint32_t currentRuntimeCorrelationId() { return runtimeEnterCorrelationId; }
 
-// Configured probe rates (tokens/sec), read from env once in init_debug.
-// Globals because the buckets below are thread_local: setRate from init_debug
-// would only reach the single thread that ran it.
+// Configured probe rates (tokens/sec), read from env once in init_debug; the
+// agent's, when it sets them, take precedence. Globals because the buckets
+// below are thread_local: setRate from init_debug would only reach the single
+// thread that ran it.
 std::atomic<double> g_eagerRateLimit{100.0};
 std::atomic<double> g_graphRateLimit{20.0};
 
@@ -53,14 +54,21 @@ std::atomic<double> g_graphRateLimit{20.0};
 thread_local TokenBucket callbackLimiter(100.0);
 thread_local TokenBucket graphCallbackLimiter(20.0);
 
-// Copy the configured rates into this thread's buckets, once per thread.
-static inline void applyRateLimitsOnce() {
-  thread_local bool applied = false;
-  if (!applied) {
-    callbackLimiter.setRate(g_eagerRateLimit.load(std::memory_order_relaxed));
-    graphCallbackLimiter.setRate(g_graphRateLimit.load(std::memory_order_relaxed));
-    applied = true;
-  }
+// Copy the configured rates into this thread's buckets: once per thread, and
+// again whenever the agent's configuration changes.
+static inline void applyRateLimits() {
+  thread_local uint64_t appliedGen = UINT64_MAX;
+  const uint64_t gen = parcagpu::agentCtlGeneration();
+  if (appliedGen == gen)
+    return;
+  appliedGen = gen;
+  const parcagpu::AgentConfig cfg = parcagpu::agentCtlConfig();
+  callbackLimiter.setRate(
+      cfg.rateLimit ? cfg.rateLimit
+                    : g_eagerRateLimit.load(std::memory_order_relaxed));
+  graphCallbackLimiter.setRate(
+      cfg.graphRateLimit ? cfg.graphRateLimit
+                         : g_graphRateLimit.load(std::memory_order_relaxed));
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +285,10 @@ public:
         parcagpu::PCSampling::isSupported(parcagpu::agentCtlReady());
     pcSampling.envSampling = parcagpu::PCSampling::envRequested();
     parcagpu::agentCtlSetCapable(pcSamplingEnabled);
+    init_debug(); // reads the environment's rate limits
+    parcagpu::agentCtlSetEnvRateLimits(
+        (uint32_t)g_eagerRateLimit.load(std::memory_order_relaxed),
+        (uint32_t)g_graphRateLimit.load(std::memory_order_relaxed));
     if (pcSamplingEnabled) {
       DEBUG_PRINTF("[PARCAGPU] PC sampling enabled (serialized mode)\n");
     } else {
@@ -773,7 +785,7 @@ private:
       // every kernel needs its correlation callback to match PC samples to
       // CPU stacks on the agent side.
       if (!profiler.pcSampling.isSampling(cbdata->context)) {
-        applyRateLimitsOnce();
+        applyRateLimits();
         TokenBucket &limiter =
             isGraphLaunch ? graphCallbackLimiter : callbackLimiter;
         if (!limiter.tryAcquire()) {

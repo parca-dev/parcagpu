@@ -84,6 +84,10 @@ the device off means the GPU is free. A small thread makes that happen within
 sampling itself. A device that another process samples, or whose setup
 failed, is reported as unavailable.
 
+The agent can also set the launch probe rate limits (`PARCAGPU_RATE_LIMIT`
+and `PARCAGPU_GRAPH_RATE_LIMIT`'s meaning, applied live); a limit it leaves at
+0 stays the environment's. Each process reports the limits in effect.
+
 With no agent, an agent that sends no configuration, or an agent whose lease
 has expired (it stopped heartbeating), parcagpu runs on the environment
 variables above. A configuration that fails validation is not acknowledged
