@@ -61,6 +61,38 @@ is attached to the `nvtx_event_batch` probe.
 | `PARCAGPU_SAMPLING_FACTOR` | 20 | Hardware PC sampling period (log2 cycles between samples). Only takes effect when PC sampling is enabled via `PARCAGPU_PC_SAMPLING_RATE`. |
 | `PARCAGPU_PC_HW_BUFFER_MB` | (unset) | Force the CUPTI PC-sampling hardware buffer to this many MB. Unset or 0 leaves it at the CUPTI default. |
 
+### Runtime control from parca-agent
+
+parcagpu also takes configuration at runtime from parca-agent over
+[procctl](https://github.com/parca-dev/procctl) (vendored as `src/procctl.h`):
+each process creates a small sealed memfd named `procctl:parcagpu-v1` that the
+agent finds through `/proc` and writes to, and reports back the devices it
+uses. The schema is `src/parcagpu_ctl.h`.
+
+The agent drives PC sampling. CUPTI can PC sample one process per GPU at a
+time, so parca-agent hands each GPU to one process at a time and rotates it.
+Its configuration says, per device the process reported, whether to sample
+there, the sampling factor (`PARCAGPU_SAMPLING_FACTOR`'s meaning, applied
+live), and the duty cycle: windows of a given length (default 30 ms) with a
+given gap between them, each opening on the first kernel launch after the gap.
+A process sets a context up for PC sampling only when its device is granted,
+and disables it when the device is taken away: on a GB10 the GPU's sampler
+belongs to the first process that enabled PC sampling, until it disables it.
+parcagpu acknowledges a configuration once it has taken effect, so an ack with
+the device off means the GPU is free. A small thread makes that happen within
+~100 ms even when the application makes no CUDA calls; it never starts
+sampling itself. A device that another process samples, or whose setup
+failed, is reported as unavailable.
+
+The agent can also set the launch probe rate limits (`PARCAGPU_RATE_LIMIT`
+and `PARCAGPU_GRAPH_RATE_LIMIT`'s meaning, applied live); a limit it leaves at
+0 stays the environment's. Each process reports the limits in effect.
+
+With no agent, an agent that sends no configuration, or an agent whose lease
+has expired (it stopped heartbeating), parcagpu runs on the environment
+variables above. A configuration that fails validation is not acknowledged
+and has no effect.
+
 ### Monitoring with bpftrace
 
 ```bash
@@ -82,6 +114,7 @@ The activity parser attaches to all USDT probes via eBPF, captures events throug
 make test           # Basic mock CUPTI test (no GPU, no BPF)
 make test-nvtx      # NVTX collector unit test (no GPU, no BPF)
 make test-nvtx-real # Real NVTX clients + BPF parser, end to end (no GPU; sudo; NVTX_PYTHON=... adds the Python nvtx case)
+make test-agent-ctl # Agent control over procctl, from a Go agent (no GPU, no root)
 make test-pc-mock   # Mock PC sampling with BPF activity parser (no GPU, requires root)
 make test-pc-real   # Real PC sampling with GPU (requires root + GPU)
 make test-multi     # test_cupti_prof + BPF activity parser in parallel (requires root)
@@ -145,6 +178,9 @@ Defined in `src/probes.d`, provider `parcagpu`:
 ├── src/
 │   ├── cupti.cpp         # Main CUPTI profiler implementation
 │   ├── pc_sampling.cpp   # PC sampling support
+│   ├── agent_ctl.cpp     # Runtime control from parca-agent (procctl)
+│   ├── parcagpu_ctl.h    # Its schema
+│   ├── procctl.h         # Vendored procctl (process side)
 │   ├── probes.d          # USDT probe definitions
 │   └── ...
 ├── ebpf/
@@ -155,6 +191,7 @@ Defined in `src/probes.d`, provider `parcagpu`:
 │   ├── mock_cuda.c       # Mock CUDA driver library
 │   ├── test-pc-mock.sh   # Mock PC sampling end-to-end test
 │   ├── test-pc-real.sh   # Real GPU PC sampling end-to-end test
+│   ├── agentctl/         # Agent control tests (Go, procctl agent side)
 │   └── bpf/              # BPF activity parser (Go + eBPF)
 ├── microbenchmarks/      # CUDA microbenchmarks (.cu)
 └── parcagpu.bt           # bpftrace monitoring script

@@ -98,6 +98,7 @@ set(PROTON_SOURCES
 # Build the shared library
 add_library(parcagpucupti SHARED
     src/cupti.cpp
+    src/agent_ctl.cpp
     src/pc_sampling.cpp
     src/correlation_filter.cpp
     src/env_config.cpp

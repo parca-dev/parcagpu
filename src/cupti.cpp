@@ -17,6 +17,7 @@
 #include "Driver/GPU/CuptiApi.h"
 #include "Profiler/Cupti/CuptiCallbacks.h"
 #include "Utility/Singleton.h"
+#include "agent_ctl.h"
 #include "correlation_filter.h"
 #include "env_config.h"
 #include "nvtx_collector.h"
@@ -40,9 +41,10 @@ thread_local uint32_t runtimeEnterCorrelationId = 0;
 
 uint32_t currentRuntimeCorrelationId() { return runtimeEnterCorrelationId; }
 
-// Configured probe rates (tokens/sec), read from env once in init_debug.
-// Globals because the buckets below are thread_local: setRate from init_debug
-// would only reach the single thread that ran it.
+// Configured probe rates (tokens/sec), read from env once in init_debug; the
+// agent's, when it sets them, take precedence. Globals because the buckets
+// below are thread_local: setRate from init_debug would only reach the single
+// thread that ran it.
 std::atomic<double> g_eagerRateLimit{100.0};
 std::atomic<double> g_graphRateLimit{20.0};
 
@@ -52,14 +54,21 @@ std::atomic<double> g_graphRateLimit{20.0};
 thread_local TokenBucket callbackLimiter(100.0);
 thread_local TokenBucket graphCallbackLimiter(20.0);
 
-// Copy the configured rates into this thread's buckets, once per thread.
-static inline void applyRateLimitsOnce() {
-  thread_local bool applied = false;
-  if (!applied) {
-    callbackLimiter.setRate(g_eagerRateLimit.load(std::memory_order_relaxed));
-    graphCallbackLimiter.setRate(g_graphRateLimit.load(std::memory_order_relaxed));
-    applied = true;
-  }
+// Copy the configured rates into this thread's buckets: once per thread, and
+// again whenever the agent's configuration changes.
+static inline void applyRateLimits() {
+  thread_local uint64_t appliedGen = UINT64_MAX;
+  const uint64_t gen = parcagpu::agentCtlGeneration();
+  if (appliedGen == gen)
+    return;
+  appliedGen = gen;
+  const parcagpu::AgentConfig cfg = parcagpu::agentCtlConfig();
+  callbackLimiter.setRate(
+      cfg.rateLimit ? cfg.rateLimit
+                    : g_eagerRateLimit.load(std::memory_order_relaxed));
+  graphCallbackLimiter.setRate(
+      cfg.graphRateLimit ? cfg.graphRateLimit
+                         : g_graphRateLimit.load(std::memory_order_relaxed));
 }
 
 // ---------------------------------------------------------------------------
@@ -115,14 +124,12 @@ struct PCRateController {
 };
 static PCRateController g_pcController;
 
-// Per-thread sampling state. A thread owns at most one window at a time, on
-// the context it started; other threads may own windows on other contexts.
+// Per-thread state for opening windows. A window itself belongs to its
+// context (PCSampling): any thread launching there drains and closes it, so
+// it lasts its length even if the thread that opened it goes quiet.
 struct PCSamplingState {
-  bool active = false;        // This thread owns an open window
-  CUcontext ctx = nullptr;    // Context the window was started on
-  uint64_t windowStartNs = 0; // When the current window opened
-  uint64_t lastCheckNs = 0;   // Last time we rolled the dice
-  unsigned int rngSeed = 0;   // Thread-local RNG state
+  uint64_t lastCheckNs = 0; // Last time this thread tried to open a window
+  unsigned int rngSeed = 0; // Thread-local RNG state
 };
 thread_local PCSamplingState g_pcSamplingState;
 
@@ -269,8 +276,19 @@ public:
 
     DEBUG_PRINTF("[PARCAGPU] Starting initialization\n");
 
-    // Check if PC sampling is supported
-    pcSamplingEnabled = parcagpu::PCSampling::isSupported();
+    parcagpu::agentCtlInit();
+
+    // Check if PC sampling is supported: asked for by the environment, or
+    // possible under agent control (contexts are set up for it, but sample
+    // only when the agent says so).
+    pcSamplingEnabled =
+        parcagpu::PCSampling::isSupported(parcagpu::agentCtlReady());
+    pcSampling.envSampling = parcagpu::PCSampling::envRequested();
+    parcagpu::agentCtlSetCapable(pcSamplingEnabled);
+    init_debug(); // reads the environment's rate limits
+    parcagpu::agentCtlSetEnvRateLimits(
+        (uint32_t)g_eagerRateLimit.load(std::memory_order_relaxed),
+        (uint32_t)g_graphRateLimit.load(std::memory_order_relaxed));
     if (pcSamplingEnabled) {
       DEBUG_PRINTF("[PARCAGPU] PC sampling enabled (serialized mode)\n");
     } else {
@@ -299,9 +317,14 @@ public:
     proton::cupti::enableCallback<true>(1, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
                                         CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
 
-    // Enable resource callbacks only if PC sampling is enabled
+    // Enable resource callbacks only if PC sampling is enabled. Context
+    // creation always: it feeds the device table reported to the agent.
     if (pcSamplingEnabled) {
       proton::setResourceCallbacks(subscriber, /*enable=*/true);
+    } else {
+      proton::cupti::enableCallback<false>(
+          1, subscriber, CUPTI_CB_DOMAIN_RESOURCE,
+          CUPTI_CBID_RESOURCE_CONTEXT_CREATED);
     }
 
     // NVTX goes through our own injection (nvtx_injection.cpp), not CUPTI.
@@ -329,6 +352,8 @@ public:
       DEBUG_PRINTF("[PARCAGPU] Enabled CONCURRENT_KERNEL activity\n");
     }
 
+    parcagpu::agentCtlStart(applyAgentConfig);
+
     DEBUG_PRINTF("[PARCAGPU] Successfully initialized CUPTI callbacks\n");
     return true;
   }
@@ -339,6 +364,8 @@ public:
     }
 
     DEBUG_PRINTF("[PARCAGPU] Cleanup started\n");
+
+    parcagpu::agentCtlShutdown();
 
     // PC sampling data is drained in finalize() during CONTEXT_DESTROY_STARTING
     // when the CUDA context is still valid. By the time cleanup() runs, the
@@ -357,6 +384,10 @@ public:
           CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
       if (pcSamplingEnabled) {
         proton::setResourceCallbacks(subscriber, /*enable=*/false);
+      } else {
+        proton::cupti::enableCallback<false>(
+            0, subscriber, CUPTI_CB_DOMAIN_RESOURCE,
+            CUPTI_CBID_RESOURCE_CONTEXT_CREATED);
       }
     }
     // Flush this thread's pending NVTX batch; other live threads drain
@@ -399,6 +430,17 @@ private:
 
   // Outstanding event counter for flushing
   size_t outstandingEvents = 0;
+
+  static void applyAgentConfig(const std::function<void()> &commit) {
+    CuptiProfiler::instance().pcSampling.applyAgentConfig(commit);
+  }
+
+  // How long a PC sampling window stays open: the agent's length if it set
+  // one. Dice rolls stay kPCSamplingIntervalNs apart.
+  static uint64_t pcWindowNs(const AgentConfig &cfg) {
+    return cfg.active && cfg.windowMs ? cfg.windowMs * 1'000'000ULL
+                                      : kPCSamplingIntervalNs;
+  }
 
   // Buffer management - using Proton's pattern (static methods)
   // A kernel activity is around 224 bytes so a 128kb buffer
@@ -547,14 +589,19 @@ private:
     try {
     auto &profiler = CuptiProfiler::instance();
 
+    parcagpu::agentCtlPoll();
+
     if (domain == CUPTI_CB_DOMAIN_RESOURCE) {
-      // Handle resource callbacks for PC sampling (only if enabled)
+      const CUpti_ResourceData *resData =
+          static_cast<const CUpti_ResourceData *>(cbdata_void);
+      if (cbid == CUPTI_CBID_RESOURCE_CONTEXT_CREATED) {
+        parcagpu::agentCtlAddContext(resData->context);
+      }
+
+      // The rest is for PC sampling (only if enabled)
       if (!profiler.pcSamplingEnabled) {
         return;
       }
-
-      const CUpti_ResourceData *resData =
-          static_cast<const CUpti_ResourceData *>(cbdata_void);
 
       switch (cbid) {
       case CUPTI_CBID_RESOURCE_MODULE_LOADED: {
@@ -582,7 +629,11 @@ private:
       case CUPTI_CBID_RESOURCE_CONTEXT_CREATED: {
         CUcontext ctx = resData->context;
         DEBUG_PRINTF("[PARCAGPU] Context created: %p\n", ctx);
-        profiler.pcSampling.initialize(ctx);
+        // Under agent control a context is set up for PC sampling only once
+        // its device is granted (PCSampling::prepare), as on a GB10 the first
+        // process to enable it owns the GPU's sampler.
+        if (profiler.pcSampling.envSampling && !agentCtlConfig().active)
+          profiler.pcSampling.initialize(ctx, 0);
         break;
       }
       case CUPTI_CBID_RESOURCE_CONTEXT_DESTROY_STARTING: {
@@ -613,24 +664,36 @@ private:
           runtimeEnterCorrelationId = correlationId;
 
         if (profiler.pcSamplingEnabled) {
-          if (isKernelLaunchCb) {
+          // Sample if the agent's configuration grants this context's
+          // device, or with no agent configuration if the environment asks.
+          const AgentConfig cfg = agentCtlConfig();
+          if (isKernelLaunchCb &&
+              (cfg.active || profiler.pcSampling.envSampling)) {
             auto &st = g_pcSamplingState;
             uint64_t now = nowNs();
 
-            if (!st.active &&
-                (now - st.lastCheckNs >= kPCSamplingIntervalNs)) {
+            if ((now - st.lastCheckNs >= kPCSamplingIntervalNs) &&
+                agentCtlAllows(cbdata->context,
+                               profiler.pcSampling.envSampling)) {
               st.lastCheckNs = now;
-              const double p = g_pcController.probability.load(
-                  std::memory_order_relaxed);
-              // start() is false if this context is already sampling
-              // (another thread's window) or can't sample; only a window
-              // we actually started is ours to close.
-              if (threadRandom(st) < p &&
-                  profiler.pcSampling.start(cbdata->context)) {
-                st.active = true;
-                st.ctx = cbdata->context;
-                st.windowStartNs = now;
-              }
+              // First set the context up, bring it to the agent's factor, or
+              // re-arm it after a failure (skipped while it samples). The
+              // context is current here.
+              profiler.pcSampling.prepare(cbdata->context,
+                                          cfg.active ? cfg.factor : 0,
+                                          agentCtlGeneration(), cfg.active);
+              // Under the agent, its window and gap set the duty cycle (per
+              // context, in start()); else the dice roll, steered by the
+              // rate controller.
+              bool open = cfg.active ||
+                          threadRandom(st) < g_pcController.probability.load(
+                                                 std::memory_order_relaxed);
+              // start() is false if this context is already sampling or
+              // can't sample.
+              if (open)
+                profiler.pcSampling.start(cbdata->context,
+                                          cfg.active ? cfg.gapMs * 1'000'000ULL
+                                                     : 0);
             }
           }
 
@@ -644,26 +707,25 @@ private:
         return;
       }
 
-      // EXIT: while a sampling window is open, drain CUPTI's host staging
-      // buffer on every CUDA API EXIT — not just launch EXITs. Empty drains
-      // are cheap (single API call returning 0 PCs) and missed drains lose
-      // samples (CUPTI_ERROR_OUT_OF_MEMORY when staging fills). Window close
-      // is still kernel-launch aligned: only check elapsed-time on a launch
-      // EXIT, so the window starts and ends at kernel boundaries. Drain and
-      // stop the window's own context, not this callback's: the thread may
-      // have switched devices since the window opened.
+      // EXIT: while this callback's context has a window open, drain
+      // CUPTI's host staging buffer on every CUDA API EXIT — not just launch
+      // EXITs. Empty drains are cheap (single API call returning 0 PCs) and
+      // missed drains lose samples (CUPTI_ERROR_OUT_OF_MEMORY when staging
+      // fills). Window close is still kernel-launch aligned: only check
+      // elapsed-time on a launch EXIT, so the window starts and ends at
+      // kernel boundaries. Any thread does this, not just the one that
+      // opened the window: an opener that goes quiet would otherwise keep
+      // the context's kernels serialized for as long as it stays quiet.
       if (profiler.pcSamplingEnabled) {
-        auto &st = g_pcSamplingState;
-
-        if (st.active) {
+        CUcontext ctx = cbdata->context;
+        if (ctx && profiler.pcSampling.isSampling(ctx)) {
+          const AgentConfig cfg = agentCtlConfig();
           if (isKernelLaunchCb &&
-              (nowNs() - st.windowStartNs >= kPCSamplingIntervalNs)) {
-            profiler.pcSampling.stop(st.ctx);
-            st.active = false;
-            st.ctx = nullptr;
-            controllerMaybeUpdate();
+              profiler.pcSampling.windowDue(ctx, pcWindowNs(cfg))) {
+            if (profiler.pcSampling.stop(ctx) && !cfg.active)
+              controllerMaybeUpdate();
           } else {
-            profiler.pcSampling.collectData(st.ctx);
+            profiler.pcSampling.collectData(ctx);
           }
         }
 
@@ -723,7 +785,7 @@ private:
       // every kernel needs its correlation callback to match PC samples to
       // CPU stacks on the agent side.
       if (!profiler.pcSampling.isSampling(cbdata->context)) {
-        applyRateLimitsOnce();
+        applyRateLimits();
         TokenBucket &limiter =
             isGraphLaunch ? graphCallbackLimiter : callbackLimiter;
         if (!limiter.tryAcquire()) {
