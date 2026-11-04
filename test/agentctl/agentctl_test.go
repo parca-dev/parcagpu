@@ -457,13 +457,13 @@ func TestFactor(t *testing.T) {
 		}
 	}
 	p.grant(config{Devices: 1, Factor: 12, WindowMs: 50}, 2)
-	// Slot 1 was set up at the default (10) by the environment before the
+	// Slot 1 was set up at the default (20) by the environment before the
 	// agent took over; disabled since, it reports what it last used.
-	p.eventually("slot 0 at 12", factors(12, 10))
+	p.eventually("slot 0 at 12", factors(12, 20))
 	p.grant(config{Devices: 3, Factor: 15, WindowMs: 50}, 2)
 	p.eventually("both at 15", factors(15, 15))
 	p.grant(config{Devices: 3, WindowMs: 50}, 2)
-	p.eventually("both back to the default", factors(10, 10))
+	p.eventually("both back to the default", factors(20, 20))
 }
 
 // When the agent's lease expires, parcagpu goes back to its environment:

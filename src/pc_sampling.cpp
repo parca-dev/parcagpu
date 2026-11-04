@@ -229,9 +229,8 @@ uint32_t getGPUSamplingFrequency() {
 }
 
 // The sampling period CUPTI is actually using on `context`, as n in 2^n
-// cycles, or 0 if it can't be read. This, not PARCAGPU_SAMPLING_FACTOR, is
-// what the agent must use to turn sample counts into time: the shim doesn't
-// set the period, and CUPTI's default depends on the GPU (10 on a GB10).
+// cycles, or 0 if it can't be read. This, not the factor parcagpu asked for,
+// is what the agent must use to turn sample counts into time.
 uint32_t readSamplingPeriod(CUcontext context) {
   CUpti_PCSamplingConfigurationInfo info{};
   info.attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD;
@@ -452,18 +451,16 @@ void ConfigureData::initialize(CUcontext context, uint32_t factor) {
                  "(PARCAGPU_PC_HW_BUFFER_MB)\n", hardwareBufferMB);
     configurationInfos.emplace_back(configureHardwareBufferSize());
   }
-  // Sampling period: the agent's factor if it set one, else CUPTI's per-GPU
-  // default unless PARCAGPU_SAMPLING_FACTOR is set. gpu_config reports
-  // whatever CUPTI ends up using (read back in PCSampling::initialize), so the
-  // agent's ns conversion is right either way. Only valid values ([5,31]) are
-  // applied; anything else keeps the default. An explicit period works under
-  // live injection + activity tracing on a GB10 (samples scale as 2^-n),
-  // despite an earlier note that it broke sampling on Blackwell.
-  if (factor == 0) {
-    if (const char *f = std::getenv("PARCAGPU_SAMPLING_FACTOR");
-        f && atoi(f) >= 5 && atoi(f) <= 31)
-      factor = getGPUSamplingFrequency();
-  }
+  // Sampling period: the agent's factor if it set one, else
+  // PARCAGPU_SAMPLING_FACTOR, else 20. Not CUPTI's per-GPU default: that is
+  // 10 on a GB10, a sample every 2^10 cycles per SM, far too dense for an
+  // always-available profiler. gpu_config reports whatever CUPTI ends up
+  // using (read back in PCSampling::initialize), so the agent's ns conversion
+  // is right either way. An explicit period works under live injection +
+  // activity tracing on a GB10 (samples scale as 2^-n), despite an earlier
+  // note that it broke sampling on Blackwell.
+  if (factor == 0)
+    factor = getGPUSamplingFrequency();
   if (factor != 0) {
     DEBUG_PRINTF("[PARCAGPU] Setting PC sampling period = %u\n", factor);
     configurationInfos.emplace_back(configureSamplingPeriod(factor));
