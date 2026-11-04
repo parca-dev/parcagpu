@@ -19,6 +19,9 @@
 //   hybrid : Start and Stop+drain on an app thread as in "app"; Enable+configure
 //            and Disable on the control thread (use with --gate).
 //
+// --at-exit runs the app threads' work in EXIT callbacks instead of ENTER.
+// --drain-ungated has every app thread call GetData, ungated, in each EXIT callback
+// while sampling (parcagpu drains this way).
 // --keep-enabled Enables once at startup; cycles are then Start / Stop+drain.
 // --continuous uses CONTINUOUS collection instead of KERNEL_SERIALIZED.
 // --gate quiesces the app first: every driver API call holds a gate from its ENTER
@@ -103,6 +106,8 @@ struct Opts {
   bool gate_narrow = false;  // gate only Enable+configure and Disable
   bool keep_enabled = false; // Enable once at startup; cycles are Start / Stop+drain
   bool gate_launch_only = false;
+  bool at_exit = false;
+  bool drain_ungated = false;
 };
 static Opts o;
 
@@ -124,6 +129,9 @@ static CUpti_PCSamplingData alloc_pcdata(size_t npcs, size_t nstall) {
   return d;
 }
 
+static std::atomic<bool> g_sampling{false};
+static std::mutex g_drainm;
+static CUpti_PCSamplingData g_drainBuf;
 static size_t g_nstall;
 static uint32_t *g_stallIdx;
 static CUpti_PCSamplingData g_cfgBuf, g_outBuf;
@@ -151,6 +159,7 @@ static void pcs_init_buffers() {
   cuptiPCSamplingGetStallReasons(&sp);
   g_cfgBuf = alloc_pcdata(1024, g_nstall);
   g_outBuf = alloc_pcdata(4096, g_nstall);
+  g_drainBuf = alloc_pcdata(1024, g_nstall);
   CUpti_PCSamplingDisableParams dp{};
   dp.size = CUpti_PCSamplingDisableParamsSize;
   dp.ctx = g_ctx;
@@ -201,10 +210,16 @@ static CUptiResult pcs_start() {
   CUpti_PCSamplingStartParams p{};
   p.size = CUpti_PCSamplingStartParamsSize;
   p.ctx = g_ctx;
-  return cuptiPCSamplingStart(&p);
+  CUptiResult r = cuptiPCSamplingStart(&p);
+  if (r == CUPTI_SUCCESS) g_sampling = true;
+  return r;
 }
 
 static CUptiResult pcs_stop_drain(uint64_t *samples) {
+  {
+    std::lock_guard<std::mutex> l(g_drainm);
+    g_sampling = false;
+  }
   CUpti_PCSamplingStopParams sp{};
   sp.size = CUpti_PCSamplingStopParamsSize;
   sp.ctx = g_ctx;
@@ -402,17 +417,39 @@ static void perform_pending() {
   g_done = op;
 }
 
+static std::atomic<uint64_t> g_drains{0};
+
+// One GetData, as parcagpu does on API EXITs while a window is open.
+static void drain_once() {
+  std::lock_guard<std::mutex> l(g_drainm);
+  if (!g_sampling) return;
+  g_drainBuf.totalNumPcs = g_drainBuf.remainingNumPcs = 0;
+  CUpti_PCSamplingGetDataParams gp{};
+  gp.size = CUpti_PCSamplingGetDataParamsSize;
+  gp.ctx = g_ctx;
+  gp.pcSamplingData = &g_drainBuf;
+  if (cuptiPCSamplingGetData(&gp) != CUPTI_SUCCESS) return;
+  uint64_t n = 0;
+  for (size_t i = 0; i < g_drainBuf.totalNumPcs; i++)
+    for (size_t j = 0; j < g_drainBuf.pPcData[i].stallReasonCount; j++)
+      n += g_drainBuf.pPcData[i].stallReason[j].samples;
+  g_samples += n;
+  g_drains++;
+}
+
 static void CUPTIAPI callback(void *, CUpti_CallbackDomain dom, CUpti_CallbackId id, const void *data) {
   if (dom != CUPTI_CB_DOMAIN_DRIVER_API) return;
   auto *cb = (const CUpti_CallbackData *)data;
-  if (o.gate && !t_in_op && !(o.gate_skip_sync && is_sync(id)) &&
-      !(o.gate_launch_only && !is_launch(id))) {
-    if (cb->callbackSite == CUPTI_API_ENTER) gate_enter();
-    else gate_exit();
+  bool gated_call = o.gate && !t_in_op && !(o.gate_skip_sync && is_sync(id)) &&
+                    !(o.gate_launch_only && !is_launch(id));
+  bool enter = cb->callbackSite == CUPTI_API_ENTER;
+  if (gated_call && enter) gate_enter();
+  if (enter != o.at_exit) {
+    if ((o.mode == "app" || o.mode == "hybrid") && !t_is_ctl) perform_pending();
+    if (o.mode == "selfcb" && t_is_ctl) perform_pending();
   }
-  if (cb->callbackSite != CUPTI_API_ENTER) return;
-  if ((o.mode == "app" || o.mode == "hybrid") && !t_is_ctl) perform_pending();
-  if (o.mode == "selfcb" && t_is_ctl) perform_pending();
+  if (!enter && o.drain_ungated && !t_is_ctl && !t_in_op) drain_once();
+  if (gated_call && !enter) gate_exit();
 }
 
 // ------------------------------------------------------------ threads
@@ -511,10 +548,10 @@ static void *ctl_main(void *) {
     g_ctl_beat++;
     usleep((useconds_t)(o.gap_ms * 1000));
   }
-  logj("ctl_done", "\"cycles\":%llu,\"timeouts\":%llu,\"gate_wait_ms\":%.1f,\"gate_timeouts\":%llu,\"gate_wait_max_ms\":%.1f,\"op_max_ms\":%.1f",
+  logj("ctl_done", "\"cycles\":%llu,\"timeouts\":%llu,\"gate_wait_ms\":%.1f,\"gate_timeouts\":%llu,\"gate_wait_max_ms\":%.1f,\"op_max_ms\":%.1f,\"drains\":%llu",
        (unsigned long long)g_cycles.load(), (unsigned long long)fails, g_gate_waits_ns.load() / 1e6,
        (unsigned long long)g_gate_timeouts.load(), g_gate_wait_max_ns.load() / 1e6,
-       g_op_max_ns.load() / 1e6);
+       g_op_max_ns.load() / 1e6, (unsigned long long)g_drains.load());
   g_stop = true;
   return nullptr;
 }
@@ -569,6 +606,7 @@ int main(int argc, char **argv) {
                                {"gate-skip-sync", 0, 0, 'S'}, {"gate-narrow", 0, 0, 'N'},
                                {"keep-enabled", 0, 0, 'K'},
                                {"gate-launch-only", 0, 0, 'L'},
+                               {"at-exit", 0, 0, 'X'}, {"drain-ungated", 0, 0, 'D'},
                                {0, 0, 0, 0}};
   int ch;
   while ((ch = getopt_long(argc, argv, "", lo, nullptr)) != -1) {
@@ -587,6 +625,8 @@ int main(int argc, char **argv) {
       case 'N': o.gate = o.gate_narrow = true; break;
       case 'K': o.keep_enabled = true; break;
       case 'L': o.gate = o.gate_launch_only = true; break;
+      case 'X': o.at_exit = true; break;
+      case 'D': o.drain_ungated = true; break;
       default: return 2;
     }
   }
