@@ -23,8 +23,10 @@ bool agentCtlReady();
 
 // Applies a configuration change: must call commit(), which makes the new
 // configuration current, and stop whatever it no longer allows, before it
-// returns; the change is acked after. Called from agentCtlPoll.
-using AgentApplyFn = void (*)(const std::function<void()> &commit);
+// returns true; the change is acked after. False: not done yet (the PC
+// sampling gate didn't close); later polls apply it again, without an ack
+// until it's done. Called from agentCtlPoll.
+using AgentApplyFn = bool (*)(const std::function<void()> &commit);
 
 // Sets the apply function and starts the release thread: every 100 ms it does
 // what a CUDA callback would, so a change (above all, giving up a GPU) takes
@@ -70,6 +72,22 @@ void agentCtlSetEnvRateLimits(uint32_t rateLimit, uint32_t graphRateLimit);
 void agentCtlSetCapable(bool capable);
 void agentCtlSetPCState(CUcontext ctx, uint32_t state);
 void agentCtlSetFactor(CUcontext ctx, uint32_t factor);
+
+// Marks this thread as inside parcagpu for its lifetime: the CUPTI callbacks
+// of the driver calls parcagpu itself makes (a context push, a synchronize)
+// then only pass the gate. They must not re-enter the callback handler, which
+// takes locks the caller may hold.
+class InternalScope {
+public:
+  InternalScope();
+  ~InternalScope();
+  InternalScope(const InternalScope &) = delete;
+  InternalScope &operator=(const InternalScope &) = delete;
+  static bool active();
+
+private:
+  bool prev_;
+};
 
 // Makes ctx current on this thread for CUPTI calls on it, and undoes that.
 bool agentCtlPushContext(CUcontext ctx);
