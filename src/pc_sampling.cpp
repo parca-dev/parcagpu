@@ -5,6 +5,7 @@
 #include "Driver/GPU/CuptiApi.h"
 #include "agent_ctl.h"
 #include "parcagpu_ctl.h"
+#include "pc_gate.h"
 #include "pc_sampling.h"
 #include "probes.h"
 #include <algorithm>
@@ -90,9 +91,8 @@ void enablePCSampling(CUcontext context) {
   proton::cupti::pcSamplingEnable<true>(&params);
 }
 
+// Call with the gate closed (pc_gate.h), as stop/disable/enable.
 bool startPCSampling(CUcontext context) {
-  // CUPTI requires the GPU to be idle before starting PC sampling.
-  proton::cuda::ctxSynchronize<false>();
   CUpti_PCSamplingStartParams params = {
       /*size=*/CUpti_PCSamplingStartParamsSize,
       /*pPriv=*/NULL,
@@ -681,7 +681,7 @@ void PCSampling::initialize(CUcontext context, uint32_t factor) {
       });
 }
 
-bool PCSampling::start(CUcontext context, uint64_t gapNs) {
+bool PCSampling::start(CUcontext context, uint64_t gapNs, uint64_t windowNs) {
   // Refuse before anything else (see contextIds); checked again under the
   // lock below.
   if (!agentCtlAllows(context, envSampling))
@@ -692,6 +692,14 @@ bool PCSampling::start(CUcontext context, uint64_t gapNs) {
       contextUnavailable.contain(contextId))
     return false;
 
+  if (isSampling(context))
+    return false;
+  // CUPTI requires the GPU to be idle before starting PC sampling. Before
+  // closing the gate, so that only this thread waits for it.
+  proton::cuda::ctxSynchronize<false>();
+  gate::Closed gate;
+  if (!gate.ok())
+    return false;
   std::lock_guard<std::mutex> lock(pcSamplingMutex);
   if (samplingContexts.count(context))
     return false;
@@ -704,18 +712,26 @@ bool PCSampling::start(CUcontext context, uint64_t gapNs) {
     if (last != lastStopNs.end() && emitMetadataNowNs() - last->second < gapNs)
       return false;
   }
+  if (captureFree && !captureFree())
+    return false;
   if (!startPCSampling(context))
     return false;
   samplingContexts.insert(context);
   numSampling.fetch_add(1, std::memory_order_release);
   windowStartNs[context] = emitMetadataNowNs();
+  gate::own(context, windowNs); // with the gate still closed
   DEBUG_PRINTF("PC sampling started on ctx=%p (kernels serialized)\n",
                context);
   return true;
 }
 
-bool PCSampling::stop(CUcontext context) {
+bool PCSampling::stop(CUcontext context, uint64_t closeTimeoutNs,
+                      bool backoff) {
   {
+    // False without the gate: still sampling, the next launch EXIT retries.
+    gate::Closed gate(closeTimeoutNs, backoff);
+    if (!gate.ok())
+      return false;
     std::lock_guard<std::mutex> lock(pcSamplingMutex);
     auto it = samplingContexts.find(context);
     if (it == samplingContexts.end())
@@ -724,6 +740,7 @@ bool PCSampling::stop(CUcontext context) {
     samplingContexts.erase(it);
     numSampling.fetch_sub(1, std::memory_order_release);
     lastStopNs[context] = emitMetadataNowNs();
+    gate::disown(context);
   }
   DEBUG_PRINTF("PC sampling stopped on ctx=%p (kernels concurrent)\n",
                context);
@@ -748,11 +765,19 @@ void PCSampling::prepare(CUcontext context, uint32_t factor, uint64_t gen,
   if (!cachedContextId(context, &contextId)) {
     // Never set up: do it now (once; initialize() caches the id).
     std::unique_lock<std::mutex> lock(reconfigMutex, std::try_to_lock);
-    if (lock.owns_lock() && !cachedContextId(context, &contextId)) {
-      DEBUG_PRINTF("PC sampling: setting up ctx=%p (factor %u)\n", context,
-                   factor);
-      initialize(context, factor);
-    }
+    if (!lock.owns_lock() || cachedContextId(context, &contextId))
+      return;
+    gate::Closed gate;
+    if (!gate.ok())
+      return; // the next launch retries
+    // A revoke may have come since the caller checked: applyAgentConfig
+    // lists the contexts to disable before it closes the gate.
+    if (!agentCtlAllows(context, envSampling) ||
+        (captureFree && !captureFree()))
+      return;
+    DEBUG_PRINTF("PC sampling: setting up ctx=%p (factor %u)\n", context,
+                 factor);
+    initialize(context, factor);
     return;
   }
   auto needed = [&](bool *rearm) {
@@ -766,6 +791,8 @@ void PCSampling::prepare(CUcontext context, uint32_t factor, uint64_t gen,
     }
     if (!contextInitialized.contain(contextId))
       return true; // disabled when its device was taken away
+    if (contextNeedsReset.contain(contextId))
+      return true; // CUPTI_ERROR_OUT_OF_MEMORY (collectData)
     auto cd = contextIdToConfigureData.find(contextId);
     return cd && cd->get().requestedFactor != factor;
   };
@@ -775,6 +802,12 @@ void PCSampling::prepare(CUcontext context, uint32_t factor, uint64_t gen,
   std::unique_lock<std::mutex> lock(reconfigMutex, std::try_to_lock);
   if (!lock.owns_lock() || !needed(&rearm) || isSampling(context))
     return; // another thread is at it, or it started sampling
+  gate::Closed gate;
+  if (!gate.ok())
+    return; // the next launch retries
+  if (!agentCtlAllows(context, envSampling) ||
+      (captureFree && !captureFree()))
+    return; // revoked since the caller checked (as above), or capturing
   if (rearm) {
     contextRearmGen[contextId] = gen;
     contextUnavailable.erase(contextId);
@@ -782,14 +815,35 @@ void PCSampling::prepare(CUcontext context, uint32_t factor, uint64_t gen,
   DEBUG_PRINTF("PC sampling: %s ctx=%p (factor %u)\n",
                rearm ? "re-arming" : "re-configuring", context, factor);
   finalize(context);
+  contextNeedsReset.erase(contextId);
   initialize(context, factor);
 }
 
-void PCSampling::applyAgentConfig(const std::function<void()> &commit) {
-  std::vector<CUcontext> stopped;
+bool PCSampling::applyAgentConfig(const std::function<void()> &commit) {
   {
     std::lock_guard<std::mutex> lock(pcSamplingMutex);
     commit();
+  }
+  // Contexts set up for PC sampling (sampling or not) that the agent no
+  // longer allows.
+  std::vector<CUcontext> enabled;
+  {
+    std::lock_guard<std::mutex> lock(contextMutex);
+    for (auto id : initializedContextIds) {
+      if (auto cd = contextIdToConfigureData.find(id);
+          cd && !agentCtlAllows(cd->get().context, envSampling))
+        enabled.push_back(cd->get().context);
+    }
+  }
+  if (enabled.empty())
+    return true;
+  // Close the gate only now, for the processes that have something to let go.
+  gate::Closed gate;
+  if (!gate.ok() || (captureFree && !captureFree()))
+    return false;
+  std::vector<CUcontext> stopped;
+  {
+    std::lock_guard<std::mutex> lock(pcSamplingMutex);
     stopped = stopDisallowedLocked();
   }
   for (CUcontext ctx : stopped) {
@@ -798,25 +852,15 @@ void PCSampling::applyAgentConfig(const std::function<void()> &commit) {
     if (pushed)
       agentCtlPopContext();
   }
-  // Then let go of PC sampling on them altogether (finalize() takes the
-  // locks itself).
-  std::vector<CUcontext> enabled;
-  {
-    std::lock_guard<std::mutex> lock(contextMutex);
-    for (auto id : initializedContextIds) {
-      if (auto cd = contextIdToConfigureData.find(id))
-        enabled.push_back(cd->get().context);
-    }
-  }
+  // Then let go of PC sampling on them altogether.
   for (CUcontext ctx : enabled) {
-    if (agentCtlAllows(ctx, envSampling))
-      continue;
     bool pushed = agentCtlPushContext(ctx);
     finalize(ctx);
     if (pushed)
       agentCtlPopContext();
     DEBUG_PRINTF("PC sampling disabled on ctx=%p (agent control)\n", ctx);
   }
+  return true;
 }
 
 std::vector<CUcontext> PCSampling::stopDisallowedLocked() {
@@ -834,12 +878,21 @@ std::vector<CUcontext> PCSampling::stopDisallowedLocked() {
     it = samplingContexts.erase(it);
     numSampling.fetch_sub(1, std::memory_order_release);
     lastStopNs[ctx] = emitMetadataNowNs();
+    gate::disown(ctx);
     if (pushed)
       agentCtlPopContext();
     stopped.push_back(ctx);
     DEBUG_PRINTF("PC sampling stopped on ctx=%p (agent control)\n", ctx);
   }
   return stopped;
+}
+
+std::vector<CUcontext> PCSampling::samplingContextsNow() {
+  if (numSampling.load(std::memory_order_acquire) == 0)
+    return {};
+  std::lock_guard<std::mutex> lock(pcSamplingMutex);
+  return std::vector<CUcontext>(samplingContexts.begin(),
+                                samplingContexts.end());
 }
 
 bool PCSampling::isSampling(CUcontext context) {
@@ -1063,43 +1116,22 @@ void PCSampling::collectData(CUcontext context) {
                   "pc_sampling");
         agentCtlSetPCState(context, PARCAGPU_PC_UNAVAILABLE);
       }
-      std::unique_lock<std::mutex> lock(pcSamplingMutex, std::try_to_lock);
-      if (lock.owns_lock()) {
-        auto it = samplingContexts.find(context);
-        if (it != samplingContexts.end()) {
-          stopPCSampling(context);
-          samplingContexts.erase(it);
-          numSampling.fetch_sub(1, std::memory_order_release);
-        }
-      }
+      // Its window ends as usual (stop(), with the gate closed: not here,
+      // under drainMutex); start() won't open another.
       break;
     }
     if (res == CUPTI_ERROR_OUT_OF_MEMORY) {
       // CUPTI's PC-sampling state for this context is wedged — stop+start
       // alone does NOT unwedge it (confirmed empirically: 7800 starts
       // produced 0 samples after the first OOM). The fix is a full reset:
-      // disable + erase tracking + re-enable + re-configure, which is
-      // exactly what finalize() + initialize() do back-to-back.
-      //
-      // try_lock-probe on pcSamplingMutex first: collectData is sometimes
-      // called from inside PCSampling::stop() which already holds the
-      // mutex. Calling finalize() in that re-entry would self-deadlock
-      // on the non-recursive mutex (finalize re-takes it). If the probe
-      // fails (someone holds it), bail; the next callback not nested
-      // under stop()/start() will retry.
-      {
-        std::unique_lock<std::mutex> probe(pcSamplingMutex, std::try_to_lock);
-        if (!probe.owns_lock()) {
-          break;
-        }
+      // disable + re-enable + re-configure (finalize() + initialize()), which
+      // needs the gate closed and so can't happen here, under drainMutex:
+      // prepare() does it before the context's next window.
+      if (!contextNeedsReset.contain(contextId)) {
+        DEBUG_PRINTF("CUPTI_ERROR_OUT_OF_MEMORY on ctx=%p: resetting before "
+                     "its next window\n", context);
+        contextNeedsReset.insert(contextId);
       }
-      // probe released; finalize() + initialize() each take their own
-      // locks (contextMutex, and pcSamplingMutex internally).
-      DEBUG_PRINTF("Recovering from CUPTI_ERROR_OUT_OF_MEMORY: full reinit on "
-                   "ctx=%p (disable+enable to clear wedged state)\n", context);
-      const uint32_t factor = configureData->requestedFactor;
-      finalize(context);
-      initialize(context, factor);
     }
     break;
   } while (configureData->outputData.remainingNumPcs > 0);
@@ -1128,15 +1160,18 @@ void PCSampling::collectAllData() {
   }
 }
 
-void PCSampling::finalize(CUcontext context) {
+bool PCSampling::finalize(CUcontext context) {
   uint32_t contextId = 0;
   proton::cupti::getContextId<true>(context, &contextId);
+  gate::Closed gate;
+  if (!gate.ok())
+    return false;
   std::lock_guard<std::recursive_mutex> drain(drainMutex);
 
   if (!contextInitialized.contain(contextId)) {
     // Clean up failed context tracking if applicable.
     contextFailed.erase(contextId);
-    return;
+    return true;
   }
 
   // Hold contextMutex for the entire finalize to prevent collectAllData
@@ -1160,6 +1195,7 @@ void PCSampling::finalize(CUcontext context) {
       stopPCSampling(context);
       samplingContexts.erase(it);
       numSampling.fetch_sub(1, std::memory_order_release);
+      gate::disown(context);
     }
   }
 
@@ -1177,6 +1213,7 @@ void PCSampling::finalize(CUcontext context) {
 
   contextIdToConfigureData.erase(contextId);
   contextInitialized.erase(contextId);
+  return true;
 }
 
 void PCSampling::loadModule(const char *cubin, size_t cubinSize) {

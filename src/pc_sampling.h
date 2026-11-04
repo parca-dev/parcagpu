@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "pc_gate.h"
 #include "stall_reason_map.h"
 
 #include <cuda.h>
@@ -134,8 +135,15 @@ public:
   // context is already sampling, not initialized, unavailable (another
   // process owns the GPU's sampler), not allowed (agent control), or CUPTI
   // refused. Under agent control, gapNs is the least time since the
-  // context's last window ended. Thread-safe.
-  bool start(CUcontext context, uint64_t gapNs = 0);
+  // context's last window ended. The calling thread owns the window for
+  // windowNs (pc_gate.h): other threads' driver calls wait until it closes.
+  // Thread-safe.
+  bool start(CUcontext context, uint64_t gapNs, uint64_t windowNs);
+
+  // If set, state changes (start, prepare, applyAgentConfig) happen only
+  // while it's true, checked with the gate closed: false during a stream
+  // capture, which they'd invalidate.
+  bool (*captureFree)() = nullptr;
 
   // Before sampling on `context` (current, on a launch) where it may sample:
   // enables and configures it if it isn't yet (under agent control, contexts
@@ -148,15 +156,18 @@ public:
   // then stops (and drains) every context it no longer allows, and disables
   // PC sampling on them. On a GB10 the GPU's sampler belongs to the first
   // process that enabled PC sampling, until it disables it: a process must
-  // let go of it entirely for another to sample.
-  void applyAgentConfig(const std::function<void()> &commit);
+  // let go of it entirely for another to sample. False if that couldn't be
+  // done yet (the gate didn't close): call again, commit() is idempotent.
+  bool applyAgentConfig(const std::function<void()> &commit);
   // Stops what the agent no longer allows; returns those contexts.
   std::vector<CUcontext> stopDisallowedLocked();
 
   // Stop PC sampling on `context` and drain its data. Kernels resume
   // concurrent execution. No-op (false) unless start(context) succeeded
-  // earlier.
-  bool stop(CUcontext context);
+  // earlier. closeTimeoutNs and backoff are for the gate (pc_gate.h).
+  bool stop(CUcontext context,
+            uint64_t closeTimeoutNs = gate::kCloseTimeoutNs,
+            bool backoff = true);
 
   // True when `context`'s window has been open for windowNs. A window
   // belongs to its context, not the thread that opened it: any thread's
@@ -165,6 +176,8 @@ public:
 
   // True while `context` is sampling. Cheap when nothing is sampling.
   bool isSampling(CUcontext context);
+  // The contexts sampling now.
+  std::vector<CUcontext> samplingContextsNow();
 
   // Emit stall reason map and replay cubin probes for late-attaching tracers.
   // Call periodically regardless of sampling state.
@@ -172,7 +185,9 @@ public:
 
   void collectData(CUcontext context);
   void collectAllData();
-  void finalize(CUcontext context);
+  // Stops, drains and disables PC sampling on `context`. False if the gate
+  // didn't close; nothing was done then.
+  bool finalize(CUcontext context);
   void loadModule(const char *cubin, size_t cubinSize);
   void unloadModule(const char *cubin, size_t cubinSize);
 
@@ -193,6 +208,9 @@ private:
       cubinCrcToCubinData;
   proton::ThreadSafeSet<uint32_t> contextInitialized;
   proton::ThreadSafeSet<uint32_t> contextFailed; // contexts where enable failed
+  // Contexts whose CUPTI state is wedged (CUPTI_ERROR_OUT_OF_MEMORY from
+  // GetData), reset by prepare() before their next window.
+  proton::ThreadSafeSet<uint32_t> contextNeedsReset;
 
   // Plain vector of initialized context IDs for iteration in collectAllData.
   // Protected by contextMutex.

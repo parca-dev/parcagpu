@@ -56,8 +56,25 @@ static struct {
 } __enabled_cbs[MOCK_MAX_ENABLED];
 static size_t __enabled_cb_count = 0;
 
+// Domains enabled as a whole (cuptiEnableDomain), by domain number.
+static int __enabled_domains[CUPTI_CB_DOMAIN_SIZE];
+
+CUptiResult cuptiEnableDomain(uint32_t enable,
+                              CUpti_SubscriberHandle subscriber,
+                              CUpti_CallbackDomain domain) {
+    (void)subscriber;
+    fprintf(stderr, "[MOCK_CUPTI] cuptiEnableDomain(enable=%u, domain=%u)\n",
+            enable, domain);
+    if (domain >= CUPTI_CB_DOMAIN_SIZE)
+        return CUPTI_ERROR_INVALID_PARAMETER;
+    __enabled_domains[domain] = enable != 0;
+    return CUPTI_SUCCESS;
+}
+
 int __mock_cupti_is_callback_enabled(CUpti_CallbackDomain domain,
                                      CUpti_CallbackId cbid) {
+    if (domain < CUPTI_CB_DOMAIN_SIZE && __enabled_domains[domain])
+        return 1;
     for (size_t i = 0; i < __enabled_cb_count; i++) {
         if (__enabled_cbs[i].domain == domain && __enabled_cbs[i].cbid == cbid) {
             return 1;

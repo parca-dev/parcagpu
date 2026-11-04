@@ -143,6 +143,11 @@ struct Update {
   bool ack = false;
 };
 
+// A change whose apply didn't complete, retried by every poll until it does
+// or a newer one replaces it.
+Update g_pending;                     // under g_applyMutex
+std::atomic<bool> g_hasPending{false};
+
 // Decodes a new generation. Rejects an invalid one, which then isn't acked,
 // and one that arrives with the lease expired (a dead agent's): procctl
 // delivers it again when the lease recovers.
@@ -210,13 +215,26 @@ void apply(const Update &u) {
   std::lock_guard<std::mutex> lock(g_applyMutex);
   if (u.ack && u.gen < g_appliedGen)
     return; // another thread already applied a newer generation
+  // A retry of the pending change: already committed.
+  const bool retry = g_hasPending.load(std::memory_order_relaxed) &&
+                     g_pending.ack == u.ack && g_pending.gen == u.gen &&
+                     g_pending.packed == u.packed &&
+                     g_pending.rates == u.rates;
   t_applying = true;
-  g_apply.load(std::memory_order_acquire)([&] {
+  bool done = g_apply.load(std::memory_order_acquire)([&] {
+    if (retry)
+      return;
     g_config.store(u.packed, std::memory_order_release);
     g_rates.store(u.rates, std::memory_order_release);
     g_configGen.fetch_add(1, std::memory_order_release);
   });
   t_applying = false;
+  if (!done) {
+    g_pending = u;
+    g_hasPending.store(true, std::memory_order_release);
+    return;
+  }
+  g_hasPending.store(false, std::memory_order_release);
   {
     std::lock_guard<std::mutex> lock2(g_devMutex);
     reportLocked(u.packed, u.rates);
@@ -238,6 +256,7 @@ void *releaseThread(void *) {
     struct timespec ts = {0, kReleaseTickNs};
     nanosleep(&ts, nullptr);
     try {
+      InternalScope internal;
       agentCtlPoll();
     } catch (const std::exception &e) {
       DEBUG_PRINTF("[PARCAGPU] agent control thread caught: %s\n", e.what());
@@ -305,8 +324,21 @@ void agentCtlPoll() {
   uint64_t gen = 0;
   Update u;
   int n = procctl_poll(&g_ctx, &c, sizeof c, &gen);
-  if ((n > 0 || n == -ENODATA) && decode(n, c, gen, &u))
+  if ((n > 0 || n == -ENODATA) && decode(n, c, gen, &u)) {
     apply(u);
+  } else if (g_hasPending.load(std::memory_order_acquire)) {
+    Update p;
+    bool retry = false;
+    {
+      std::unique_lock<std::mutex> lock(g_applyMutex, std::try_to_lock);
+      if (lock.owns_lock() && g_hasPending.load(std::memory_order_relaxed)) {
+        p = g_pending;
+        retry = true;
+      }
+    }
+    if (retry) // else another thread is at it
+      apply(p);
+  }
   else if (n == -E2BIG)
     fireError(E2BIG, "agent configuration too large", "agent_ctl");
   if (checkLease(&u))
@@ -432,6 +464,14 @@ void agentCtlSetFactor(CUcontext ctx, uint32_t factor) {
   g_state.devices[slot].sampling_factor = factor;
   publishStateLocked();
 }
+
+namespace {
+thread_local bool t_internal = false;
+} // namespace
+
+InternalScope::InternalScope() : prev_(t_internal) { t_internal = true; }
+InternalScope::~InternalScope() { t_internal = prev_; }
+bool InternalScope::active() { return t_internal; }
 
 bool agentCtlPushContext(CUcontext ctx) {
   return proton::cuda::ctxPushCurrent<false>(ctx) == CUDA_SUCCESS;

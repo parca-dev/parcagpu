@@ -100,6 +100,7 @@ add_library(parcagpucupti SHARED
     src/cupti.cpp
     src/agent_ctl.cpp
     src/pc_sampling.cpp
+    src/pc_gate.cpp
     src/correlation_filter.cpp
     src/env_config.cpp
     src/nvtx_collector.cpp
