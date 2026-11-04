@@ -17,6 +17,8 @@
 #include "Driver/GPU/CuptiApi.h"
 #include "Profiler/Cupti/CuptiCallbacks.h"
 #include "Utility/Singleton.h"
+#include "agent_ctl.h"
+#include "pc_gate.h"
 #include "correlation_filter.h"
 #include "env_config.h"
 #include "nvtx_collector.h"
@@ -40,9 +42,10 @@ thread_local uint32_t runtimeEnterCorrelationId = 0;
 
 uint32_t currentRuntimeCorrelationId() { return runtimeEnterCorrelationId; }
 
-// Configured probe rates (tokens/sec), read from env once in init_debug.
-// Globals because the buckets below are thread_local: setRate from init_debug
-// would only reach the single thread that ran it.
+// Configured probe rates (tokens/sec), read from env once in init_debug; the
+// agent's, when it sets them, take precedence. Globals because the buckets
+// below are thread_local: setRate from init_debug would only reach the single
+// thread that ran it.
 std::atomic<double> g_eagerRateLimit{100.0};
 std::atomic<double> g_graphRateLimit{20.0};
 
@@ -52,14 +55,21 @@ std::atomic<double> g_graphRateLimit{20.0};
 thread_local TokenBucket callbackLimiter(100.0);
 thread_local TokenBucket graphCallbackLimiter(20.0);
 
-// Copy the configured rates into this thread's buckets, once per thread.
-static inline void applyRateLimitsOnce() {
-  thread_local bool applied = false;
-  if (!applied) {
-    callbackLimiter.setRate(g_eagerRateLimit.load(std::memory_order_relaxed));
-    graphCallbackLimiter.setRate(g_graphRateLimit.load(std::memory_order_relaxed));
-    applied = true;
-  }
+// Copy the configured rates into this thread's buckets: once per thread, and
+// again whenever the agent's configuration changes.
+static inline void applyRateLimits() {
+  thread_local uint64_t appliedGen = UINT64_MAX;
+  const uint64_t gen = parcagpu::agentCtlGeneration();
+  if (appliedGen == gen)
+    return;
+  appliedGen = gen;
+  const parcagpu::AgentConfig cfg = parcagpu::agentCtlConfig();
+  callbackLimiter.setRate(
+      cfg.rateLimit ? cfg.rateLimit
+                    : g_eagerRateLimit.load(std::memory_order_relaxed));
+  graphCallbackLimiter.setRate(
+      cfg.graphRateLimit ? cfg.graphRateLimit
+                         : g_graphRateLimit.load(std::memory_order_relaxed));
 }
 
 // ---------------------------------------------------------------------------
@@ -115,14 +125,77 @@ struct PCRateController {
 };
 static PCRateController g_pcController;
 
-// Per-thread sampling state. A thread owns at most one window at a time, on
-// the context it started; other threads may own windows on other contexts.
+// Stream captures and PC sampling state changes keep out of each other's
+// way. Opening a window synchronizes the context and starts PC sampling;
+// closing one stops it; setting a context up or letting it go enables or
+// disables PC sampling on it. A capture forbids all of these, on the
+// capturing thread or, during a global-mode capture, on any thread; the call
+// fails and invalidates the capture. So a capture counts from its
+// BeginCapture ENTER (g_streamCaptures), and a state change from before it
+// starts (g_pcTransitions, PCTransition): a change gives up if a capture is
+// counted (checked again with the gate closed, PCSampling::captureFree), and
+// a BeginCapture waits for changes in progress, then closes the open windows
+// (beforeCapture). Both counters are seq_cst: of a change and a capture
+// that race, at least one sees the other.
+static std::atomic<int> g_streamCaptures{0};
+static std::atomic<int> g_pcTransitions{0};
+
+// How long a BeginCapture waits for a state change (a window opening's
+// synchronize waits for the GPU); then it goes ahead.
+static constexpr uint64_t kCaptureWaitNs = 1'000'000'000ULL;
+
+class PCTransition {
+public:
+  PCTransition() { g_pcTransitions.fetch_add(1); }
+  ~PCTransition() { g_pcTransitions.fetch_sub(1); }
+  PCTransition(const PCTransition &) = delete;
+  PCTransition &operator=(const PCTransition &) = delete;
+  static bool captureFree() { return g_streamCaptures.load() == 0; }
+};
+
+static bool isBeginCapture(CUpti_CallbackId cbid) {
+  switch (cbid) {
+  case CUPTI_DRIVER_TRACE_CBID_cuStreamBeginCapture:
+  case CUPTI_DRIVER_TRACE_CBID_cuStreamBeginCapture_ptsz:
+  case CUPTI_DRIVER_TRACE_CBID_cuStreamBeginCapture_v2:
+  case CUPTI_DRIVER_TRACE_CBID_cuStreamBeginCapture_v2_ptsz:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static void trackStreamCapture(CUpti_CallbackId cbid,
+                               const CUpti_CallbackData *cbdata) {
+  switch (cbid) {
+  case CUPTI_DRIVER_TRACE_CBID_cuStreamBeginCapture:
+  case CUPTI_DRIVER_TRACE_CBID_cuStreamBeginCapture_ptsz:
+  case CUPTI_DRIVER_TRACE_CBID_cuStreamBeginCapture_v2:
+  case CUPTI_DRIVER_TRACE_CBID_cuStreamBeginCapture_v2_ptsz:
+    // Counted at ENTER (beforeCapture); uncount one that didn't begin.
+    if (*static_cast<const CUresult *>(cbdata->functionReturnValue) !=
+        CUDA_SUCCESS)
+      g_streamCaptures.fetch_sub(1);
+    break;
+  case CUPTI_DRIVER_TRACE_CBID_cuStreamEndCapture:
+  case CUPTI_DRIVER_TRACE_CBID_cuStreamEndCapture_ptsz: {
+    // Ends the capture even when it fails (an invalidated capture).
+    int n = g_streamCaptures.load();
+    while (n > 0 && !g_streamCaptures.compare_exchange_weak(n, n - 1))
+      ;
+    break;
+  }
+  default:
+    break;
+  }
+}
+
+// Per-thread state for opening windows. A window itself belongs to its
+// context (PCSampling): any thread launching there drains and closes it, so
+// it lasts its length even if the thread that opened it goes quiet.
 struct PCSamplingState {
-  bool active = false;        // This thread owns an open window
-  CUcontext ctx = nullptr;    // Context the window was started on
-  uint64_t windowStartNs = 0; // When the current window opened
-  uint64_t lastCheckNs = 0;   // Last time we rolled the dice
-  unsigned int rngSeed = 0;   // Thread-local RNG state
+  uint64_t lastCheckNs = 0; // Last time this thread tried to open a window
+  unsigned int rngSeed = 0; // Thread-local RNG state
 };
 thread_local PCSamplingState g_pcSamplingState;
 
@@ -269,8 +342,19 @@ public:
 
     DEBUG_PRINTF("[PARCAGPU] Starting initialization\n");
 
-    // Check if PC sampling is supported
-    pcSamplingEnabled = parcagpu::PCSampling::isSupported();
+    parcagpu::agentCtlInit();
+
+    // Check if PC sampling is supported: asked for by the environment, or
+    // possible under agent control (contexts are set up for it, but sample
+    // only when the agent says so).
+    pcSamplingEnabled =
+        parcagpu::PCSampling::isSupported(parcagpu::agentCtlReady());
+    pcSampling.envSampling = parcagpu::PCSampling::envRequested();
+    parcagpu::agentCtlSetCapable(pcSamplingEnabled);
+    init_debug(); // reads the environment's rate limits
+    parcagpu::agentCtlSetEnvRateLimits(
+        (uint32_t)g_eagerRateLimit.load(std::memory_order_relaxed),
+        (uint32_t)g_graphRateLimit.load(std::memory_order_relaxed));
     if (pcSamplingEnabled) {
       DEBUG_PRINTF("[PARCAGPU] PC sampling enabled (serialized mode)\n");
     } else {
@@ -290,6 +374,16 @@ public:
     // Enable runtime and driver API callbacks (using Proton's utilities)
     proton::setRuntimeCallbacks(subscriber, /*enable=*/true);
     proton::setLaunchCallbacks(subscriber, /*enable=*/true);
+    // Where PC sampling may run, every driver API call passes through the
+    // gate (pc_gate.h), so that it can change state with no other thread in
+    // the driver. The gate counts from before the first callback.
+    if (pcSamplingEnabled) {
+      parcagpu::gate::setOverdueHandler(closeOverdueWindow);
+      pcSampling.captureFree = PCTransition::captureFree;
+      parcagpu::gate::enable();
+      proton::cupti::enableDomain<true>(1, subscriber,
+                                        CUPTI_CB_DOMAIN_DRIVER_API);
+    }
 
     // Driver-API graph launches (cuGraphLaunch/_ptsz); not covered by setLaunch/
     // setRuntimeCallbacks. Only these two cbids -- not setGraphCallbacks(), which
@@ -299,9 +393,14 @@ public:
     proton::cupti::enableCallback<true>(1, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
                                         CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
 
-    // Enable resource callbacks only if PC sampling is enabled
+    // Enable resource callbacks only if PC sampling is enabled. Context
+    // creation always: it feeds the device table reported to the agent.
     if (pcSamplingEnabled) {
       proton::setResourceCallbacks(subscriber, /*enable=*/true);
+    } else {
+      proton::cupti::enableCallback<false>(
+          1, subscriber, CUPTI_CB_DOMAIN_RESOURCE,
+          CUPTI_CBID_RESOURCE_CONTEXT_CREATED);
     }
 
     // NVTX goes through our own injection (nvtx_injection.cpp), not CUPTI.
@@ -329,6 +428,8 @@ public:
       DEBUG_PRINTF("[PARCAGPU] Enabled CONCURRENT_KERNEL activity\n");
     }
 
+    parcagpu::agentCtlStart(applyAgentConfig);
+
     DEBUG_PRINTF("[PARCAGPU] Successfully initialized CUPTI callbacks\n");
     return true;
   }
@@ -340,6 +441,8 @@ public:
 
     DEBUG_PRINTF("[PARCAGPU] Cleanup started\n");
 
+    parcagpu::agentCtlShutdown();
+
     // PC sampling data is drained in finalize() during CONTEXT_DESTROY_STARTING
     // when the CUDA context is still valid. By the time cleanup() runs, the
     // context may already be dead, so we don't drain here.
@@ -348,6 +451,9 @@ public:
     if (subscriber) {
       proton::setRuntimeCallbacks(subscriber, /*enable=*/false);
       proton::setLaunchCallbacks(subscriber, /*enable=*/false);
+      if (pcSamplingEnabled)
+        proton::cupti::enableDomain<false>(0, subscriber,
+                                           CUPTI_CB_DOMAIN_DRIVER_API);
       // Mirror the graph-launch callbacks enabled in init().
       proton::cupti::enableCallback<false>(0, subscriber,
                                            CUPTI_CB_DOMAIN_DRIVER_API,
@@ -357,6 +463,10 @@ public:
           CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
       if (pcSamplingEnabled) {
         proton::setResourceCallbacks(subscriber, /*enable=*/false);
+      } else {
+        proton::cupti::enableCallback<false>(
+            0, subscriber, CUPTI_CB_DOMAIN_RESOURCE,
+            CUPTI_CBID_RESOURCE_CONTEXT_CREATED);
       }
     }
     // Flush this thread's pending NVTX batch; other live threads drain
@@ -399,6 +509,63 @@ private:
 
   // Outstanding event counter for flushing
   size_t outstandingEvents = 0;
+
+  // False (retried) while a stream capture is in progress.
+  static bool applyAgentConfig(const std::function<void()> &commit) {
+    PCTransition transition;
+    return CuptiProfiler::instance().pcSampling.applyAgentConfig(commit);
+  }
+
+  // A stream capture is beginning on this thread (its BeginCapture ENTER,
+  // not yet in the gate): count it, wait for PC sampling state changes in
+  // progress, then close the open windows, regardless of the gate's backoff.
+  // No new one opens until the capture ends.
+  static void beforeCapture() {
+    g_streamCaptures.fetch_add(1);
+    auto &profiler = instance();
+    if (!profiler.pcSamplingEnabled)
+      return;
+    const uint64_t start = nowNs();
+    while (g_pcTransitions.load() > 0 && nowNs() - start < kCaptureWaitNs) {
+      struct timespec ts = {0, 1'000'000};
+      nanosleep(&ts, nullptr);
+    }
+    InternalScope internal;
+    try {
+      for (CUcontext ctx : profiler.pcSampling.samplingContextsNow()) {
+        bool pushed = parcagpu::agentCtlPushContext(ctx);
+        profiler.pcSampling.stop(ctx, parcagpu::gate::kCloseTimeoutNs,
+                                 /*backoff=*/false);
+        if (pushed)
+          parcagpu::agentCtlPopContext();
+      }
+    } catch (...) {
+    }
+  }
+
+  // The gate's overdue handler: a thread waiting at the gate closes a window
+  // whose owner went quiet (pc_gate.h). It's at its call's ENTER, holding
+  // none of our locks; the context needn't be its current one.
+  static bool closeOverdueWindow(CUcontext ctx) {
+    InternalScope internal;
+    try {
+      bool pushed = parcagpu::agentCtlPushContext(ctx);
+      bool stopped = CuptiProfiler::instance().pcSampling.stop(
+          ctx, parcagpu::gate::kOverdueCloseTimeoutNs, /*backoff=*/false);
+      if (pushed)
+        parcagpu::agentCtlPopContext();
+      return stopped;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  // How long a PC sampling window stays open: the agent's length if it set
+  // one. Dice rolls stay kPCSamplingIntervalNs apart.
+  static uint64_t pcWindowNs(const AgentConfig &cfg) {
+    return cfg.active && cfg.windowMs ? cfg.windowMs * 1'000'000ULL
+                                      : kPCSamplingIntervalNs;
+  }
 
   // Buffer management - using Proton's pattern (static methods)
   // A kernel activity is around 224 bytes so a 128kb buffer
@@ -544,17 +711,51 @@ private:
     // libcupti invokes us from contexts whose callers weren't built with
     // C++ EH support, so any uncaught throw aborts the process. Treat the
     // whole body as untrusted and swallow exceptions at the boundary.
+    // Every driver API call passes the gate: in at ENTER, out at the end
+    // of its EXIT callback (whatever that does, it does still inside).
+    struct GateExit {
+      CUpti_CallbackId cbid;
+      bool active;
+      ~GateExit() {
+        if (active)
+          parcagpu::gate::exit(cbid);
+      }
+    } gateExit{cbid, false};
+    if (domain == CUPTI_CB_DOMAIN_DRIVER_API) {
+      const auto *cbdata = static_cast<const CUpti_CallbackData *>(cbdata_void);
+      if (cbdata->callbackSite == CUPTI_API_ENTER) {
+        if (isBeginCapture(cbid) && !InternalScope::active())
+          CuptiProfiler::beforeCapture(); // before the gate counts it
+        parcagpu::gate::enter(cbid, InternalScope::active());
+      } else {
+        gateExit.active = true;
+        trackStreamCapture(cbid, cbdata);
+      }
+    }
+    // A driver call parcagpu made itself, from this handler or the release
+    // thread: nothing more to do, and the caller may hold our locks.
+    if (InternalScope::active())
+      return;
+    InternalScope internal;
     try {
     auto &profiler = CuptiProfiler::instance();
 
+    // Not from resource callbacks: they run inside the driver, where
+    // applying a change can't close the gate.
+    if (domain != CUPTI_CB_DOMAIN_RESOURCE)
+      parcagpu::agentCtlPoll();
+
     if (domain == CUPTI_CB_DOMAIN_RESOURCE) {
-      // Handle resource callbacks for PC sampling (only if enabled)
+      const CUpti_ResourceData *resData =
+          static_cast<const CUpti_ResourceData *>(cbdata_void);
+      if (cbid == CUPTI_CBID_RESOURCE_CONTEXT_CREATED) {
+        parcagpu::agentCtlAddContext(resData->context);
+      }
+
+      // The rest is for PC sampling (only if enabled)
       if (!profiler.pcSamplingEnabled) {
         return;
       }
-
-      const CUpti_ResourceData *resData =
-          static_cast<const CUpti_ResourceData *>(cbdata_void);
 
       switch (cbid) {
       case CUPTI_CBID_RESOURCE_MODULE_LOADED: {
@@ -582,12 +783,21 @@ private:
       case CUPTI_CBID_RESOURCE_CONTEXT_CREATED: {
         CUcontext ctx = resData->context;
         DEBUG_PRINTF("[PARCAGPU] Context created: %p\n", ctx);
-        profiler.pcSampling.initialize(ctx);
+        // Under agent control a context is set up for PC sampling only once
+        // its device is granted (PCSampling::prepare), as on a GB10 the first
+        // process to enable it owns the GPU's sampler.
+        if (profiler.pcSampling.envSampling && !agentCtlConfig().active) {
+          // Inside the driver, with the new context not yet in use.
+          parcagpu::gate::Bypass bypass;
+          profiler.pcSampling.initialize(ctx, 0);
+        }
         break;
       }
       case CUPTI_CBID_RESOURCE_CONTEXT_DESTROY_STARTING: {
         CUcontext ctx = resData->context;
         DEBUG_PRINTF("[PARCAGPU] Context destroying: %p\n", ctx);
+        // Inside the driver, with the context no longer in use.
+        parcagpu::gate::Bypass bypass;
         profiler.pcSampling.finalize(ctx);
         break;
       }
@@ -606,31 +816,53 @@ private:
       // just determine when the boundaries fire.
       const bool isKernelLaunchCb =
           domain == CUPTI_CB_DOMAIN_DRIVER_API && proton::isLaunch(cbid);
+      // Other driver calls are subscribed for the gate only (and drains).
+      const bool gateOnlyCb =
+          domain == CUPTI_CB_DOMAIN_DRIVER_API && !isKernelLaunchCb;
 
       // ENTER: open a sampling window on launch boundary if interval+prob hits.
       if (cbdata->callbackSite == CUPTI_API_ENTER) {
+        if (gateOnlyCb)
+          return;
         if (domain == CUPTI_CB_DOMAIN_RUNTIME_API)
           runtimeEnterCorrelationId = correlationId;
 
         if (profiler.pcSamplingEnabled) {
-          if (isKernelLaunchCb) {
+          // Sample if the agent's configuration grants this context's
+          // device, or with no agent configuration if the environment asks.
+          const AgentConfig cfg = agentCtlConfig();
+          if (isKernelLaunchCb &&
+              (cfg.active || profiler.pcSampling.envSampling) &&
+              g_streamCaptures.load(std::memory_order_relaxed) == 0) {
             auto &st = g_pcSamplingState;
             uint64_t now = nowNs();
 
-            if (!st.active &&
-                (now - st.lastCheckNs >= kPCSamplingIntervalNs)) {
+            if ((now - st.lastCheckNs >= kPCSamplingIntervalNs) &&
+                agentCtlAllows(cbdata->context,
+                               profiler.pcSampling.envSampling)) {
               st.lastCheckNs = now;
-              const double p = g_pcController.probability.load(
-                  std::memory_order_relaxed);
-              // start() is false if this context is already sampling
-              // (another thread's window) or can't sample; only a window
-              // we actually started is ours to close.
-              if (threadRandom(st) < p &&
-                  profiler.pcSampling.start(cbdata->context)) {
-                st.active = true;
-                st.ctx = cbdata->context;
-                st.windowStartNs = now;
-              }
+              PCTransition transition;
+              if (!PCTransition::captureFree())
+                return;
+              // First set the context up, bring it to the agent's factor, or
+              // re-arm it after a failure (skipped while it samples). The
+              // context is current here.
+              profiler.pcSampling.prepare(cbdata->context,
+                                          cfg.active ? cfg.factor : 0,
+                                          agentCtlGeneration(), cfg.active);
+              // Under the agent, its window and gap set the duty cycle (per
+              // context, in start()); else the dice roll, steered by the
+              // rate controller.
+              bool open = cfg.active ||
+                          threadRandom(st) < g_pcController.probability.load(
+                                                 std::memory_order_relaxed);
+              // start() is false if this context is already sampling or
+              // can't sample.
+              if (open)
+                profiler.pcSampling.start(cbdata->context,
+                                          cfg.active ? cfg.gapMs * 1'000'000ULL
+                                                     : 0,
+                                          pcWindowNs(cfg));
             }
           }
 
@@ -644,31 +876,33 @@ private:
         return;
       }
 
-      // EXIT: while a sampling window is open, drain CUPTI's host staging
-      // buffer on every CUDA API EXIT — not just launch EXITs. Empty drains
-      // are cheap (single API call returning 0 PCs) and missed drains lose
-      // samples (CUPTI_ERROR_OUT_OF_MEMORY when staging fills). Window close
-      // is still kernel-launch aligned: only check elapsed-time on a launch
-      // EXIT, so the window starts and ends at kernel boundaries. Drain and
-      // stop the window's own context, not this callback's: the thread may
-      // have switched devices since the window opened.
+      // EXIT: while this callback's context has a window open, drain
+      // CUPTI's host staging buffer on every CUDA API EXIT — not just launch
+      // EXITs. Empty drains are cheap (single API call returning 0 PCs) and
+      // missed drains lose samples (CUPTI_ERROR_OUT_OF_MEMORY when staging
+      // fills). Window close is still kernel-launch aligned: only check
+      // elapsed-time on a launch EXIT, so the window starts and ends at
+      // kernel boundaries. Any thread does this, not just the one that
+      // opened the window; while the gate holds the others back, one
+      // waiting for an overdue window closes it (closeOverdueWindow).
       if (profiler.pcSamplingEnabled) {
-        auto &st = g_pcSamplingState;
-
-        if (st.active) {
+        CUcontext ctx = cbdata->context;
+        if (ctx && profiler.pcSampling.isSampling(ctx)) {
+          const AgentConfig cfg = agentCtlConfig();
           if (isKernelLaunchCb &&
-              (nowNs() - st.windowStartNs >= kPCSamplingIntervalNs)) {
-            profiler.pcSampling.stop(st.ctx);
-            st.active = false;
-            st.ctx = nullptr;
-            controllerMaybeUpdate();
+              profiler.pcSampling.windowDue(ctx, pcWindowNs(cfg))) {
+            if (profiler.pcSampling.stop(ctx) && !cfg.active)
+              controllerMaybeUpdate();
           } else {
-            profiler.pcSampling.collectData(st.ctx);
+            profiler.pcSampling.collectData(ctx);
           }
         }
 
-        profiler.pcSampling.emitMetadata();
+        if (!gateOnlyCb)
+          profiler.pcSampling.emitMetadata();
       }
+      if (gateOnlyCb)
+        return;
 
       // Skip correlation/rate-limiter work when no profiler is attached.
       if (!PARCAGPU_CUDA_CORRELATION_ENABLED())
@@ -723,7 +957,7 @@ private:
       // every kernel needs its correlation callback to match PC samples to
       // CPU stacks on the agent side.
       if (!profiler.pcSampling.isSampling(cbdata->context)) {
-        applyRateLimitsOnce();
+        applyRateLimits();
         TokenBucket &limiter =
             isGraphLaunch ? graphCallbackLimiter : callbackLimiter;
         if (!limiter.tryAcquire()) {

@@ -5,6 +5,8 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
 #include <cuda.h>
 
 // Mock implementation of cuDriverGetVersion
@@ -30,13 +32,17 @@ CUresult cuCtxSynchronize(void) {
     return CUDA_SUCCESS;
 }
 
-// Mock cuCtxGetDevice — return a fixed device id for the parcagpu
-// gpu_config probe path.
+static __thread CUcontext mock_ctx_stack[8];
+static __thread int mock_ctx_depth;
+
+// Mock cuCtxGetDevice — mock contexts are 1 + device index (as in
+// test_cupti_prof and mock_cupti); with no context current, device 0.
 CUresult cuCtxGetDevice(CUdevice *device) {
     if (device == NULL) {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    *device = 0;
+    CUcontext c = mock_ctx_depth ? mock_ctx_stack[mock_ctx_depth - 1] : NULL;
+    *device = c ? (CUdevice)((uintptr_t)c - 1) : 0;
     return CUDA_SUCCESS;
 }
 
@@ -60,5 +66,37 @@ CUresult cuDeviceGetAttribute(int *pi, CUdevice_attribute attrib,
         *pi = 0;
         break;
     }
+    return CUDA_SUCCESS;
+}
+
+// Mock context stack (for cuCtxGetDevice); the harness never makes a context
+// current, parcagpu pushes one to query its device.
+CUresult cuCtxPushCurrent(CUcontext ctx) {
+    if (mock_ctx_depth == 8) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    mock_ctx_stack[mock_ctx_depth++] = ctx;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuCtxPopCurrent(CUcontext *ctx) {
+    if (mock_ctx_depth == 0) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    CUcontext c = mock_ctx_stack[--mock_ctx_depth];
+    if (ctx) {
+        *ctx = c;
+    }
+    return CUDA_SUCCESS;
+}
+
+// A UUID per device: "MOCKGPU-" then the device index.
+CUresult cuDeviceGetUuid(CUuuid *uuid, CUdevice dev) {
+    if (uuid == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    memcpy(uuid->bytes, "MOCKGPU-", 8);
+    memset(uuid->bytes + 8, 0, 8);
+    uuid->bytes[15] = (char)dev;
     return CUDA_SUCCESS;
 }

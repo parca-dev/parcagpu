@@ -58,8 +58,88 @@ is attached to the `nvtx_event_batch` probe.
 | `PARCAGPU_RATE_LIMIT` | 100 | Token-bucket rate limit for callback probes (events/sec per thread) |
 | `PARCAGPU_GRAPH_RATE_LIMIT` | 20 | Separate token-bucket rate limit for graph launches (`cuGraphLaunch`/`cudaGraphLaunch`), events/sec per thread. Graph launches draw from this bucket instead of `PARCAGPU_RATE_LIMIT`, so graph replays can't flood the probes and eager launch bursts can't starve graph sampling. |
 | `PARCAGPU_PC_SAMPLING_RATE` | (unset) | Setting this env var to a non-negative number enables PC sampling. The value is the target samples/sec; a controller adjusts the per-window dice-roll probability internally to converge on this rate. Set to 0 to enable sampling with rate control disabled (controller off, fixed probability). |
-| `PARCAGPU_SAMPLING_FACTOR` | 20 | Hardware PC sampling period (log2 cycles between samples). Only takes effect when PC sampling is enabled via `PARCAGPU_PC_SAMPLING_RATE`. |
+| `PARCAGPU_SAMPLING_FACTOR` | 20 | Hardware PC sampling period (log2 cycles between samples per SM), [5,31]. A factor set by parca-agent takes precedence. Applied rather than CUPTI's per-GPU default, which is 10 on a GB10. |
 | `PARCAGPU_PC_HW_BUFFER_MB` | (unset) | Force the CUPTI PC-sampling hardware buffer to this many MB. Unset or 0 leaves it at the CUPTI default. |
+| `PARCAGPU_GATE_STATS` | off | Print the PC sampling gate's counters every 10 s (see below) |
+
+### Runtime control from parca-agent
+
+parcagpu also takes configuration at runtime from parca-agent over
+[procctl](https://github.com/parca-dev/procctl) (vendored as `src/procctl.h`):
+each process creates a small sealed memfd named `procctl:parcagpu-v1` that the
+agent finds through `/proc` and writes to, and reports back the devices it
+uses. The schema is `src/parcagpu_ctl.h`.
+
+The agent drives PC sampling. CUPTI can PC sample one process per GPU at a
+time, so parca-agent hands each GPU to one process at a time and rotates it.
+Its configuration says, per device the process reported, whether to sample
+there, the sampling factor (`PARCAGPU_SAMPLING_FACTOR`'s meaning, applied
+live), and the duty cycle: windows of a given length (default 30 ms) with a
+given gap between them, each opening on the first kernel launch after the gap.
+A process sets a context up for PC sampling only when its device is granted,
+and disables it when the device is taken away: on a GB10 the GPU's sampler
+belongs to the first process that enabled PC sampling, until it disables it.
+parcagpu acknowledges a configuration once it has taken effect, so an ack with
+the device off means the GPU is free. A small thread makes that happen within
+~100 ms even when the application makes no CUDA calls; it never starts
+sampling itself. A device that another process samples, or whose setup
+failed, is reported as unavailable.
+
+The agent can also set the launch probe rate limits (`PARCAGPU_RATE_LIMIT`
+and `PARCAGPU_GRAPH_RATE_LIMIT`'s meaning, applied live); a limit it leaves at
+0 stays the environment's. Each process reports the limits in effect.
+
+With no agent, an agent that sends no configuration, or an agent whose lease
+has expired (it stopped heartbeating), parcagpu runs on the environment
+variables above. A configuration that fails validation is not acknowledged
+and has no effect.
+
+### PC sampling and concurrent launches
+
+CUPTI's PC sampling API is not safe to use while other threads launch work.
+What we found on a GB10 with CUPTI 13.0 (no release note up to 13.4 says
+otherwise), and what parcagpu does about it:
+
+- `cuptiPCSamplingStart`, `Stop`, `Enable` and `Disable` deadlock against
+  another thread inside a kernel launch, memset or async memcpy: the PC
+  sampling call holds a CUPTI mutex and waits for the driver lock, the other
+  thread holds the driver lock inside CUPTI's hook and waits for the mutex.
+  Serialized and continuous collection modes alike. `test/relrace.cu`
+  reproduces it.
+- Continuous mode is no way around it: Start/Stop deadlock the same way,
+  draining after Disable yields no samples, and leaving it on all the time
+  (no Start/Stop) avoids the deadlock but stalls other threads' launches for
+  0.3-3 s, whatever the sampling factor. It also loses the correlation of
+  samples to launches. So parcagpu keeps `KERNEL_SERIALIZED` windows: a short
+  window (30 ms by default) opened on a launch, then stopped and drained.
+- While a serialized window is open, the launching thread holds the driver
+  lock and other threads' calls starve: a hang if the window's owner waits
+  for one of them, or is starved itself and never closes the window.
+
+So with PC sampling on, every driver API call passes through a gate
+(`src/pc_gate.h`) between its ENTER and EXIT callbacks, except calls that
+only wait, query or read context state. A PC sampling state change runs only
+with the gate closed (no other thread inside a gated call), and while a
+window is open only its owner's calls are admitted; the others wait at ENTER,
+outside the driver. Nothing waits without a bound: a close that takes over
+100 ms gives up (and closes fail at once for the next 2 s), a call waiting for
+a close goes in after 250 ms, and a call waiting for a window past its
+deadline (length + 20 ms) closes it itself or, if the owner is inside a
+driver call, stops honoring it: the gate fails open. It trades a possible
+stall for a hang that can't be undone.
+
+Stream capture: a call into the driver from parcagpu during a capture can
+invalidate it, so no PC sampling state changes while any thread captures.
+`cuStreamBeginCapture`'s ENTER counts the capture, waits up to 1 s for state
+changes in flight and stops any open window; windows, setup and agent
+configuration changes check under the closed gate that no capture runs, and
+an agent configuration that has to wait for one is retried by the release
+thread.
+
+The cost: each window stalls other threads for 50-300 ms, gate or no gate
+(the driver serializes them while sampling). That is why PC sampling is opt
+in, and under agent control can be engaged only when wanted.
+`PARCAGPU_GATE_STATS=1` prints the gate's counters every 10 s.
 
 ### Monitoring with bpftrace
 
@@ -82,6 +162,8 @@ The activity parser attaches to all USDT probes via eBPF, captures events throug
 make test           # Basic mock CUPTI test (no GPU, no BPF)
 make test-nvtx      # NVTX collector unit test (no GPU, no BPF)
 make test-nvtx-real # Real NVTX clients + BPF parser, end to end (no GPU; sudo; NVTX_PYTHON=... adds the Python nvtx case)
+make test-agent-ctl # Agent control over procctl, from a Go agent (no GPU, no root)
+make test-gate      # PC sampling gate, under ThreadSanitizer (no GPU)
 make test-pc-mock   # Mock PC sampling with BPF activity parser (no GPU, requires root)
 make test-pc-real   # Real PC sampling with GPU (requires root + GPU)
 make test-multi     # test_cupti_prof + BPF activity parser in parallel (requires root)
@@ -145,6 +227,9 @@ Defined in `src/probes.d`, provider `parcagpu`:
 ├── src/
 │   ├── cupti.cpp         # Main CUPTI profiler implementation
 │   ├── pc_sampling.cpp   # PC sampling support
+│   ├── agent_ctl.cpp     # Runtime control from parca-agent (procctl)
+│   ├── parcagpu_ctl.h    # Its schema
+│   ├── procctl.h         # Vendored procctl (process side)
 │   ├── probes.d          # USDT probe definitions
 │   └── ...
 ├── ebpf/
@@ -155,6 +240,7 @@ Defined in `src/probes.d`, provider `parcagpu`:
 │   ├── mock_cuda.c       # Mock CUDA driver library
 │   ├── test-pc-mock.sh   # Mock PC sampling end-to-end test
 │   ├── test-pc-real.sh   # Real GPU PC sampling end-to-end test
+│   ├── agentctl/         # Agent control tests (Go, procctl agent side)
 │   └── bpf/              # BPF activity parser (Go + eBPF)
 ├── microbenchmarks/      # CUDA microbenchmarks (.cu)
 └── parcagpu.bt           # bpftrace monitoring script

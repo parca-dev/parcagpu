@@ -1,0 +1,4 @@
+github.com/parca-dev/procctl v0.1.0-alpha.1 h1:GDe/x7UwcYkqIGjx0r86tFGFr3S6cRRHGfZ6Rzr6Sx4=
+github.com/parca-dev/procctl v0.1.0-alpha.1/go.mod h1:BbeUWALuh6IbZeb+PRfOKBA0INKTM6tg/ZiMTC6VWTE=
+golang.org/x/sys v0.43.0 h1:Rlag2XtaFTxp19wS8MXlJwTvoh8ArU6ezoyFsMyCTNI=
+golang.org/x/sys v0.43.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
