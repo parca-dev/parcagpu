@@ -2,6 +2,27 @@
 
 CUDA profiling library that exposes GPU activity via USDT/DTRACE probes for eBPF consumption. Captures kernel executions, PC sampling with stall reasons, and cubin module loading.
 
+## Optional cubin file provenance
+
+The legacy `cubin_loaded(crc, ptr, size)` probe remains unchanged. The optional
+`cubin_loaded_file(crc, ptr, size, path)` probe carries the same loaded image and
+an absolute original filename when a synchronous module resource callback
+occurs inside `cuModuleLoad`. The path is resolved in the application's working
+directory and filesystem namespace. Both probes fire on load and metadata
+replay, including when a consumer joins either probe.
+
+Consumers should attach to one cubin probe, prefer the file-bearing probe when
+available, and treat an empty path as normal. `cuModuleLoadData`/`DataEx`, JIT
+linking and deferred loads have no filename here. A path is only a hint: PTX,
+fatbinaries and shared libraries need not contain the exact executed image as a
+standalone file. A consumer must validate the complete file against the loaded
+image before using it, resolve paths through the target process's root, and
+handle later deletion or mutation. parcagpu does not create a disk cache.
+
+Old consumers continue using the legacy probe. New consumers must support old
+producers without this optional probe. Missing file provenance must not prevent
+PC offsets, kernel identity, stall reasons or sample counts from being reported.
+
 ## Building
 
 ```bash

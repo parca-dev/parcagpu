@@ -42,6 +42,13 @@ __attribute__((noinline)) void fireCubinLoaded(uint64_t crc, const char *cubin,
   PARCAGPU_CUBIN_LOADED(crc, cubin, size);
 }
 
+__attribute__((noinline)) void fireCubinLoadedFile(uint64_t crc,
+                                                   const char *cubin,
+                                                   uint64_t size,
+                                                   const char *path) {
+  PARCAGPU_CUBIN_LOADED_FILE(crc, cubin, size, path);
+}
+
 __attribute__((noinline)) void fireCubinUnloaded(uint64_t crc) {
   PARCAGPU_CUBIN_UNLOADED(crc);
 }
@@ -808,13 +815,17 @@ void PCSampling::emitMetadata() {
   const uint16_t cubinSem = readSem(parcagpu_cubin_loaded_semaphore);
   const uint16_t prevCubin =
       prevCubinSem.exchange(cubinSem, std::memory_order_acq_rel);
-  const bool cubinJoin = cubinSem > prevCubin;
-  if (cubinSem > 0 && (cubinJoin || refresh)) {
+  const uint16_t fileSem = readSem(parcagpu_cubin_loaded_file_semaphore);
+  const uint16_t prevFile =
+      prevCubinFileSem.exchange(fileSem, std::memory_order_acq_rel);
+  const bool cubinJoin = cubinSem > prevCubin || fileSem > prevFile;
+  if ((cubinSem > 0 || fileSem > 0) && (cubinJoin || refresh)) {
     std::lock_guard<std::mutex> lock(contextMutex);
     for (auto &ref : loadedCubins) {
       if (cubinJoin ||
           (nowNs - ref.lastEmittedNs) > kEmitRefreshPeriodNs) {
         fireCubinLoaded(ref.crc, ref.data, ref.size);
+        fireCubinLoadedFile(ref.crc, ref.data, ref.size, ref.path.c_str());
         ref.lastEmittedNs = nowNs;
       }
     }
@@ -1000,7 +1011,8 @@ void PCSampling::finalize(CUcontext context) {
   contextInitialized.erase(contextId);
 }
 
-void PCSampling::loadModule(const char *cubin, size_t cubinSize) {
+void PCSampling::loadModule(const char *cubin, size_t cubinSize,
+                            const std::string &path) {
   auto cubinCrc = getCubinCrc(cubin, cubinSize);
 
   if (cubinCrcToCubinData.contain(cubinCrc)) {
@@ -1019,9 +1031,10 @@ void PCSampling::loadModule(const char *cubin, size_t cubinSize) {
     DEBUG_PRINTF("Module 0x%lx loaded (new)\n", cubinCrc);
     const uint64_t emittedNs = emitMetadataNowNs();
     fireCubinLoaded(cubinCrc, cubin, cubinSize);
+    fireCubinLoadedFile(cubinCrc, cubin, cubinSize, path.c_str());
     {
       std::lock_guard<std::mutex> lock(contextMutex);
-      loadedCubins.push_back({cubinCrc, cubin, cubinSize, emittedNs});
+      loadedCubins.push_back({cubinCrc, cubin, cubinSize, emittedNs, path});
     }
   }
 }

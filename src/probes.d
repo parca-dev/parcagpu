@@ -9,6 +9,8 @@ provider parcagpu {
   probe pc_sample_batch(const void **records, uint32_t count, uint32_t deviceId);
   probe stall_reason_map(const char *names, uint32_t count);
   probe cubin_loaded(uint64_t cubinCrc, const char *cubin, uint64_t cubinSize);
+  probe cubin_loaded_file(uint64_t cubinCrc, const char *cubin,
+                          uint64_t cubinSize, const char *path);
   probe cubin_unloaded(uint64_t cubinCrc);
   probe gpu_config(uint32_t deviceId, uint32_t samplingFactor,
                     uint32_t clockKHz, uint32_t smCount);

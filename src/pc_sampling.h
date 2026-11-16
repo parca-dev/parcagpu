@@ -137,7 +137,8 @@ public:
   void collectData(CUcontext context);
   void collectAllData();
   void finalize(CUcontext context);
-  void loadModule(const char *cubin, size_t cubinSize);
+  void loadModule(const char *cubin, size_t cubinSize,
+                  const std::string &path = "");
   void unloadModule(const char *cubin, size_t cubinSize);
 
 private:
@@ -177,6 +178,7 @@ private:
     const char *data;
     size_t size;
     uint64_t lastEmittedNs; // monotonic; for emitMetadata staleness check
+    std::string path; // Optional original file, not a copy or disk cache.
   };
   std::vector<CubinRef> loadedCubins;
 
@@ -199,6 +201,7 @@ private:
   // between our reads.
   std::atomic<uint16_t> prevStallSem{0};
   std::atomic<uint16_t> prevCubinSem{0};
+  std::atomic<uint16_t> prevCubinFileSem{0};
   std::atomic<uint16_t> prevConfigSem{0};
   std::atomic<uint64_t> lastRefreshNs{0};
 };
