@@ -38,6 +38,12 @@ static std::atomic<uint32_t> g_bufferCycle{0};
 // runtime calls)
 thread_local uint32_t runtimeEnterCorrelationId = 0;
 
+// A resource MODULE_LOADED callback can run inside cuModuleLoad. CUPTI's
+// resource record has no filename, so carry that optional hint across the
+// synchronous call. Canonicalize in the application's cwd/mount namespace.
+// Data/DataEx, JIT linking and deferred loads deliberately have no path hint.
+thread_local std::vector<std::string> moduleLoadPaths;
+
 uint32_t currentRuntimeCorrelationId() { return runtimeEnterCorrelationId; }
 
 // Configured probe rates (tokens/sec), read from env once in init_debug.
@@ -302,6 +308,9 @@ public:
     // Enable resource callbacks only if PC sampling is enabled
     if (pcSamplingEnabled) {
       proton::setResourceCallbacks(subscriber, /*enable=*/true);
+      proton::cupti::enableCallback<true>(1, subscriber,
+                                          CUPTI_CB_DOMAIN_DRIVER_API,
+                                          CUPTI_DRIVER_TRACE_CBID_cuModuleLoad);
     }
 
     // NVTX goes through our own injection (nvtx_injection.cpp), not CUPTI.
@@ -357,6 +366,9 @@ public:
           CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
       if (pcSamplingEnabled) {
         proton::setResourceCallbacks(subscriber, /*enable=*/false);
+        proton::cupti::enableCallback<false>(
+            0, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
+            CUPTI_DRIVER_TRACE_CBID_cuModuleLoad);
       }
     }
     // Flush this thread's pending NVTX batch; other live threads drain
@@ -564,7 +576,9 @@ private:
         if (modData && modData->pCubin && modData->cubinSize > 0) {
           DEBUG_PRINTF("[PARCAGPU] Module loaded: cubin=%p size=%zu\n",
                        modData->pCubin, modData->cubinSize);
-          profiler.pcSampling.loadModule(modData->pCubin, modData->cubinSize);
+          profiler.pcSampling.loadModule(
+              modData->pCubin, modData->cubinSize,
+              moduleLoadPaths.empty() ? "" : moduleLoadPaths.back());
         }
         break;
       }
@@ -598,6 +612,21 @@ private:
       // Handle both Runtime and Driver API callbacks
       const CUpti_CallbackData *cbdata =
           static_cast<const CUpti_CallbackData *>(cbdata_void);
+      if (domain == CUPTI_CB_DOMAIN_DRIVER_API &&
+          cbid == CUPTI_DRIVER_TRACE_CBID_cuModuleLoad) {
+        if (cbdata->callbackSite == CUPTI_API_ENTER) {
+          const auto *params =
+              static_cast<const cuModuleLoad_params *>(cbdata->functionParams);
+          char *path = params && params->fname
+                           ? realpath(params->fname, nullptr)
+                           : nullptr;
+          moduleLoadPaths.emplace_back(path ? path : "");
+          free(path);
+        } else if (!moduleLoadPaths.empty()) {
+          moduleLoadPaths.pop_back();
+        }
+        return;
+      }
       uint32_t correlationId = cbdata->correlationId;
 
       // PC sampling windows are aligned to kernel-launch boundaries:
