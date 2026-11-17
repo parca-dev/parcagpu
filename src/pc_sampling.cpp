@@ -988,10 +988,21 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData) {
 }
 
 // Period between forced metadata refreshes regardless of probe-arm
-// transitions. Bounds how long an undetected ABA semaphore cycle (consumer
-// detaches and re-attaches between two of our reads) can leave a tracer
-// missing cubins or the stall-reason map.
-static constexpr uint64_t kEmitRefreshPeriodNs = 30ULL * 1000 * 1000 * 1000;
+// transitions. Bounds how long a consumer whose attach we can't see goes
+// without cubins, the stall-reason map and gpu_config: an ABA cycle
+// (detach and re-attach between two of our reads), or a second consumer
+// joining one already attached. The kernel bumps a USDT semaphore only when
+// it writes the breakpoint, so a second consumer leaves it at 1.
+// PARCAGPU_METADATA_REFRESH_MS overrides it (tests running beside a
+// parca-agent use it).
+static uint64_t emitRefreshPeriodNs() {
+  static const uint64_t period = [] {
+    const char *v = std::getenv("PARCAGPU_METADATA_REFRESH_MS");
+    const long ms = v ? std::atol(v) : 0;
+    return ms > 0 ? uint64_t(ms) * 1000 * 1000 : 30ULL * 1000 * 1000 * 1000;
+  }();
+  return period;
+}
 
 static uint64_t emitMetadataNowNs() {
   struct timespec ts;
@@ -1010,16 +1021,13 @@ static inline uint16_t readSem(unsigned short &sem) {
 void PCSampling::emitMetadata() {
   // Re-emit stall_reason_map and cubin_loaded for late-attaching tracers.
   //
-  // The USDT semaphore is a refcount of attached uprobe consumers — every
-  // attach increments, every detach decrements. Re-emit whenever the count
-  // increases (so 1→2 fires the metadata to a second consumer joining
-  // while the first is still attached), plus on a periodic refresh that
-  // bounds staleness from ABA cycles which net the same count between our
-  // reads.
+  // Re-emit whenever a probe's USDT semaphore count increases (a consumer
+  // attached where none was), plus on a periodic refresh for attaches the
+  // count doesn't show (see emitRefreshPeriodNs).
 
   const uint64_t nowNs = emitMetadataNowNs();
   const uint64_t lastRefresh = lastRefreshNs.load(std::memory_order_relaxed);
-  const bool refresh = (nowNs - lastRefresh) > kEmitRefreshPeriodNs;
+  const bool refresh = (nowNs - lastRefresh) > emitRefreshPeriodNs();
   if (refresh) {
     lastRefreshNs.store(nowNs, std::memory_order_relaxed);
   }
@@ -1047,7 +1055,7 @@ void PCSampling::emitMetadata() {
     std::lock_guard<std::mutex> lock(contextMutex);
     for (auto &ref : loadedCubins) {
       if (cubinJoin ||
-          (nowNs - ref.lastEmittedNs) > kEmitRefreshPeriodNs) {
+          (nowNs - ref.lastEmittedNs) > emitRefreshPeriodNs()) {
         fireCubinLoaded(ref.crc, ref.data, ref.size);
         fireCubinLoadedFile(ref.crc, ref.data, ref.size, ref.path.c_str());
         ref.lastEmittedNs = nowNs;
@@ -1064,7 +1072,7 @@ void PCSampling::emitMetadata() {
     std::lock_guard<std::mutex> lock(contextMutex);
     for (auto &ref : loadedConfigs) {
       if (cfgJoin ||
-          (nowNs - ref.lastEmittedNs) > kEmitRefreshPeriodNs) {
+          (nowNs - ref.lastEmittedNs) > emitRefreshPeriodNs()) {
         fireGpuConfig(ref.dev, ref.samplingFactor, ref.clockKHz, ref.smCount);
         ref.lastEmittedNs = nowNs;
       }
