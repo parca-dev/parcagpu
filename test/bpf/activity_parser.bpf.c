@@ -68,6 +68,21 @@ struct cubin_event {
 #define EVENT_TYPE_ERROR 5
 #define EVENT_TYPE_NVTX 6
 #define EVENT_TYPE_NVTX_NAME 7
+#define EVENT_TYPE_GPU_MEM_ALLOC 8
+#define EVENT_TYPE_GPU_MEM_FREE 9
+
+// GPU memory alloc/free, from either provider.
+#define GPU_MEM_SOURCE_PARCAGPU 0 // parcagpu:gpu_mem_alloc/free
+#define GPU_MEM_SOURCE_OTEL 1     // otel_gpu_memory:alloc/free
+struct gpu_mem_event {
+  u32 event_type; // EVENT_TYPE_GPU_MEM_ALLOC or EVENT_TYPE_GPU_MEM_FREE
+  u32 source;     // GPU_MEM_SOURCE_*
+  u64 ptr;
+  u64 size;           // alloc only
+  u64 weighted_bytes; // alloc; for otel frees, the matched alloc's weight
+  u32 device_id;      // parcagpu only
+  u32 kind;           // parcagpu alloc only: GPU_MEM_KIND_*
+};
 
 // PC sample event sent to user-space.
 struct pc_sample_event {
@@ -152,7 +167,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, u32);
     __type(value, u64);
-    __uint(max_entries, 8);
+    __uint(max_entries, 16);
 } stats SEC(".maps");
 
 enum stat_key {
@@ -163,6 +178,7 @@ enum stat_key {
   STAT_NVTX_BATCHES = 4,   // nvtx_event_batch probe invocations
   STAT_NVTX_EVENTS = 5,    // NVTX records read from batches
   STAT_NVTX_TRUNCATED = 6, // NVTX records past MAX_NVTX_BATCH (skipped)
+  STAT_OTEL_FREE_UNMATCHED = 7, // otel_gpu_memory:free of an unsampled ptr
 };
 
 static __always_inline void add_stat(enum stat_key key, u64 n) {
@@ -479,6 +495,87 @@ int BPF_USDT(handle_nvtx_resource_name, u32 kind, u64 id, u64 name_ptr) {
   if (name_ptr)
     bpf_probe_read_user_str(evt->name, sizeof(evt->name), (void *)name_ptr);
   bpf_ringbuf_submit(evt, 0);
+  return 0;
+}
+
+// ---- GPU memory ------------------------------------------------------------
+
+static __always_inline void emit_gpu_mem(u32 type, u32 source, u64 ptr,
+                                         u64 size, u64 weighted, u32 dev,
+                                         u32 kind) {
+  struct gpu_mem_event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+  if (!evt) {
+    bump_stat(STAT_DROPS);
+    return;
+  }
+  evt->event_type = type;
+  evt->source = source;
+  evt->ptr = ptr;
+  evt->size = size;
+  evt->weighted_bytes = weighted;
+  evt->device_id = dev;
+  evt->kind = kind;
+  bpf_ringbuf_submit(evt, 0);
+}
+
+SEC("usdt/parcagpu/gpu_mem_alloc")
+int BPF_USDT(handle_gpu_mem_alloc, u64 ptr, u64 size, u64 weighted, u32 dev,
+             u32 kind) {
+  emit_gpu_mem(EVENT_TYPE_GPU_MEM_ALLOC, GPU_MEM_SOURCE_PARCAGPU, ptr, size,
+               weighted, dev, kind);
+  return 0;
+}
+
+SEC("usdt/parcagpu/gpu_mem_free")
+int BPF_USDT(handle_gpu_mem_free, u64 ptr, u32 dev) {
+  emit_gpu_mem(EVENT_TYPE_GPU_MEM_FREE, GPU_MEM_SOURCE_PARCAGPU, ptr, 0, 0,
+               dev, 0);
+  return 0;
+}
+
+// otel_gpu_memory consumer, written the way opentelemetry-ebpf-profiler
+// #1747 consumes otel_memory: arguments come straight from the ABI argument
+// registers (no USDT spec), and a (pid, ptr) map drops frees of pointers
+// that were never sampled.
+struct otel_live_key {
+  u32 pid;
+  u32 _pad;
+  u64 ptr;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, struct otel_live_key);
+  __type(value, u64); // weighted_bytes
+  __uint(max_entries, 65536);
+} otel_gpu_mem_live SEC(".maps");
+
+SEC("uprobe")
+int handle_otel_gpu_mem_alloc(struct pt_regs *ctx) {
+  u64 ptr = PT_REGS_PARM1(ctx);
+  u64 size = PT_REGS_PARM2(ctx);
+  u64 weighted = PT_REGS_PARM3(ctx);
+  struct otel_live_key key = {.pid = bpf_get_current_pid_tgid() >> 32,
+                              .ptr = ptr};
+  bpf_map_update_elem(&otel_gpu_mem_live, &key, &weighted, BPF_ANY);
+  emit_gpu_mem(EVENT_TYPE_GPU_MEM_ALLOC, GPU_MEM_SOURCE_OTEL, ptr, size,
+               weighted, 0, 0);
+  return 0;
+}
+
+SEC("uprobe")
+int handle_otel_gpu_mem_free(struct pt_regs *ctx) {
+  u64 ptr = PT_REGS_PARM1(ctx);
+  struct otel_live_key key = {.pid = bpf_get_current_pid_tgid() >> 32,
+                              .ptr = ptr};
+  u64 *weighted = bpf_map_lookup_elem(&otel_gpu_mem_live, &key);
+  if (!weighted) {
+    bump_stat(STAT_OTEL_FREE_UNMATCHED);
+    return 0;
+  }
+  u64 w = *weighted;
+  bpf_map_delete_elem(&otel_gpu_mem_live, &key);
+  emit_gpu_mem(EVENT_TYPE_GPU_MEM_FREE, GPU_MEM_SOURCE_OTEL, ptr, 0, w, 0, 0);
   return 0;
 }
 

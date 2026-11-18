@@ -1,4 +1,4 @@
-.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-graph-rate-limit test-pc-contexts test-nvtx test-nvtx-real
+.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-graph-rate-limit test-pc-contexts test-nvtx test-nvtx-real test-gpu-mem test-gpu-mem-e2e test-gpu-mem-real
 
 LIB_NAME = libparcagpucupti.so
 
@@ -74,6 +74,21 @@ test-nvtx: local
 	@LD_LIBRARY_PATH="$(CURDIR)/build-local/lib:$$LD_LIBRARY_PATH" \
 		PARCAGPU_TEST_LIB=build-local/lib/libparcagpucupti.so \
 		./build-local/bin/test_nvtx
+
+# GPU memory allocation sampling unit test (mock CUPTI, no GPU, no root)
+test-gpu-mem: local
+	@echo "=== Running GPU memory test ==="
+	@LD_LIBRARY_PATH="$(CURDIR)/build-local/lib:$$LD_LIBRARY_PATH" \
+		PARCAGPU_TEST_LIB=build-local/lib/libparcagpucupti.so \
+		./build-local/bin/test_gpu_mem
+
+# GPU memory e2e through the BPF parser: mock driver, no GPU; root for BPF.
+test-gpu-mem-e2e: local bpf-test
+	sudo -E test/test-gpu-mem-e2e.sh mock
+
+# Same checks against the real driver. Needs a GPU; root for BPF.
+test-gpu-mem-real: local bpf-test
+	sudo -E test/test-gpu-mem-e2e.sh real
 
 # Clean build artifacts
 clean:

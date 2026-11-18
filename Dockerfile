@@ -25,6 +25,7 @@ COPY --from=cuda-headers /usr/local/cuda /usr/local/cuda
 # Copy parcagpu source files and proton submodule
 COPY src /build/src
 COPY proton /build/proton
+COPY scripts /build/scripts
 COPY CMakeLists.txt /build/
 
 # Build the library (disable tests for Docker build)

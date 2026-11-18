@@ -44,6 +44,8 @@ jobs:
           ls -lh build/amd64/
           file build/amd64/libparcagpucupti.so
           readelf -n build/amd64/libparcagpucupti.so | grep -A2 "stapsdt" | head -20
+          # otel_gpu_memory consumers read arguments from fixed registers.
+          scripts/check-otel-usdt-regs.sh build/amd64/libparcagpucupti.so
 
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request'

@@ -71,21 +71,30 @@ include_directories(
 # Generate USDT probe header and object from probes.d
 find_program(DTRACE dtrace REQUIRED)
 
-add_custom_command(
-    OUTPUT ${GENERATED_DIR}/probes.h
-    COMMAND ${DTRACE} -h -s ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.d
-                         -o ${GENERATED_DIR}/probes.h
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.d
-    COMMENT "Generating USDT probe header (probes.h)"
-)
-
-add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/probes.o
-    COMMAND ${DTRACE} -G -s ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.d
-                         -o ${CMAKE_CURRENT_BINARY_DIR}/probes.o
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/probes.d
-    COMMENT "Generating USDT probe object (probes.o)"
-)
+# One header + object per USDT provider:
+#   probes.d                  -> parcagpu provider
+#   otel_gpu_memory_probes.d  -> otel_gpu_memory provider (see gpu_memory.cpp)
+set(USDT_PROVIDERS probes otel_gpu_memory_probes)
+set(USDT_HEADERS)
+set(USDT_OBJECTS)
+foreach(provider ${USDT_PROVIDERS})
+    add_custom_command(
+        OUTPUT ${GENERATED_DIR}/${provider}.h
+        COMMAND ${DTRACE} -h -s ${CMAKE_CURRENT_SOURCE_DIR}/src/${provider}.d
+                             -o ${GENERATED_DIR}/${provider}.h
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/${provider}.d
+        COMMENT "Generating USDT probe header (${provider}.h)"
+    )
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${provider}.o
+        COMMAND ${DTRACE} -G -s ${CMAKE_CURRENT_SOURCE_DIR}/src/${provider}.d
+                             -o ${CMAKE_CURRENT_BINARY_DIR}/${provider}.o
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/${provider}.d
+        COMMENT "Generating USDT probe object (${provider}.o)"
+    )
+    list(APPEND USDT_HEADERS ${GENERATED_DIR}/${provider}.h)
+    list(APPEND USDT_OBJECTS ${CMAKE_CURRENT_BINARY_DIR}/${provider}.o)
+endforeach()
 
 # Collect proton driver source files we need
 # Note: We only link driver APIs and callback utilities (no profiler dependencies)
@@ -103,16 +112,24 @@ add_library(parcagpucupti SHARED
     src/env_config.cpp
     src/nvtx_collector.cpp
     src/nvtx_injection.cpp
+    src/gpu_memory.cpp
     ${PROTON_SOURCES}
 )
 
 # Wire USDT probe artifacts into the build
 add_custom_target(probes_generated
-    DEPENDS ${GENERATED_DIR}/probes.h
-            ${CMAKE_CURRENT_BINARY_DIR}/probes.o
+    DEPENDS ${USDT_HEADERS} ${USDT_OBJECTS}
 )
 add_dependencies(parcagpucupti probes_generated)
-target_link_libraries(parcagpucupti ${CMAKE_CURRENT_BINARY_DIR}/probes.o)
+target_link_libraries(parcagpucupti ${USDT_OBJECTS})
+
+# The otel_gpu_memory contract fixes the argument registers. Fail the build
+# if the compiler put an operand anywhere else.
+add_custom_command(TARGET parcagpucupti POST_BUILD
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check-otel-usdt-regs.sh
+            $<TARGET_FILE:parcagpucupti>
+    COMMENT "Checking otel_gpu_memory USDT argument registers"
+)
 
 # Link against system libraries only (NOT libcupti - loaded dynamically by Proton)
 target_link_libraries(parcagpucupti
@@ -217,6 +234,54 @@ if(BUILD_TESTS)
     set_target_properties(test_nvtx PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
+
+    # GPU memory allocation sampling unit test (mock CUDA/CUPTI, no GPU).
+    add_executable(test_gpu_mem
+        test/test_gpu_mem.c
+    )
+    target_include_directories(test_gpu_mem PRIVATE
+        ${CUDA_INCLUDE_DIR}
+    )
+    target_link_libraries(test_gpu_mem
+        dl
+        m
+        -Wl,--no-as-needed
+        cuda_mock
+        cupti_mock
+        -Wl,--as-needed
+    )
+    set_target_properties(test_gpu_mem PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # Driver-API GPU memory client for test-gpu-mem-e2e.sh. One source, two
+    # builds: against the mock libcuda (which fires CUPTI callbacks itself;
+    # no GPU) and, when the toolkit is available, against the real driver.
+    add_executable(gpu_mem_client
+        test/gpu_mem_client.c
+    )
+    target_include_directories(gpu_mem_client PRIVATE
+        ${CUDA_INCLUDE_DIR}
+    )
+    target_link_libraries(gpu_mem_client
+        dl
+        -Wl,--no-as-needed
+        cuda_mock
+        cupti_mock
+        -Wl,--as-needed
+    )
+    set_target_properties(gpu_mem_client PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+    if(TARGET CUDA::cuda_driver)
+        add_executable(gpu_mem_client_real
+            test/gpu_mem_client.c
+        )
+        target_link_libraries(gpu_mem_client_real CUDA::cuda_driver)
+        set_target_properties(gpu_mem_client_real PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+        )
+    endif()
 
     # Real header-only nvtx3 client for test-nvtx-real.sh. Finds parcagpu
     # only through NVTX_INJECTION64_PATH; no CUDA.

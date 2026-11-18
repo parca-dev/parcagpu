@@ -20,6 +20,7 @@ static const char *knownVars[] = {
     "PARCAGPU_SAMPLING_FACTOR",
     "PARCAGPU_PC_SAMPLING_RATE",
     "PARCAGPU_PC_HW_BUFFER_MB",
+    "PARCAGPU_MEM_SAMPLING_INTERVAL",
 };
 static constexpr size_t numKnownVars =
     sizeof(knownVars) / sizeof(knownVars[0]);
@@ -108,6 +109,18 @@ void validateEnvVars() {
       DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_PC_HW_BUFFER_MB=%s invalid "
                    "(must be >= 0), ignoring\n", val);
       fireError(0, val, "env_config: PARCAGPU_PC_HW_BUFFER_MB invalid");
+    }
+  }
+
+  val = std::getenv("PARCAGPU_MEM_SAMPLING_INTERVAL");
+  if (val && *val) {
+    char *end = nullptr;
+    std::strtoull(val, &end, 10);
+    if (end == val || *end != '\0' || val[0] == '-') {
+      DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_MEM_SAMPLING_INTERVAL=%s "
+                   "invalid (must be a byte count >= 0), using default\n",
+                   val);
+      fireError(0, val, "env_config: PARCAGPU_MEM_SAMPLING_INTERVAL invalid");
     }
   }
 }
