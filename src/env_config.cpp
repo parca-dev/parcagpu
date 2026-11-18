@@ -118,7 +118,8 @@ void validateEnvVars() {
     std::strtoull(val, &end, 10);
     if (end == val || *end != '\0' || val[0] == '-') {
       DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_MEM_SAMPLING_INTERVAL=%s "
-                   "invalid (must be a byte count >= 0), using default\n",
+                   "invalid (must be a byte count >= 0), GPU memory "
+                   "profiling disabled\n",
                    val);
       fireError(0, val, "env_config: PARCAGPU_MEM_SAMPLING_INTERVAL invalid");
     }

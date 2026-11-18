@@ -81,7 +81,7 @@ is attached to the `nvtx_event_batch` probe.
 | `PARCAGPU_PC_SAMPLING_RATE` | (unset) | Setting this env var to a non-negative number enables PC sampling. The value is the target samples/sec; a controller adjusts the per-window dice-roll probability internally to converge on this rate. Set to 0 to enable sampling with rate control disabled (controller off, fixed probability). |
 | `PARCAGPU_SAMPLING_FACTOR` | 20 | Hardware PC sampling period (log2 cycles between samples). Only takes effect when PC sampling is enabled via `PARCAGPU_PC_SAMPLING_RATE`. |
 | `PARCAGPU_PC_HW_BUFFER_MB` | (unset) | Force the CUPTI PC-sampling hardware buffer to this many MB. Unset or 0 leaves it at the CUPTI default. |
-| `PARCAGPU_MEM_SAMPLING_INTERVAL` | 524288 | Mean bytes between sampled GPU allocations (see [GPU Memory Profiling](#gpu-memory-profiling)). 0 samples every allocation. |
+| `PARCAGPU_MEM_SAMPLING_INTERVAL` | (unset) | Setting this env var enables GPU memory profiling (see [GPU Memory Profiling](#gpu-memory-profiling)). The value is the mean bytes between sampled allocations; 524288 (512 KiB) is a reasonable start. 0 samples every allocation. |
 
 ### GPU Memory Profiling
 
@@ -104,8 +104,9 @@ opentelemetry-ebpf-profiler
   their real size.
 - **Frees are not sampled**: every free is reported, and consumers ignore
   pointers they never saw allocated.
-- **No consumer, no cost**: nothing runs unless a consumer is attached to
-  an alloc probe.
+- **Off by default**: the alloc/free callbacks are only registered when
+  `PARCAGPU_MEM_SAMPLING_INTERVAL` is set. Even then nothing runs unless a
+  consumer is attached to an alloc probe.
 
 Two providers carry the same sampling decisions:
 

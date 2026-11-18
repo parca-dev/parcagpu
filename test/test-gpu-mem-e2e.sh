@@ -11,7 +11,7 @@
 #                                 (#1747) consumes otel_memory
 #
 # Checks exact counts, bytes, kinds and the in-use set with every allocation
-# sampled; weighted totals under the default sampling interval; that both
+# sampled; weighted totals under a 512 KiB sampling interval; that both
 # providers see the same sampling decisions; and that allocations made
 # before a consumer attached are not reported.
 #
@@ -88,7 +88,7 @@ field() {
 
 # run_case NAME WORKLOAD INTERVAL: start the client, wait for it to load the
 # library, attach the parser, release the client, and collect the parser
-# summary in $WORK/NAME.bpf.log. INTERVAL "" leaves the default.
+# summary in $WORK/NAME.bpf.log. INTERVAL "" leaves profiling off.
 run_case() {
   local name="$1" workload="$2" interval="$3"
   local go="$WORK/$name.go"
@@ -147,8 +147,8 @@ check_line "exact: async allocs"   'gpu_mem parcagpu kind async=4' "$L"
 check_line "exact: vmm maps"       'gpu_mem parcagpu kind vmm=2' "$L"
 check_line "exact: one device"     'gpu_mem parcagpu devices=1' "$L"
 
-# --- bulk: default interval (512 KiB), 2000 x 256 KiB ------------------------
-run_case bulk bulk ""
+# --- bulk: 512 KiB interval, 2000 x 256 KiB ---------------------------------
+run_case bulk bulk 524288
 L="$WORK/bulk.bpf.log"
 TRUE_BYTES=$((2000 * 262144))
 for src in parcagpu otel; do

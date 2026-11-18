@@ -309,7 +309,11 @@ public:
                                         CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
 
     // GPU memory alloc/free (sampled allocation profiling, gpu_memory.cpp).
-    parcagpu::gpu_memory::setCallbacks(subscriber, /*enable=*/true);
+    // Off unless PARCAGPU_MEM_SAMPLING_INTERVAL is set.
+    if (parcagpu::gpu_memory::enabled()) {
+      DEBUG_PRINTF("[PARCAGPU] GPU memory profiling enabled\n");
+      parcagpu::gpu_memory::setCallbacks(subscriber, /*enable=*/true);
+    }
 
     // Enable resource callbacks only if PC sampling is enabled
     if (pcSamplingEnabled) {

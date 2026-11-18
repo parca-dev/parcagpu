@@ -31,11 +31,16 @@ enum Kind : uint32_t {
   kKindVmm = 4,     // cuMemMap
 };
 
-// Default mean sampling interval, in bytes.
+// Suggested mean sampling interval, in bytes. Profiling is off unless
+// PARCAGPU_MEM_SAMPLING_INTERVAL is set.
 constexpr uint64_t kDefaultSamplingInterval = 512 * 1024;
 
 // Read PARCAGPU_MEM_SAMPLING_INTERVAL. Called once from init_debug().
+// A valid value enables profiling; unset or invalid leaves it off.
 void configure();
+
+// True once configure() has seen a valid PARCAGPU_MEM_SAMPLING_INTERVAL.
+bool enabled();
 
 // Driver-API callback ids this module handles.
 bool isMemCbid(CUpti_CallbackId cbid);

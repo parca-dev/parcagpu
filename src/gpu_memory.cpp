@@ -81,6 +81,9 @@ namespace {
 // Mean bytes between samples; 0 samples every allocation.
 std::atomic<uint64_t> g_interval{kDefaultSamplingInterval};
 
+// Set by configure() when PARCAGPU_MEM_SAMPLING_INTERVAL is valid.
+std::atomic<bool> g_enabled{false};
+
 // Test hooks (see the extern "C" block at the bottom).
 std::atomic<bool> g_testForceCapture{false};
 std::atomic<uint64_t> g_testSeed{0};
@@ -283,7 +286,10 @@ void configure() {
   if (end == env || *end != '\0' || env[0] == '-')
     return; // validateEnvVars() reports it
   g_interval.store((uint64_t)v, std::memory_order_relaxed);
+  g_enabled.store(true, std::memory_order_relaxed);
 }
+
+bool enabled() { return g_enabled.load(std::memory_order_relaxed); }
 
 bool isMemCbid(CUpti_CallbackId cbid) {
   for (auto c : kAllocCbids)
