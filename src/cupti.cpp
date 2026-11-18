@@ -19,6 +19,7 @@
 #include "Utility/Singleton.h"
 #include "correlation_filter.h"
 #include "env_config.h"
+#include "gpu_memory.h"
 #include "nvtx_collector.h"
 #include "pc_sampling.h"
 #include "token_bucket.h"
@@ -241,6 +242,8 @@ void init_debug() {
     }
     g_pcController.lastCheckNs.store(nowNs(), std::memory_order_relaxed);
 
+    gpu_memory::configure();
+
     validateEnvVars();
     initialized = true;
   }
@@ -305,6 +308,13 @@ public:
     proton::cupti::enableCallback<true>(1, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
                                         CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
 
+    // GPU memory alloc/free (sampled allocation profiling, gpu_memory.cpp).
+    // Off unless PARCAGPU_MEM_SAMPLING_INTERVAL is set.
+    if (parcagpu::gpu_memory::enabled()) {
+      DEBUG_PRINTF("[PARCAGPU] GPU memory profiling enabled\n");
+      parcagpu::gpu_memory::setCallbacks(subscriber, /*enable=*/true);
+    }
+
     // Enable resource callbacks only if PC sampling is enabled
     if (pcSamplingEnabled) {
       proton::setResourceCallbacks(subscriber, /*enable=*/true);
@@ -364,6 +374,7 @@ public:
       proton::cupti::enableCallback<false>(
           0, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
           CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
+      parcagpu::gpu_memory::setCallbacks(subscriber, /*enable=*/false);
       if (pcSamplingEnabled) {
         proton::setResourceCallbacks(subscriber, /*enable=*/false);
         proton::cupti::enableCallback<false>(
@@ -627,6 +638,16 @@ private:
         }
         return;
       }
+
+      // GPU memory alloc/free: handled entirely by gpu_memory. These calls
+      // aren't launches and must not touch the correlation filter, the
+      // launch rate limiters, or PC sampling windows.
+      if (domain == CUPTI_CB_DOMAIN_DRIVER_API &&
+          parcagpu::gpu_memory::isMemCbid(cbid)) {
+        parcagpu::gpu_memory::onCallback(cbid, cbdata);
+        return;
+      }
+
       uint32_t correlationId = cbdata->correlationId;
 
       // PC sampling windows are aligned to kernel-launch boundaries:

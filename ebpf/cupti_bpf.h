@@ -138,4 +138,35 @@ struct cupti_nvtx_event {
 _Static_assert(sizeof(struct cupti_nvtx_event) == 56,
                "cupti_nvtx_event size mismatch with parcagpu/src/nvtx.h");
 
+// ---------------------------------------------------------------------------
+// GPU memory allocations
+// ---------------------------------------------------------------------------
+//
+// Driver-level GPU allocations are sampled by bytes (Poisson, mean
+// PARCAGPU_MEM_SAMPLING_INTERVAL, default 512 KiB); each sampled allocation
+// carries weighted_bytes, the unbiased estimate size / (1 - exp(-size/T)).
+// Frees are not sampled: consumers keep the pointers of the allocations they
+// saw and ignore frees of any other pointer.
+//
+// Two providers, same sampler, each gated on its own semaphore:
+//
+//   parcagpu:gpu_mem_alloc(u64 ptr, u64 size, u64 weighted_bytes,
+//                          u32 device_id, u32 kind)
+//   parcagpu:gpu_mem_free(u64 ptr, u32 device_id)
+//       Regular USDT arguments; read them through the SDT arg specs.
+//
+//   otel_gpu_memory:alloc(void *ptr, u64 size, u64 weighted_bytes)
+//   otel_gpu_memory:free(void *ptr)
+//       The otel_memory contract of opentelemetry-ebpf-profiler #1747 under
+//       its own provider. Arguments are guaranteed to be in the ABI argument
+//       registers (rdi/rsi/rdx on x86-64, x0/x1/x2 on arm64), so a consumer
+//       may read them from pt_regs directly.
+//
+// Allocation kinds (parcagpu:gpu_mem_alloc `kind`). Must match
+// parcagpu::gpu_memory::Kind in parcagpu/src/gpu_memory.h.
+#define GPU_MEM_KIND_DEVICE  1 // cuMemAlloc, cuMemAllocPitch
+#define GPU_MEM_KIND_MANAGED 2 // cuMemAllocManaged
+#define GPU_MEM_KIND_ASYNC   3 // cuMemAllocAsync, cuMemAllocFromPoolAsync
+#define GPU_MEM_KIND_VMM     4 // cuMemMap (alloc) / cuMemUnmap (free)
+
 #endif // CUPTI_BPF_H

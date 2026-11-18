@@ -17,4 +17,7 @@ provider parcagpu {
   probe error(int32_t code, const char *message, const char *component);
   probe nvtx_event_batch(const void **events, uint32_t count);
   probe nvtx_resource_name(uint32_t kind, uint64_t id, const char *name);
+  probe gpu_mem_alloc(uint64_t ptr, uint64_t size, uint64_t weightedBytes,
+                      uint32_t deviceId, uint32_t kind);
+  probe gpu_mem_free(uint64_t ptr, uint32_t deviceId);
 };

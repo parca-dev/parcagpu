@@ -119,6 +119,38 @@ usdt:*:parcagpu:error {
            $message);
 }
 
+usdt:*:parcagpu:nvtx_resource_name {
+    printf("%-12s.%-6u [NVTX_NAME] kind=%u id=0x%lx name=%s\n",
+           strftime("%H:%M:%S", nsecs),
+           (nsecs % 1000000000) / 1000,
+           arg0, arg1, str(arg2));
+}
+
+usdt:*:parcagpu:nvtx_event_batch {
+    printf("%-12s.%-6u [NVTX_BATCH] count=%u\n",
+           strftime("%H:%M:%S", nsecs),
+           (nsecs % 1000000000) / 1000,
+           arg1);
+}
+
+// Sampled GPU allocations: weighted is the unbiased byte estimate.
+// kind: 1=device 2=managed 3=async 4=vmm
+usdt:*:parcagpu:gpu_mem_alloc {
+    printf("%-12s.%-6u [GPU_ALLOC] ptr=0x%lx size=%lu weighted=%lu dev=%u kind=%u\n",
+           strftime("%H:%M:%S", nsecs),
+           (nsecs % 1000000000) / 1000,
+           arg0, arg1, arg2, arg3, arg4);
+    @gpu_alloc_weighted_bytes = sum(arg2);
+}
+
+// Fires for every free, sampled or not.
+usdt:*:parcagpu:gpu_mem_free {
+    printf("%-12s.%-6u [GPU_FREE] ptr=0x%lx dev=%u\n",
+           strftime("%H:%M:%S", nsecs),
+           (nsecs % 1000000000) / 1000,
+           arg0, arg1);
+}
+
 END {
     printf("\nMonitoring complete.\n");
 }

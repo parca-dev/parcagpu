@@ -55,6 +55,8 @@ const (
 	eventTypeError         = 5
 	eventTypeNvtx          = 6
 	eventTypeNvtxName      = 7
+	eventTypeGpuMemAlloc   = 8
+	eventTypeGpuMemFree    = 9
 )
 
 // KernelEvent matches struct kernel_event in the BPF program.
@@ -133,15 +135,116 @@ type NvtxNameEvent struct {
 	Name      [128]byte
 }
 
+// GpuMemEvent matches struct gpu_mem_event in the BPF program.
+type GpuMemEvent struct {
+	EventType     uint32
+	Source        uint32 // 0 = parcagpu:gpu_mem_*, 1 = otel_gpu_memory:*
+	Ptr           uint64
+	Size          uint64
+	WeightedBytes uint64
+	DeviceID      uint32
+	Kind          uint32
+}
+
 const (
-	statBatches       = 0
-	statActivities    = 1
-	statKernels       = 2
-	statDrops         = 3
-	statNvtxBatches   = 4
-	statNvtxEvents    = 5
-	statNvtxTruncated = 6
+	statBatches           = 0
+	statActivities        = 1
+	statKernels           = 2
+	statDrops             = 3
+	statNvtxBatches       = 4
+	statNvtxEvents        = 5
+	statNvtxTruncated     = 6
+	statOtelFreeUnmatched = 7
 )
+
+var gpuMemSourceNames = []string{"parcagpu", "otel"}
+var gpuMemKindNames = map[uint32]string{1: "device", 2: "managed", 3: "async", 4: "vmm"}
+
+type gpuMemLive struct {
+	size, weighted uint64
+}
+
+// gpuMemSource aggregates the alloc/free events of one provider.
+type gpuMemSource struct {
+	allocs, bytes, weighted uint64
+	frees, unmatchedFrees   uint64
+	byKind                  map[uint32]uint64
+	devices                 map[uint32]bool
+	live                    map[uint64]gpuMemLive
+}
+
+// gpuMemSummary aggregates GPU memory events for the end-of-run report that
+// test-gpu-mem-real.sh checks. In-use figures pair frees with the
+// allocations seen, the way a heap profiler's live set does.
+type gpuMemSummary struct {
+	src [2]*gpuMemSource
+}
+
+func newGpuMemSummary() *gpuMemSummary {
+	g := &gpuMemSummary{}
+	for i := range g.src {
+		g.src[i] = &gpuMemSource{
+			byKind:  map[uint32]uint64{},
+			devices: map[uint32]bool{},
+			live:    map[uint64]gpuMemLive{},
+		}
+	}
+	return g
+}
+
+func (g *gpuMemSummary) add(ev *GpuMemEvent) {
+	if ev.Source > 1 {
+		return
+	}
+	s := g.src[ev.Source]
+	switch ev.EventType {
+	case eventTypeGpuMemAlloc:
+		s.allocs++
+		s.bytes += ev.Size
+		s.weighted += ev.WeightedBytes
+		if ev.Source == 0 {
+			s.byKind[ev.Kind]++
+			s.devices[ev.DeviceID] = true
+		}
+		s.live[ev.Ptr] = gpuMemLive{ev.Size, ev.WeightedBytes}
+	case eventTypeGpuMemFree:
+		if _, ok := s.live[ev.Ptr]; ok {
+			delete(s.live, ev.Ptr)
+			s.frees++
+		} else {
+			s.unmatchedFrees++
+		}
+	}
+}
+
+func (g *gpuMemSummary) print(objs *activityParserObjects) {
+	var otelUnmatched uint64
+	key := uint32(statOtelFreeUnmatched)
+	objs.Stats.Lookup(&key, &otelUnmatched)
+	for i, s := range g.src {
+		name := gpuMemSourceNames[i]
+		var liveBytes, liveWeighted uint64
+		for _, l := range s.live {
+			liveBytes += l.size
+			liveWeighted += l.weighted
+		}
+		unmatched := s.unmatchedFrees
+		if i == 1 {
+			// The BPF side drops otel frees of unsampled pointers, like the
+			// upstream heap probe; userspace never sees them.
+			unmatched += otelUnmatched
+		}
+		fmt.Printf("gpu_mem %s allocs=%d bytes=%d weighted=%d\n", name, s.allocs, s.bytes, s.weighted)
+		fmt.Printf("gpu_mem %s frees=%d unmatched_frees=%d\n", name, s.frees, unmatched)
+		fmt.Printf("gpu_mem %s inuse allocs=%d bytes=%d weighted=%d\n", name, len(s.live), liveBytes, liveWeighted)
+		if i == 0 {
+			for k := uint32(1); k <= 4; k++ {
+				fmt.Printf("gpu_mem %s kind %s=%d\n", name, gpuMemKindNames[k], s.byKind[k])
+			}
+			fmt.Printf("gpu_mem %s devices=%d\n", name, len(s.devices))
+		}
+	}
+}
 
 var nvtxKindNames = map[uint16]string{1: "push", 2: "pop", 3: "start", 4: "end", 5: "mark"}
 
@@ -558,23 +661,50 @@ func main() {
 	type probeTarget struct {
 		name    string
 		handler *ebpf2.Program
+		// provider defaults to "parcagpu". Probes of other providers
+		// (otel_gpu_memory) have handlers that read the argument registers
+		// directly, so they get no USDT spec.
+		provider string
 	}
 	targets := []probeTarget{
-		{"activity_batch", objs.HandleActivityBatch},
-		{"stall_reason_map", objs.HandleStallReasonMap},
-		{"cubin_loaded", objs.HandleCubinLoaded},
-		{"cubin_unloaded", objs.HandleCubinUnloaded},
-		{"pc_sample_batch", objs.HandlePcSampleBatch},
-		{"error", objs.HandleError},
-		{"nvtx_event_batch", objs.HandleNvtxEventBatch},
-		{"nvtx_resource_name", objs.HandleNvtxResourceName},
+		{name: "activity_batch", handler: objs.HandleActivityBatch},
+		{name: "stall_reason_map", handler: objs.HandleStallReasonMap},
+		{name: "cubin_loaded", handler: objs.HandleCubinLoaded},
+		{name: "cubin_unloaded", handler: objs.HandleCubinUnloaded},
+		{name: "pc_sample_batch", handler: objs.HandlePcSampleBatch},
+		{name: "error", handler: objs.HandleError},
+		{name: "nvtx_event_batch", handler: objs.HandleNvtxEventBatch},
+		{name: "nvtx_resource_name", handler: objs.HandleNvtxResourceName},
+		{name: "gpu_mem_alloc", handler: objs.HandleGpuMemAlloc},
+		{name: "gpu_mem_free", handler: objs.HandleGpuMemFree},
+		{name: "alloc", handler: objs.HandleOtelGpuMemAlloc, provider: "otel_gpu_memory"},
+		{name: "free", handler: objs.HandleOtelGpuMemFree, provider: "otel_gpu_memory"},
 	}
 
 	var links []link.Link
 	var specID uint32
 	for _, t := range targets {
+		provider := t.provider
+		if provider == "" {
+			provider = "parcagpu"
+		}
 		for _, probe := range probes {
-			if probe.Provider != "parcagpu" || probe.Name != t.name {
+			if probe.Provider != provider || probe.Name != t.name {
+				continue
+			}
+
+			if provider != "parcagpu" {
+				log.Printf("USDT probe %s:%s at offset 0x%x, args=%q (register ABI)",
+					provider, t.name, probe.Location, probe.Arguments)
+				up, err := ex.Uprobe(t.name, t.handler, &link.UprobeOptions{
+					Address:      probe.Location,
+					PID:          *pid,
+					RefCtrOffset: probe.SemaphoreOffset,
+				})
+				if err != nil {
+					log.Fatalf("Attaching uprobe for %s:%s at offset 0x%x: %v", provider, t.name, probe.Location, err)
+				}
+				links = append(links, up)
 				continue
 			}
 
@@ -662,6 +792,7 @@ func main() {
 	var eventCount uint64
 	var pcSampleCount uint64
 	nvtx := newNvtxSummary()
+	gpuMem := newGpuMemSummary()
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -751,6 +882,23 @@ func main() {
 			}
 			nvtx.names = append(nvtx.names, event)
 
+		case eventTypeGpuMemAlloc, eventTypeGpuMemFree:
+			var event GpuMemEvent
+			if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &event); err != nil {
+				log.Printf("Parsing gpu mem event: %v", err)
+				continue
+			}
+			gpuMem.add(&event)
+			if *verbose {
+				op := "alloc"
+				if event.EventType == eventTypeGpuMemFree {
+					op = "free"
+				}
+				fmt.Printf("gpu_mem: %s %s ptr=0x%x size=%d weighted=%d dev=%d kind=%s\n",
+					gpuMemSourceNames[event.Source&1], op, event.Ptr, event.Size,
+					event.WeightedBytes, event.DeviceID, gpuMemKindNames[event.Kind])
+			}
+
 		case eventTypePCSample:
 			var event PCSampleEvent
 			if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &event); err != nil {
@@ -811,6 +959,7 @@ func main() {
 	printStallReasonMap(&objs)
 	printCubins(cubins)
 	nvtx.print(&objs)
+	gpuMem.print(&objs)
 }
 
 func printStats(objs *activityParserObjects, eventCount uint64) {
