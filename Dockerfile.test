@@ -19,7 +19,6 @@ COPY build/bin/test_cupti_prof ./build/bin/
 COPY build/lib/libcuda.so ./build/lib/
 COPY build/lib/libcuda.so.1 ./build/lib/
 COPY build/lib/libcupti.so ./build/lib/
-COPY build/lib/libcupti.so.12 ./build/lib/
 
 # Set environment
 ENV LD_LIBRARY_PATH=/test/build/lib

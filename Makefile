@@ -1,6 +1,8 @@
 .PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-graph-rate-limit test-pc-contexts test-nvtx test-nvtx-real
 
 LIB_NAME = libparcagpucupti.so
+# Bundled CUPTI that Docker builds ship next to $(LIB_NAME)
+BUNDLED_CUPTI = libcupti.so.12 libcupti.so.13 libnvperf_host.so.12 libnvperf_host.so.13
 
 # Default target: build for both architectures
 all: build-all
@@ -15,8 +17,8 @@ build-amd64:
 		--output type=local,dest=/tmp/parcagpu-build-amd64 \
 		--platform linux/amd64 .
 	@mkdir -p build/amd64
-	@cp /tmp/parcagpu-build-amd64/$(LIB_NAME) build/amd64/
-	@echo "AMD64 library built: build/amd64/$(LIB_NAME)"
+	@cd /tmp/parcagpu-build-amd64 && cp $(LIB_NAME) $(BUNDLED_CUPTI) $(CURDIR)/build/amd64/
+	@echo "AMD64 library built: build/amd64/$(LIB_NAME) (with bundled CUPTI 12 and 13)"
 
 # Build libparcagpucupti.so for ARM64 using Docker
 build-arm64:
@@ -28,8 +30,8 @@ build-arm64:
 		--output type=local,dest=/tmp/parcagpu-build-arm64 \
 		--platform linux/arm64 .
 	@mkdir -p build/arm64
-	@cp /tmp/parcagpu-build-arm64/$(LIB_NAME) build/arm64/
-	@echo "ARM64 library built: build/arm64/$(LIB_NAME)"
+	@cd /tmp/parcagpu-build-arm64 && cp $(LIB_NAME) $(BUNDLED_CUPTI) $(CURDIR)/build/arm64/
+	@echo "ARM64 library built: build/arm64/$(LIB_NAME) (with bundled CUPTI 12 and 13)"
 
 # Build both architectures
 build-all: build-amd64 build-arm64
