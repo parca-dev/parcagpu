@@ -18,6 +18,7 @@
 #include "Profiler/Cupti/CuptiCallbacks.h"
 #include "Utility/Singleton.h"
 #include "correlation_filter.h"
+#include "device_info.h"
 #include "env_config.h"
 #include "nvtx_collector.h"
 #include "pc_sampling.h"
@@ -305,12 +306,17 @@ public:
     proton::cupti::enableCallback<true>(1, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
                                         CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
 
-    // Enable resource callbacks only if PC sampling is enabled
+    // Context creation drives the device_info probe, independent of PC
+    // sampling; the remaining resource callbacks only feed PC sampling.
     if (pcSamplingEnabled) {
       proton::setResourceCallbacks(subscriber, /*enable=*/true);
       proton::cupti::enableCallback<true>(1, subscriber,
                                           CUPTI_CB_DOMAIN_DRIVER_API,
                                           CUPTI_DRIVER_TRACE_CBID_cuModuleLoad);
+    } else {
+      proton::cupti::enableCallback<true>(1, subscriber,
+                                          CUPTI_CB_DOMAIN_RESOURCE,
+                                          CUPTI_CBID_RESOURCE_CONTEXT_CREATED);
     }
 
     // NVTX goes through our own injection (nvtx_injection.cpp), not CUPTI.
@@ -560,13 +566,15 @@ private:
     auto &profiler = CuptiProfiler::instance();
 
     if (domain == CUPTI_CB_DOMAIN_RESOURCE) {
-      // Handle resource callbacks for PC sampling (only if enabled)
+      const CUpti_ResourceData *resData =
+          static_cast<const CUpti_ResourceData *>(cbdata_void);
+      if (cbid == CUPTI_CBID_RESOURCE_CONTEXT_CREATED)
+        device_info::onContextCreated(resData->context);
+
+      // The rest is for PC sampling (only if enabled)
       if (!profiler.pcSamplingEnabled) {
         return;
       }
-
-      const CUpti_ResourceData *resData =
-          static_cast<const CUpti_ResourceData *>(cbdata_void);
 
       switch (cbid) {
       case CUPTI_CBID_RESOURCE_MODULE_LOADED: {
@@ -665,6 +673,7 @@ private:
 
           profiler.pcSampling.emitMetadata();
         }
+        device_info::emit();
         return;
       }
 
@@ -698,6 +707,7 @@ private:
 
         profiler.pcSampling.emitMetadata();
       }
+      device_info::emit();
 
       // Skip correlation/rate-limiter work when no profiler is attached.
       if (!PARCAGPU_CUDA_CORRELATION_ENABLED())
