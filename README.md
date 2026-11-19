@@ -52,15 +52,35 @@ export CUDA_INJECTION64_PATH=/path/to/libparcagpucupti.so
 ### Bundled CUPTI
 
 Docker builds (`make build-amd64`, the release `parcagpu-<arch>.tar.gz` and
-`/usr/lib` in the runtime image) ship `libcupti.so` from CUDA 12.9 next to
-`libparcagpucupti.so`. Keep the two files in the same directory. parcagpu first
-looks for CUPTI the usual way: the directory in `TRITON_CUPTI_LIB_PATH`, a copy
-the process has already loaded, then `LD_LIBRARY_PATH` and the system library
-paths. If none of these has one, it loads the bundled copy. You don't need
-to set an environment variable.
-NVIDIA lists driver 575.57.08 or newer for CUPTI 12.9. If an older driver
-makes CUPTI fail with `CUPTI_ERROR_NOT_INITIALIZED`, put a `libcupti.so` that
-matches the driver on one of the paths above.
+`/usr/lib` in the runtime image) ship two CUPTIs next to
+`libparcagpucupti.so`: `libcupti.so.12` (CUDA 12.9) and `libcupti.so.13`
+(CUDA 13.0), each with the `libnvperf_host.so` it needs for PC sampling,
+renamed `libnvperf_host.so.12` and `.13`. Keep all five files in the same
+directory. You don't need to set an environment variable.
+
+parcagpu first looks for CUPTI the usual way: the directory in
+`TRITON_CUPTI_LIB_PATH`, a `libcupti.so` the process has already loaded, then
+`libcupti.so` on `LD_LIBRARY_PATH` and the system library paths. If none of
+these has one, it loads a bundled CUPTI:
+
+- `libcupti.so.13` when the driver supports CUDA 13 (driver 580 or newer)
+  and every GPU is Turing or newer (compute capability 7.5). GPUs released
+  after CUDA 12.9 need this one.
+- `libcupti.so.12` otherwise. It needs driver 575.57.08 or newer. If an older
+  driver makes CUPTI fail with `CUPTI_ERROR_NOT_INITIALIZED`, put a
+  `libcupti.so` that matches the driver on one of the paths above.
+
+`PARCAGPU_DEBUG=1` logs the choice. parcagpu loads the bundled
+`libnvperf_host.so` (about 110 MB of memory) only when PC sampling is on.
+A CUPTI found the usual way must find `libnvperf_host.so` itself, through
+`LD_LIBRARY_PATH` or the system library paths; otherwise PC sampling reports
+no stall reasons.
+
+An application may load its own `libcupti.so.12` or `.13`, as PyTorch does.
+parcagpu still loads its bundled copy, so the process has two. CUPTI takes
+one subscriber per process: if the application starts its own CUPTI profiler
+(such as `torch.profiler`) first, parcagpu records nothing; if it starts one
+later, that profiler fails with `CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED`.
 
 ### NVTX Annotations
 

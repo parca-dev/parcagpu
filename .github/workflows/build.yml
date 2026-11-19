@@ -110,7 +110,9 @@ jobs:
             --platform linux/${{ matrix.arch }} \
             .
           tar -czf build/parcagpu-${{ matrix.arch }}.tar.gz \
-            -C build/${{ matrix.arch }} libparcagpucupti.so libcupti.so
+            -C build/${{ matrix.arch }} libparcagpucupti.so \
+            libcupti.so.12 libcupti.so.13 \
+            libnvperf_host.so.12 libnvperf_host.so.13
           mv build/${{ matrix.arch }}/libparcagpucupti.so \
              build/${{ matrix.arch }}/libparcagpucupti-${{ matrix.arch }}.so
 
