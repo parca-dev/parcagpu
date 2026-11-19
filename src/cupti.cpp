@@ -450,10 +450,16 @@ public:
 
     // Have CUPTI's worker hand back partly filled buffers every second, so
     // kernel_stats (and kernel_executed) stay current on workloads that
-    // launch too few kernels to fill a buffer. Best effort.
-    if (auto r = proton::cupti::activityFlushPeriod<false>(1000);
-        r != CUPTI_SUCCESS) {
-      DEBUG_PRINTF("[PARCAGPU] activityFlushPeriod failed: %d\n", r);
+    // launch too few kernels to fill a buffer. Best effort: Dispatch throws
+    // if this libcupti lacks the symbol.
+    try {
+      if (auto r = proton::cupti::activityFlushPeriod<false>(1000);
+          r != CUPTI_SUCCESS) {
+        DEBUG_PRINTF("[PARCAGPU] activityFlushPeriod failed: %d\n", r);
+      }
+    } catch (const std::exception &e) {
+      DEBUG_PRINTF("[PARCAGPU] activityFlushPeriod unavailable: %s\n",
+                   e.what());
     }
 
     parcagpu::agentCtlStart(applyAgentConfig);
