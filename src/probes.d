@@ -1,6 +1,8 @@
 provider parcagpu {
   probe cuda_correlation(uint32_t correlationId, int signedCbid,
                           const char *name);
+  probe cuda_blocking_call(uint64_t startNs, uint64_t endNs, int signedCbid,
+                  uint32_t deviceId, uint64_t weightNs);
   probe kernel_executed(uint64_t start, uint64_t end,
                         uint32_t correlationId, uint32_t deviceId,
                         uint32_t streamId, uint32_t graphId,

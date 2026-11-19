@@ -55,6 +55,7 @@ const (
 	eventTypeError         = 5
 	eventTypeNvtx          = 6
 	eventTypeNvtxName      = 7
+	eventTypeCudaSync      = 8
 )
 
 // KernelEvent matches struct kernel_event in the BPF program.
@@ -133,14 +134,54 @@ type NvtxNameEvent struct {
 	Name      [128]byte
 }
 
+// CudaBlockingCallEvent matches struct cuda_blocking_call_event in the BPF program.
+type CudaBlockingCallEvent struct {
+	EventType  uint32
+	SignedCbid int32
+	StartNs    uint64
+	EndNs      uint64
+	WeightNs   uint64
+	DeviceID   uint32
+	Tid        uint32
+}
+
+// blockingStats aggregates cuda_blocking_call events per signed cbid.
+type blockingStats struct {
+	events   uint64
+	weightNs uint64
+	minDurNs uint64
+	maxDurNs uint64
+}
+
+func printBlockingSummary(objs *activityParserObjects, byCbid map[int32]*blockingStats) {
+	var fires uint64
+	key := uint32(statBlockingEvents)
+	objs.Stats.Lookup(&key, &fires)
+	var total, weight uint64
+	cbids := make([]int32, 0, len(byCbid))
+	for c, st := range byCbid {
+		cbids = append(cbids, c)
+		total += st.events
+		weight += st.weightNs
+	}
+	sort.Slice(cbids, func(i, j int) bool { return cbids[i] < cbids[j] })
+	fmt.Printf("cuda_blocking_call: events=%d probe_fires=%d weight_ns=%d\n", total, fires, weight)
+	for _, c := range cbids {
+		st := byCbid[c]
+		fmt.Printf("cuda_blocking_call cbid=%d events=%d weight_ns=%d min_dur_ns=%d max_dur_ns=%d\n",
+			c, st.events, st.weightNs, st.minDurNs, st.maxDurNs)
+	}
+}
+
 const (
-	statBatches       = 0
-	statActivities    = 1
-	statKernels       = 2
-	statDrops         = 3
-	statNvtxBatches   = 4
-	statNvtxEvents    = 5
-	statNvtxTruncated = 6
+	statBatches        = 0
+	statActivities     = 1
+	statKernels        = 2
+	statDrops          = 3
+	statNvtxBatches    = 4
+	statNvtxEvents     = 5
+	statNvtxTruncated  = 6
+	statBlockingEvents = 7
 )
 
 var nvtxKindNames = map[uint16]string{1: "push", 2: "pop", 3: "start", 4: "end", 5: "mark"}
@@ -568,6 +609,7 @@ func main() {
 		{"error", objs.HandleError},
 		{"nvtx_event_batch", objs.HandleNvtxEventBatch},
 		{"nvtx_resource_name", objs.HandleNvtxResourceName},
+		{"cuda_blocking_call", objs.HandleCudaBlockingCall},
 	}
 
 	var links []link.Link
@@ -662,6 +704,7 @@ func main() {
 	var eventCount uint64
 	var pcSampleCount uint64
 	nvtx := newNvtxSummary()
+	blockingByCbid := map[int32]*blockingStats{}
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -751,6 +794,27 @@ func main() {
 			}
 			nvtx.names = append(nvtx.names, event)
 
+		case eventTypeCudaSync:
+			var event CudaBlockingCallEvent
+			if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &event); err != nil {
+				log.Printf("Parsing cuda_blocking_call event: %v", err)
+				continue
+			}
+			dur := event.EndNs - event.StartNs
+			st := blockingByCbid[event.SignedCbid]
+			if st == nil {
+				st = &blockingStats{minDurNs: dur}
+				blockingByCbid[event.SignedCbid] = st
+			}
+			st.events++
+			st.weightNs += event.WeightNs
+			st.minDurNs = min(st.minDurNs, dur)
+			st.maxDurNs = max(st.maxDurNs, dur)
+			if *verbose {
+				fmt.Printf("cuda_blocking_call: cbid=%d dev=%d tid=%d duration=%dns weight=%dns\n",
+					event.SignedCbid, int32(event.DeviceID), event.Tid, dur, event.WeightNs)
+			}
+
 		case eventTypePCSample:
 			var event PCSampleEvent
 			if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &event); err != nil {
@@ -811,6 +875,7 @@ func main() {
 	printStallReasonMap(&objs)
 	printCubins(cubins)
 	nvtx.print(&objs)
+	printBlockingSummary(&objs, blockingByCbid)
 }
 
 func printStats(objs *activityParserObjects, eventCount uint64) {
@@ -894,3 +959,4 @@ func cString(b []byte) string {
 var _ = [1]struct{}{}[unsafe.Sizeof(KernelEvent{})-176]
 var _ = [1]struct{}{}[unsafe.Sizeof(CubinEvent{})-32]
 var _ = [1]struct{}{}[unsafe.Sizeof(PCSampleEvent{})-672]
+var _ = [1]struct{}{}[unsafe.Sizeof(CudaBlockingCallEvent{})-40]

@@ -68,6 +68,19 @@ struct cubin_event {
 #define EVENT_TYPE_ERROR 5
 #define EVENT_TYPE_NVTX 6
 #define EVENT_TYPE_NVTX_NAME 7
+#define EVENT_TYPE_CUDA_BLOCKING_CALL 8
+
+// Host blocking-call sample (cuda_blocking_call probe): one CUDA API call that
+// blocked the calling thread (GPU wait, allocation, pinning, module load, ...).
+struct cuda_blocking_call_event {
+  u32 event_type; // EVENT_TYPE_CUDA_BLOCKING_CALL
+  s32 signed_cbid; // >0 runtime cbid, <0 driver cbid
+  u64 start_ns;    // CLOCK_MONOTONIC at API ENTER
+  u64 end_ns;      // CLOCK_MONOTONIC at API EXIT
+  u64 weight_ns;   // blocked time this sample stands for
+  u32 device_id;   // UINT32_MAX if unknown
+  u32 tid;
+};
 
 // PC sample event sent to user-space.
 struct pc_sample_event {
@@ -163,6 +176,7 @@ enum stat_key {
   STAT_NVTX_BATCHES = 4,   // nvtx_event_batch probe invocations
   STAT_NVTX_EVENTS = 5,    // NVTX records read from batches
   STAT_NVTX_TRUNCATED = 6, // NVTX records past MAX_NVTX_BATCH (skipped)
+  STAT_BLOCKING_EVENTS = 7,    // cuda_blocking_call probe fires
 };
 
 static __always_inline void add_stat(enum stat_key key, u64 n) {
@@ -478,6 +492,26 @@ int BPF_USDT(handle_nvtx_resource_name, u32 kind, u64 id, u64 name_ptr) {
   evt->name[0] = '\0';
   if (name_ptr)
     bpf_probe_read_user_str(evt->name, sizeof(evt->name), (void *)name_ptr);
+  bpf_ringbuf_submit(evt, 0);
+  return 0;
+}
+
+SEC("usdt/parcagpu/cuda_blocking_call")
+int BPF_USDT(handle_cuda_blocking_call, u64 start_ns, u64 end_ns, s32 signed_cbid,
+             u32 device_id, u64 weight_ns) {
+  bump_stat(STAT_BLOCKING_EVENTS);
+  struct cuda_blocking_call_event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+  if (!evt) {
+    bump_stat(STAT_DROPS);
+    return 0;
+  }
+  evt->event_type = EVENT_TYPE_CUDA_BLOCKING_CALL;
+  evt->signed_cbid = signed_cbid;
+  evt->start_ns = start_ns;
+  evt->end_ns = end_ns;
+  evt->weight_ns = weight_ns;
+  evt->device_id = device_id;
+  evt->tid = (u32)bpf_get_current_pid_tgid();
   bpf_ringbuf_submit(evt, 0);
   return 0;
 }
