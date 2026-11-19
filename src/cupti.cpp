@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
+#include <string>
 #include <time.h>
 #include <unistd.h>
 
@@ -259,6 +261,33 @@ __attribute__((noinline)) void parcagpuActivityBatch(const void **ptrs,
 
 namespace parcagpu {
 
+// Load libcupti for Proton's dispatch. Proton's own lookup goes first
+// (TRITON_CUPTI_LIB_PATH, an already loaded copy, LD_LIBRARY_PATH,
+// ld.so.cache), so a CUPTI matching the installed toolkit wins. Failing
+// that, use the libcupti.so shipped next to this library. A CUPTI needs a
+// driver at least as new as the CUDA release it came from.
+static void loadCupti() {
+  using Cupti = proton::cupti::ExternLibCupti;
+  try {
+    proton::Dispatch<Cupti>::init(Cupti::name, &Cupti::lib);
+    return;
+  } catch (const std::runtime_error &) {
+  }
+  Dl_info info;
+  if (!dladdr(reinterpret_cast<void *>(&loadCupti), &info) ||
+      !info.dli_fname)
+    return;
+  std::string path = info.dli_fname;
+  path = path.substr(0, path.rfind('/') + 1) + Cupti::name;
+  Cupti::lib = dlopen(path.c_str(), RTLD_LOCAL | RTLD_LAZY);
+  if (Cupti::lib) {
+    DEBUG_PRINTF("[PARCAGPU] Using bundled %s\n", path.c_str());
+  } else {
+    DEBUG_PRINTF("[PARCAGPU] No libcupti found, bundled %s: %s\n",
+                 path.c_str(), dlerror());
+  }
+}
+
 // Simplified profiler using Proton's patterns
 class CuptiProfiler : public proton::Singleton<CuptiProfiler> {
 public:
@@ -274,6 +303,8 @@ public:
     }
 
     DEBUG_PRINTF("[PARCAGPU] Starting initialization\n");
+
+    loadCupti();
 
     // Check if PC sampling is supported
     pcSamplingEnabled = parcagpu::PCSampling::isSupported();

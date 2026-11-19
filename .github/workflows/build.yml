@@ -109,10 +109,14 @@ jobs:
             --output type=local,dest=build/${{ matrix.arch }} \
             --platform linux/${{ matrix.arch }} \
             .
+          tar -czf build/parcagpu-${{ matrix.arch }}.tar.gz \
+            -C build/${{ matrix.arch }} libparcagpucupti.so libcupti.so
           mv build/${{ matrix.arch }}/libparcagpucupti.so \
              build/${{ matrix.arch }}/libparcagpucupti-${{ matrix.arch }}.so
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          files: build/${{ matrix.arch }}/libparcagpucupti-${{ matrix.arch }}.so
+          files: |
+            build/${{ matrix.arch }}/libparcagpucupti-${{ matrix.arch }}.so
+            build/parcagpu-${{ matrix.arch }}.tar.gz

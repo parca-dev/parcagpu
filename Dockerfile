@@ -31,12 +31,15 @@ COPY CMakeLists.txt /build/
 RUN mkdir -p build && \
     cd build && \
     cmake -DCUDA_INCLUDE_DIR=/usr/local/cuda/include -DBUILD_TESTS=OFF .. && \
-    make -j$(nproc)
+    make -j$(nproc) && \
+    cp -L /usr/local/cuda/lib64/libcupti.so lib/libcupti.so
 
-# Export stage for extracting the library (used by Makefile and release binaries)
+# Export stage for extracting the library (used by Makefile and release binaries).
+# libcupti.so (redistributable under the CUDA EULA) ships next to
+# libparcagpucupti.so, which loads it when no other libcupti is found.
 FROM scratch AS export
-COPY --from=builder /build/build/lib/libparcagpucupti.so /
+COPY --from=builder /build/build/lib/libparcagpucupti.so /build/build/lib/libcupti.so /
 
 # Runtime image (for container registry)
 FROM busybox:latest AS runtime
-COPY --from=builder /build/build/lib/libparcagpucupti.so /usr/lib/libparcagpucupti.so
+COPY --from=builder /build/build/lib/libparcagpucupti.so /build/build/lib/libcupti.so /usr/lib/

@@ -15,8 +15,8 @@ build-amd64:
 		--output type=local,dest=/tmp/parcagpu-build-amd64 \
 		--platform linux/amd64 .
 	@mkdir -p build/amd64
-	@cp /tmp/parcagpu-build-amd64/$(LIB_NAME) build/amd64/
-	@echo "AMD64 library built: build/amd64/$(LIB_NAME)"
+	@cp /tmp/parcagpu-build-amd64/$(LIB_NAME) /tmp/parcagpu-build-amd64/libcupti.so build/amd64/
+	@echo "AMD64 library built: build/amd64/$(LIB_NAME) (with bundled libcupti.so)"
 
 # Build libparcagpucupti.so for ARM64 using Docker
 build-arm64:
@@ -28,8 +28,8 @@ build-arm64:
 		--output type=local,dest=/tmp/parcagpu-build-arm64 \
 		--platform linux/arm64 .
 	@mkdir -p build/arm64
-	@cp /tmp/parcagpu-build-arm64/$(LIB_NAME) build/arm64/
-	@echo "ARM64 library built: build/arm64/$(LIB_NAME)"
+	@cp /tmp/parcagpu-build-arm64/$(LIB_NAME) /tmp/parcagpu-build-arm64/libcupti.so build/arm64/
+	@echo "ARM64 library built: build/arm64/$(LIB_NAME) (with bundled libcupti.so)"
 
 # Build both architectures
 build-all: build-amd64 build-arm64
