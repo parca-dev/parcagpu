@@ -650,6 +650,15 @@ public:
 
     DEBUG_PRINTF("[PARCAGPU] Starting initialization\n");
 
+    // cuda_blocking_call is opt-in: CUPTI has no probe-attach hook, so its
+    // callbacks would otherwise cost every blocking call (including polling
+    // queries) even with no agent attached.
+    if (const char *v = getenv("PARCAGPU_BLOCKING_CALLS");
+        v != nullptr && strcmp(v, "0") != 0 && *v != '\0') {
+      blockingCallsEnabled = true;
+      DEBUG_PRINTF("[PARCAGPU] Blocking-call sampling enabled\n");
+    }
+
     parcagpu::agentCtlInit();
 
     // Check if PC sampling is supported: asked for by the environment, or
@@ -701,9 +710,12 @@ public:
     proton::cupti::enableCallback<true>(1, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
                                         CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
 
-    // Blocking-class callbacks for the cuda_blocking_call probe. <false>: an older CUPTI
-    // rejecting one cbid must not fail the whole injection.
+    // Blocking-class callbacks for the cuda_blocking_call probe, only when
+    // PARCAGPU_BLOCKING_CALLS is set. <false>: an older CUPTI rejecting one
+    // cbid must not fail the whole injection.
     for (const auto &cb : kBlockingCallbacks) {
+      if (!blockingCallsEnabled)
+        break;
       if (auto r = proton::cupti::enableCallback<false>(1, subscriber,
                                                         cb.domain, cb.cbid);
           r != CUPTI_SUCCESS) {
@@ -789,6 +801,8 @@ public:
           CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
       // Mirror the blocking callbacks enabled in init().
       for (const auto &cb : kBlockingCallbacks) {
+        if (!blockingCallsEnabled)
+          break;
         proton::cupti::enableCallback<false>(0, subscriber, cb.domain,
                                              cb.cbid);
       }
@@ -838,6 +852,7 @@ public:
 private:
   std::atomic<bool> initialized{false};
   bool pcSamplingEnabled = false;
+  bool blockingCallsEnabled = false; // PARCAGPU_BLOCKING_CALLS
   CUpti_SubscriberHandle subscriber = nullptr;
 
   // PC sampling state — owned by this profiler, destroyed with it.
@@ -1212,7 +1227,8 @@ private:
           domain == CUPTI_CB_DOMAIN_DRIVER_API && proton::isLaunch(cbid);
       // Blocking-class calls (cuda_blocking_call probe) never take the launch
       // correlation / rate-limiter path below.
-      const bool isBlocking = isBlockingCb(domain, cbid);
+      const bool isBlocking =
+          profiler.blockingCallsEnabled && isBlockingCb(domain, cbid);
       // Other driver calls are subscribed for the gate only (and drains).
       const bool gateOnlyCb = domain == CUPTI_CB_DOMAIN_DRIVER_API &&
                               !isKernelLaunchCb && !isBlocking;

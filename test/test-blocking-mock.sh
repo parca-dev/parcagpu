@@ -6,6 +6,8 @@
 # Phase 1 (default threshold, 10 us): every 200 us sync is reported with
 #   weight == duration; runtime syncs are reported once (cbid 131), not
 #   again as their nested driver call; pure driver syncs report cbid -126.
+# All probe phases set PARCAGPU_BLOCKING_CALLS=1; phase "off" leaves it unset
+#   and checks that no blocking callbacks are enabled and nothing fires.
 # Phase 2 (PARCAGPU_BLOCKING_THRESHOLD_US=1000): 200 us syncs are below T, so
 #   only some are reported, each with weight == T.
 #
@@ -49,14 +51,16 @@ BT_PROG='usdt:'"$LIB"':parcagpu:cuda_blocking_call {
   @bad_weight[(int32)arg2] = sum(arg4 != ($1 == 0 ? arg1 - arg0 : $1) ? 1 : 0);
 }'
 
-# run_phase NAME THRESHOLD_US EXPECTED_WEIGHT_NS — sets TEST_LOG / BT_LOG.
+# run_phase NAME THRESHOLD_US EXPECTED_WEIGHT_NS [ENABLE] — sets TEST_LOG /
+# BT_LOG. ENABLE defaults to 1; pass "" to leave PARCAGPU_BLOCKING_CALLS unset.
 run_phase() {
-  local name="$1" threshold="$2" expected="$3"
+  local name="$1" threshold="$2" expected="$3" enable="${4-1}"
   TEST_LOG="/tmp/parcagpu-blocking-mock-$name-test.log"
   BT_LOG="/tmp/parcagpu-blocking-mock-$name-bt.log"
 
   echo "=== Phase $name: sync-us=$SYNC_US threshold=${threshold:-default} ==="
   env LD_LIBRARY_PATH="$ROOT/build-local/lib:${LD_LIBRARY_PATH:-}" \
+    ${enable:+PARCAGPU_BLOCKING_CALLS=$enable} \
     ${threshold:+PARCAGPU_BLOCKING_THRESHOLD_US=$threshold} \
     "$TEST_BIN" "$LIB" --launch-rate=50 --sync-us=$SYNC_US --duration=5 \
     > "$TEST_LOG" 2>&1 &
@@ -107,6 +111,14 @@ EV=$(( $(val events 131) + $(val events -126) ))
 check_expr "sub-threshold calls sampled ($EV of $CALLS)" "[ $EV -gt 0 ] && [ $EV -lt $CALLS ]"
 check_expr "sub-threshold weight == T" \
   "[ $(val bad_weight 131) -eq 0 ] && [ $(val bad_weight -126) -eq 0 ]"
+
+# --- Phase 3: off by default ---
+run_phase off "" 0 ""
+OFF_EV=$({ grep -E "^@events\[" "$BT_LOG" || true; } | awk '{ s += $2 } END { print s + 0 }')
+# cbid 131 (runtime cudaStreamSynchronize) is enabled only by the blocking list.
+OFF_EN=$(grep -c "cuptiEnableCallback(enable=1, domain=2, cbid=131)" "$TEST_LOG" || true)
+check_expr "no events without PARCAGPU_BLOCKING_CALLS ($OFF_EV)" "[ $OFF_EV -eq 0 ]"
+check_expr "blocking callbacks not enabled without PARCAGPU_BLOCKING_CALLS" "[ $OFF_EN -eq 0 ]"
 
 if $PASS; then
   echo; echo "=== ALL CHECKS PASSED ==="

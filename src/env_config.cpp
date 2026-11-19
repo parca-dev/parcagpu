@@ -22,6 +22,7 @@ static const char *knownVars[] = {
     "PARCAGPU_PC_HW_BUFFER_MB",
     "PARCAGPU_GATE_STATS",
     "PARCAGPU_METADATA_REFRESH_MS",
+    "PARCAGPU_BLOCKING_CALLS",
     "PARCAGPU_BLOCKING_THRESHOLD_US",
 };
 static constexpr size_t numKnownVars =
