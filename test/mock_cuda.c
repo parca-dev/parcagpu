@@ -4,6 +4,7 @@
  */
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <cuda.h>
 
@@ -30,13 +31,49 @@ CUresult cuCtxSynchronize(void) {
     return CUDA_SUCCESS;
 }
 
-// Mock cuCtxGetDevice — return a fixed device id for the parcagpu
-// gpu_config probe path.
+// Context pushed by cuCtxPushCurrent (one level is all parcagpu needs).
+// Mock contexts are (CUcontext)(1 + device index); see mock_cupti.c.
+static __thread CUcontext pushed_ctx = NULL;
+
+CUresult cuCtxPushCurrent_v2(CUcontext ctx) {
+    pushed_ctx = ctx;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuCtxPopCurrent_v2(CUcontext *ctx) {
+    if (ctx != NULL)
+        *ctx = pushed_ctx;
+    pushed_ctx = NULL;
+    return CUDA_SUCCESS;
+}
+
+// Mock cuCtxGetDevice — the pushed context's device, else device 0 (the
+// gpu_config probe path doesn't push).
 CUresult cuCtxGetDevice(CUdevice *device) {
     if (device == NULL) {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    *device = 0;
+    *device = pushed_ctx ? (CUdevice)((uintptr_t)pushed_ctx - 1) : 0;
+    return CUDA_SUCCESS;
+}
+
+// Mock cuDeviceGetUuid_v2 — bytes 0..14 are 0xA0+i, byte 15 is the ordinal,
+// so each device's UUID is distinct and recognizable.
+CUresult cuDeviceGetUuid_v2(CUuuid *uuid, CUdevice dev) {
+    if (uuid == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    for (int i = 0; i < 15; i++)
+        uuid->bytes[i] = (char)(0xA0 + i);
+    uuid->bytes[15] = (char)dev;
+    return CUDA_SUCCESS;
+}
+
+CUresult cuDeviceGetPCIBusId(char *pciBusId, int len, CUdevice dev) {
+    if (pciBusId == NULL || len < 13) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    snprintf(pciBusId, len, "0000:%02x:00.0", 0x10 + dev);
     return CUDA_SUCCESS;
 }
 
