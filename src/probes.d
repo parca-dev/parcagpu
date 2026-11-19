@@ -19,4 +19,6 @@ provider parcagpu {
   probe nvtx_resource_name(uint32_t kind, uint64_t id, const char *name);
   probe device_info(uint32_t deviceId, const uint8_t *uuid,
                     const char *pciBusId);
+  probe kernel_stats(const void *header, const void **entries,
+                     uint32_t count);
 };
