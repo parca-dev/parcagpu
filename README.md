@@ -23,6 +23,19 @@ a no-op. So set `NVTX_INJECTION64_PATH` in the launcher. parcagpu sets it at
 slot holds one library, so this can't be combined with Nsight Systems' NVTX
 capture.
 
+### Bundled CUPTI
+
+Docker builds (`make build-amd64`, the release `parcagpu-<arch>.tar.gz` and
+`/usr/lib` in the runtime image) ship `libcupti.so` from CUDA 12.9 next to
+`libparcagpucupti.so`. Keep the two files in the same directory. parcagpu first
+looks for CUPTI the usual way: the directory in `TRITON_CUPTI_LIB_PATH`, a copy
+the process has already loaded, then `LD_LIBRARY_PATH` and the system library
+paths. If none of these has one, it loads the bundled copy. You don't need
+to set an environment variable.
+NVIDIA lists driver 575.57.08 or newer for CUPTI 12.9. If an older driver
+makes CUPTI fail with `CUPTI_ERROR_NOT_INITIALIZED`, put a `libcupti.so` that
+matches the driver on one of the paths above.
+
 ### Environment variables
 
 Under control from [parca-agent](https://github.com/parca-dev/parca-agent), the
