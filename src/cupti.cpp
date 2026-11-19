@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <nvml.h>
 #include <string>
 #include <time.h>
 #include <unistd.h>
@@ -17,6 +18,7 @@
 #include "probes.h"
 
 // Include proton headers
+#include "Driver/GPU/CudaApi.h"
 #include "Driver/GPU/CuptiApi.h"
 #include "Profiler/Cupti/CuptiCallbacks.h"
 #include "Utility/Singleton.h"
@@ -686,11 +688,60 @@ __attribute__((noinline)) void parcagpuActivityBatch(const void **ptrs,
 
 namespace parcagpu {
 
+// Directory (with trailing slash) and major version ("12" or "13") of the
+// bundled CUPTI in use; bundledDir is empty when none was loaded.
+static std::string bundledDir;
+static std::string bundledMajor;
+
+// The bundled CUPTI major version for this machine. CUPTI 13 (CUDA 13.0)
+// needs driver 580 or newer and supports only Turing and newer GPUs (compute
+// capability 7.5); CUPTI 12 (CUDA 12.9) runs on driver 575.57.08 or newer,
+// including 580+, and on older GPUs. GPUs released after CUDA 12.9 need 13.
+static int bundledCuptiMajor() {
+  int driver = 0;
+  proton::cuda::driverGetVersion<false>(&driver);
+  if (driver < 13000)
+    return 12;
+  // InitializeInjection runs inside cuInit, before cuDeviceGet works, so ask
+  // NVML. It sees every GPU on the host, ignoring CUDA_VISIBLE_DEVICES.
+  int minCC = 0;
+  if (void *nvml = dlopen("libnvidia-ml.so.1", RTLD_LOCAL | RTLD_LAZY)) {
+    auto init = (decltype(&nvmlInit_v2))dlsym(nvml, "nvmlInit_v2");
+    auto shutdown = (decltype(&nvmlShutdown))dlsym(nvml, "nvmlShutdown");
+    auto count =
+        (decltype(&nvmlDeviceGetCount_v2))dlsym(nvml, "nvmlDeviceGetCount_v2");
+    auto handle = (decltype(&nvmlDeviceGetHandleByIndex_v2))dlsym(
+        nvml, "nvmlDeviceGetHandleByIndex_v2");
+    auto cc = (decltype(&nvmlDeviceGetCudaComputeCapability))dlsym(
+        nvml, "nvmlDeviceGetCudaComputeCapability");
+    unsigned n = 0;
+    if (init && shutdown && count && handle && cc && init() == NVML_SUCCESS) {
+      if (count(&n) == NVML_SUCCESS) {
+        for (unsigned i = 0; i < n; i++) {
+          nvmlDevice_t dev;
+          int major = 0, minor = 0;
+          if (handle(i, &dev) == NVML_SUCCESS &&
+              cc(dev, &major, &minor) == NVML_SUCCESS &&
+              (minCC == 0 || major * 10 + minor < minCC))
+            minCC = major * 10 + minor;
+        }
+      }
+      shutdown();
+    }
+    dlclose(nvml);
+  }
+  PLOG_DEBUG(kLogComponent, "Driver CUDA %d, lowest compute capability %d",
+             driver, minCC);
+  return minCC >= 75 ? 13 : 12;
+}
+
 // Load libcupti for Proton's dispatch. Proton's own lookup goes first
-// (TRITON_CUPTI_LIB_PATH, an already loaded copy, LD_LIBRARY_PATH,
+// (TRITON_CUPTI_LIB_PATH, an already loaded libcupti.so, LD_LIBRARY_PATH,
 // ld.so.cache), so a CUPTI matching the installed toolkit wins. Failing
-// that, use the libcupti.so shipped next to this library. A CUPTI needs a
-// driver at least as new as the CUDA release it came from.
+// that, load libcupti.so.12 or libcupti.so.13 shipped next to this library.
+// An application's own libcupti.so.12/.13 (pip wheels) is not reused: CUPTI
+// takes one subscriber per process either way, and in a shared copy the
+// application's later cuptiActivityRegisterCallbacks steals our records.
 static void loadCupti() {
   using Cupti = proton::cupti::ExternLibCupti;
   try {
@@ -702,14 +753,33 @@ static void loadCupti() {
   if (!dladdr(reinterpret_cast<void *>(&loadCupti), &info) ||
       !info.dli_fname)
     return;
-  std::string path = info.dli_fname;
-  path = path.substr(0, path.rfind('/') + 1) + Cupti::name;
+  std::string dir = info.dli_fname;
+  dir = dir.substr(0, dir.rfind('/') + 1);
+  std::string major = std::to_string(bundledCuptiMajor());
+  std::string path = dir + "libcupti.so." + major;
   Cupti::lib = dlopen(path.c_str(), RTLD_LOCAL | RTLD_LAZY);
   if (Cupti::lib) {
+    bundledDir = dir;
+    bundledMajor = major;
     PLOG_DEBUG(kLogComponent, "Using bundled %s", path.c_str());
   } else {
     PLOG_DEBUG(kLogComponent, "No libcupti found, bundled %s: %s",
                path.c_str(), dlerror());
+  }
+}
+
+// CUPTI's PC sampling dlopens "libnvperf_host.so" by name and reports no
+// stall reasons when it is missing. A loaded library with that soname
+// satisfies the lookup, so load the copy bundled with the CUPTI in use. It
+// adds about 110 MB of RSS, so only when PC sampling is on.
+static void loadBundledNvperf() {
+  if (bundledDir.empty())
+    return;
+  std::string path = bundledDir + "libnvperf_host.so." + bundledMajor;
+  if (dlopen(path.c_str(), RTLD_LOCAL | RTLD_LAZY)) {
+    PLOG_DEBUG(kLogComponent, "Using bundled %s", path.c_str());
+  } else {
+    PLOG_DEBUG(kLogComponent, "Bundled %s: %s", path.c_str(), dlerror());
   }
 }
 
@@ -763,6 +833,7 @@ public:
         PARCAGPU_FEATURE_KERNEL_STATS |
         (blockingCallsEnabled ? PARCAGPU_FEATURE_BLOCKING_CALLS : 0));
     if (pcSamplingEnabled) {
+      loadBundledNvperf();
       PLOG_DEBUG(kLogComponent, "PC sampling enabled (serialized mode)");
     } else {
       PLOG_DEBUG(kLogComponent,

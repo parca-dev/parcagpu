@@ -213,14 +213,6 @@ if(BUILD_TESTS)
         COMMENT "Creating libcuda.so.1 symlink"
     )
 
-    # Create libcupti.so.12 symlink for test
-    add_custom_command(TARGET cupti_mock POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E create_symlink
-            libcupti.so
-            ${CMAKE_BINARY_DIR}/lib/libcupti.so.12
-        COMMENT "Creating libcupti.so.12 symlink"
-    )
-
     # Focused NVTX injection test. Acts as an NVTX client: calls
     # InitializeInjectionNvtx2 in libparcagpucupti.so, calls through the
     # installed handlers, and asserts via the collector's test-only accessors.
