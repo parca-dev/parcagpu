@@ -17,7 +17,7 @@
 // per (device, stream, kernel name) and leave through the kernel_stats probe
 // as deltas: at most once a second from completeBuffer, and once more from
 // cleanup after the final flush. Nothing is counted while no consumer is
-// attached to kernel_stats.
+// attached to kernel_stats, or while parca-agent has them off.
 //
 // The layouts below are the probe's ABI: the eBPF consumer reads them from
 // this process's memory (see ebpf/cupti_bpf.h).
@@ -45,7 +45,13 @@ static_assert(sizeof(Entry) == 32, "kernel_stats entry ABI");
 // the same header. Matches the eBPF consumer's tail-call budget.
 constexpr uint32_t kMaxEntriesPerFiring = 256;
 
-// Counts one kernel activity record. Cheap no-op when nothing is attached.
+// Whether kernel stats are on: the agent's PARCAGPU_FEATURE_KERNEL_STATS bit
+// while it controls this process, else always (the probe's semaphore then
+// decides). One atomic load.
+bool enabled();
+
+// Counts one kernel activity record. Cheap no-op when nothing is attached,
+// or while kernel stats are off.
 void record(const CUpti_ActivityKernel5 *k);
 
 // Fires kernel_stats if at least a second has passed since the last firing,

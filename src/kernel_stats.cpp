@@ -13,6 +13,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "agent_ctl.h"
+#include "parcagpu_ctl.h"
 #include "pc_sampling.h" // DEBUG_PRINTF
 
 // Single call site for the probe (see the fireX wrappers in pc_sampling.cpp).
@@ -101,8 +103,12 @@ void fire(Interval &iv, uint32_t seq) {
 
 } // namespace
 
+bool enabled() {
+  return agentCtlFeature(PARCAGPU_FEATURE_KERNEL_STATS, /*envDefault=*/true);
+}
+
 void record(const CUpti_ActivityKernel5 *k) {
-  if (!PARCAGPU_KERNEL_STATS_ENABLED())
+  if (!PARCAGPU_KERNEL_STATS_ENABLED() || !enabled())
     return;
   const uint64_t dur = k->end > k->start ? k->end - k->start : 0;
   const Key key{k->deviceId, k->streamId, k->name};

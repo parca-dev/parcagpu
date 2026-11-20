@@ -55,6 +55,7 @@ struct AgentConfig {
   uint32_t gapMs = 0;
   uint32_t rateLimit = 0; // launch probe rate limits; 0 = the environment's
   uint32_t graphRateLimit = 0;
+  uint32_t features = 0; // PARCAGPU_FEATURE_*
 };
 AgentConfig agentCtlConfig();
 uint64_t agentCtlGeneration();
@@ -62,6 +63,10 @@ uint64_t agentCtlGeneration();
 // Whether ctx may PC sample: the agent's configuration if active, else
 // envDefault.
 bool agentCtlAllows(CUcontext ctx, bool envDefault);
+
+// Whether optional instrumentation feature (PARCAGPU_FEATURE_*) is on: the
+// agent's bit if active, else envDefault. One atomic load.
+bool agentCtlFeature(uint32_t feature, bool envDefault);
 
 // The environment's launch probe rate limits, reported as in effect while the
 // agent sets none.

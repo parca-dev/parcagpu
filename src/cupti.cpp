@@ -448,19 +448,7 @@ public:
       DEBUG_PRINTF("[PARCAGPU] Enabled CONCURRENT_KERNEL activity\n");
     }
 
-    // Have CUPTI's worker hand back partly filled buffers every second, so
-    // kernel_stats (and kernel_executed) stay current on workloads that
-    // launch too few kernels to fill a buffer. Best effort: Dispatch throws
-    // if this libcupti lacks the symbol.
-    try {
-      if (auto r = proton::cupti::activityFlushPeriod<false>(1000);
-          r != CUPTI_SUCCESS) {
-        DEBUG_PRINTF("[PARCAGPU] activityFlushPeriod failed: %d\n", r);
-      }
-    } catch (const std::exception &e) {
-      DEBUG_PRINTF("[PARCAGPU] activityFlushPeriod unavailable: %s\n",
-                   e.what());
-    }
+    syncFlushPeriod();
 
     parcagpu::agentCtlStart(applyAgentConfig);
 
@@ -551,8 +539,42 @@ private:
 
   // False (retried) while a stream capture is in progress.
   static bool applyAgentConfig(const std::function<void()> &commit) {
-    PCTransition transition;
-    return CuptiProfiler::instance().pcSampling.applyAgentConfig(commit);
+    bool done;
+    {
+      PCTransition transition;
+      done = CuptiProfiler::instance().pcSampling.applyAgentConfig(commit);
+    }
+    if (done)
+      syncFlushPeriod();
+    return done;
+  }
+
+  // While kernel stats are on, have CUPTI's worker hand back partly filled
+  // buffers every second, so kernel_stats (and kernel_executed) stay current
+  // on workloads that launch too few kernels to fill a buffer; while they
+  // are off, leave CUPTI's default. Best effort: Dispatch throws if this
+  // libcupti lacks the symbol.
+  static void syncFlushPeriod() {
+    static std::mutex mu;
+    static int applied = -1; // flush period in ms; -1 = never set
+    std::lock_guard<std::mutex> lock(mu);
+    const int want = kernel_stats::enabled() ? 1000 : 0;
+    if (want == applied)
+      return;
+    try {
+      if (auto r = proton::cupti::activityFlushPeriod<false>(want);
+          r != CUPTI_SUCCESS) {
+        DEBUG_PRINTF("[PARCAGPU] activityFlushPeriod(%d) failed: %d\n", want,
+                     r);
+        return;
+      }
+      applied = want;
+      DEBUG_PRINTF("[PARCAGPU] activityFlushPeriod(%d)\n", want);
+    } catch (const std::exception &e) {
+      applied = want; // unavailable: don't retry
+      DEBUG_PRINTF("[PARCAGPU] activityFlushPeriod unavailable: %s\n",
+                   e.what());
+    }
   }
 
   // A stream capture is beginning on this thread (its BeginCapture ENTER,
