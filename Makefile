@@ -1,4 +1,4 @@
-.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-blocking-mock test-graph-rate-limit test-pc-contexts test-nvtx test-nvtx-real test-agent-ctl test-gate
+.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-blocking-mock test-graph-rate-limit test-pc-contexts test-nvtx test-nvtx-real test-agent-ctl test-gate test-machine-gpus
 
 LIB_NAME = libparcagpucupti.so
 
@@ -69,6 +69,10 @@ test: local
 		./build-local/bin/test_cupti_prof build-local/lib/libparcagpucupti.so --duration=5
 
 # NVTX collector unit test (mock CUPTI, no GPU, no root)
+# Machine GPU count and the default launch rate limit split (no GPU/root).
+test-machine-gpus: local
+	./build-local/bin/test_machine_gpus
+
 test-nvtx: local
 	@echo "=== Running NVTX test ==="
 	@LD_LIBRARY_PATH="$(CURDIR)/build-local/lib:$$LD_LIBRARY_PATH" \

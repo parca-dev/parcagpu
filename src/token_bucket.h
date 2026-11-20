@@ -20,8 +20,8 @@ public:
 
   void setRate(double tokensPerSec) {
     rate = tokensPerSec;
-    if (tokens > rate)
-      tokens = rate;
+    if (tokens > capacity())
+      tokens = capacity();
   }
 
   // Returns true if a token was available and consumed.
@@ -40,11 +40,15 @@ private:
     if (lastRefillNs > 0) {
       double elapsed = (now - lastRefillNs) / 1e9;
       tokens += elapsed * rate;
-      if (tokens > rate)
-        tokens = rate;
+      if (tokens > capacity())
+        tokens = capacity();
     }
     lastRefillNs = now;
   }
+
+  // A second's worth of tokens, but at least one: a bucket slower than 1/s
+  // would otherwise never fill to a whole token.
+  double capacity() const { return rate > 1.0 ? rate : 1.0; }
 
   static uint64_t nowNs() {
     struct timespec ts;
