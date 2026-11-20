@@ -294,6 +294,12 @@ void parcagpu_nvtx_test_force_capture(int on) {
   parcagpu::g_testForceCapture.store(on != 0, std::memory_order_relaxed);
 }
 
+// Whether a USDT consumer (e.g. a running parca-agent) has the event batch
+// probe armed: then events are captured with force-capture off too.
+int parcagpu_nvtx_test_consumer_attached(void) {
+  return PARCAGPU_NVTX_EVENT_BATCH_ENABLED() ? 1 : 0;
+}
+
 uint64_t parcagpu_nvtx_test_events_captured(void) {
   return parcagpu::g_testEventsCaptured.load(std::memory_order_relaxed);
 }

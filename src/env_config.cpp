@@ -20,6 +20,8 @@ static const char *knownVars[] = {
     "PARCAGPU_SAMPLING_FACTOR",
     "PARCAGPU_PC_SAMPLING_RATE",
     "PARCAGPU_PC_HW_BUFFER_MB",
+    "PARCAGPU_GATE_STATS",
+    "PARCAGPU_METADATA_REFRESH_MS",
 };
 static constexpr size_t numKnownVars =
     sizeof(knownVars) / sizeof(knownVars[0]);
@@ -99,6 +101,13 @@ void validateEnvVars() {
       fireError(0, val,
                 "env_config: PARCAGPU_PC_SAMPLING_RATE invalid");
     }
+  }
+
+  val = std::getenv("PARCAGPU_METADATA_REFRESH_MS");
+  if (val && std::atol(val) <= 0) {
+    DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_METADATA_REFRESH_MS=%s invalid "
+                 "(must be > 0), using default\n", val);
+    fireError(0, val, "env_config: PARCAGPU_METADATA_REFRESH_MS invalid");
   }
 
   val = std::getenv("PARCAGPU_PC_HW_BUFFER_MB");

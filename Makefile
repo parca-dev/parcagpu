@@ -1,4 +1,4 @@
-.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-graph-rate-limit test-pc-contexts test-nvtx test-nvtx-real
+.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-graph-rate-limit test-pc-contexts test-nvtx test-nvtx-real test-agent-ctl test-gate
 
 LIB_NAME = libparcagpucupti.so
 
@@ -74,6 +74,16 @@ test-nvtx: local
 	@LD_LIBRARY_PATH="$(CURDIR)/build-local/lib:$$LD_LIBRARY_PATH" \
 		PARCAGPU_TEST_LIB=build-local/lib/libparcagpucupti.so \
 		./build-local/bin/test_nvtx
+
+# PC sampling gate unit test (no GPU), under ThreadSanitizer. setarch -R:
+# TSAN can't map its shadow memory with recent kernels' ASLR entropy.
+test-gate:
+	@echo "=== Running gate test ==="
+	@mkdir -p build-local/bin
+	@$(CXX) -std=c++17 -O1 -g -fsanitize=thread -Isrc \
+		-I$(or $(CUDA_INCLUDE_DIR),/usr/local/cuda/include) \
+		src/pc_gate.cpp test/test_gate.cpp -o build-local/bin/test_gate -lpthread
+	@setarch -R ./build-local/bin/test_gate
 
 # Clean build artifacts
 clean:
@@ -180,6 +190,11 @@ test-pc-mock: local bpf-test
 # Drives test_cupti_prof at a production TRT-LLM 4-GPU peak (graph rate-limit stress). No GPU.
 test-graph-rate-limit: local
 	test/test-graph-rate-limit.sh
+
+# Agent control over procctl, driven by a Go procctl agent against mock CUPTI.
+# No GPU/root.
+test-agent-ctl: local
+	cd test/agentctl && go test -count=1 -v ./...
 
 # PC sampling start/stop bookkeeping across several mock contexts. No GPU/root.
 test-pc-contexts: local

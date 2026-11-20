@@ -61,10 +61,16 @@ trap cleanup EXIT
 # short mock run (otherwise it would converge below 1 once samples flow).
 # --graph-rate=25 of --launch-rate=50: half the launches are CUDA graph
 # launches (one correlation ID fanning out into many kernel records).
+# PARCAGPU_METADATA_REFRESH_MS: the stall reason map and cubins fire at init,
+# before the parser attaches, and reach it on a replay. A replay on attach
+# needs the probe's semaphore to rise, which it doesn't when another
+# consumer (a parca-agent on the host) already holds it at 1; the refresh
+# replays them regardless.
 echo "=== Starting test_cupti_prof (mock, graph-rate=25 of launch-rate=50) ==="
 LD_LIBRARY_PATH="$ROOT/build-local/lib:${LD_LIBRARY_PATH:-}" \
   PARCAGPU_DEBUG=1 \
   PARCAGPU_PC_SAMPLING_RATE=10000 \
+  PARCAGPU_METADATA_REFRESH_MS=1000 \
   MOCK_CUBIN_PATH="$CUBIN" \
   "$TEST_BIN" "$LIB" --launch-rate=50 --graph-rate=25 --duration=15 > "$TEST_LOG" 2>&1 &
 TEST_PID=$!

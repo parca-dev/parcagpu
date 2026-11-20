@@ -122,8 +122,10 @@ int main(void) {
   StatFn_t names   = (StatFn_t)dlsym(h, "parcagpu_nvtx_test_resource_names_fired");
   ResetFn_t reset  = (ResetFn_t)dlsym(h, "parcagpu_nvtx_test_reset");
   LastEventFn_t last = (LastEventFn_t)dlsym(h, "parcagpu_nvtx_test_last_event");
+  int (*consumerAttached)(void) =
+      (int (*)(void))dlsym(h, "parcagpu_nvtx_test_consumer_attached");
   if (!initNvtx || !initCuda || !force || !events || !batches || !names ||
-      !reset || !last)
+      !reset || !last || !consumerAttached)
     fail("missing library entry points");
 
   force(1);
@@ -303,9 +305,13 @@ int main(void) {
   reset();
   pushA("skipped");
   pop();
-  // No USDT consumer attached, so without force-capture nothing should
-  // run past the early exit.
-  EXPECT(events() == 0, "case9 cold path");
+  // Without force-capture nothing should run past the early exit, unless a
+  // USDT consumer has the probe armed: a parca-agent on the host attaches to
+  // any process carrying parcagpu's probes, this one included.
+  if (consumerAttached())
+    fprintf(stderr, "SKIP: case9 cold path (a USDT consumer is attached)\n");
+  else
+    EXPECT(events() == 0, "case9 cold path");
 
   // -------- Case 10: cuInit points NVTX_INJECTION64_PATH at the library ----
   EXPECT(initCuda() == 1, "InitializeInjection returned non-1");
