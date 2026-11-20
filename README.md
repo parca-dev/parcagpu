@@ -80,6 +80,8 @@ is attached to the `nvtx_event_batch` probe.
 | `PARCAGPU_GRAPH_RATE_LIMIT` | 20 | Separate token-bucket rate limit for graph launches (`cuGraphLaunch`/`cudaGraphLaunch`), events/sec per thread. Graph launches draw from this bucket instead of `PARCAGPU_RATE_LIMIT`, so graph replays can't flood the probes and eager launch bursts can't starve graph sampling. |
 | `PARCAGPU_PC_SAMPLING_RATE` | (unset) | Setting this env var to a non-negative number enables PC sampling. The value is the target samples/sec; a controller adjusts the per-window dice-roll probability internally to converge on this rate. Set to 0 to enable sampling with rate control disabled (controller off, fixed probability). |
 | `PARCAGPU_SAMPLING_FACTOR` | 20 | Hardware PC sampling period (log2 cycles between samples per SM), [5,31]. A factor set by parca-agent takes precedence. Applied rather than CUPTI's per-GPU default, which is 10 on a GB10. |
+| `PARCAGPU_BLOCKING_CALLS` | (unset) | Set to a non-empty value other than `0` to enable the `cuda_blocking_call` probe. Off by default, because its CUPTI callbacks run on every covered API call (including stream/event query polling) even when no agent is attached. Under parca-agent control, the agent's `PARCAGPU_FEATURE_BLOCKING_CALLS` decides instead (off by default). |
+| `PARCAGPU_BLOCKING_THRESHOLD_US` | 10 | Threshold T for `cuda_blocking_call` (only used when `PARCAGPU_BLOCKING_CALLS` is set). Calls blocked at least T are always reported with weight = duration; shorter calls are reported with probability duration/T and weight = T, so summed weights estimate total blocked time without bias. 0 reports every call. |
 | `PARCAGPU_PC_HW_BUFFER_MB` | (unset) | Force the CUPTI PC-sampling hardware buffer to this many MB. Unset or 0 leaves it at the CUPTI default. |
 | `PARCAGPU_GATE_STATS` | off | Print the PC sampling gate's counters every 10 s (see below) |
 | `PARCAGPU_METADATA_REFRESH_MS` | 30000 | Re-emit cubins, the stall reason map and `gpu_config` this often. A consumer that attaches while another is attached only gets them at the next refresh: the USDT semaphore stays at 1. |
@@ -112,6 +114,14 @@ failed, is reported as unavailable.
 The agent can also set the launch probe rate limits (`PARCAGPU_RATE_LIMIT`
 and `PARCAGPU_GRAPH_RATE_LIMIT`'s meaning, applied live); a limit it leaves at
 0 stays the environment's. Each process reports the limits in effect.
+
+It also turns optional instrumentation on and off with feature bits:
+`kernel_stats` (`PARCAGPU_FEATURE_KERNEL_STATS`) and `cuda_blocking_call`
+(`PARCAGPU_FEATURE_BLOCKING_CALLS`). Under the agent each is off unless it
+sets the bit; the state reports the features in effect. The blocking-call
+callbacks are subscribed the first time the feature is on and then stay
+subscribed (with PC sampling on, the driver domain is subscribed as a whole
+for the gate); while the feature is off they return at once.
 
 With no agent, an agent that sends no configuration, or an agent whose lease
 has expired (it stopped heartbeating), parcagpu runs on the environment
@@ -189,6 +199,7 @@ make test-nvtx-real # Real NVTX clients + BPF parser, end to end (no GPU; sudo; 
 make test-agent-ctl # Agent control over procctl, from a Go agent (no GPU, no root)
 make test-gate      # PC sampling gate, under ThreadSanitizer (no GPU)
 make test-pc-mock   # Mock PC sampling with BPF activity parser (no GPU, requires root)
+make test-blocking-mock # Mock cuda_blocking_call probe check with bpftrace (no GPU, requires root)
 make test-pc-real   # Real PC sampling with GPU (requires root + GPU)
 make test-multi     # test_cupti_prof + BPF activity parser in parallel (requires root)
 ```
@@ -224,6 +235,7 @@ Defined in `src/probes.d`, provider `parcagpu`:
 | Probe | Arguments | Description |
 |---|---|---|
 | `cuda_correlation` | correlationId, cbid, name | API callback correlation |
+| `cuda_blocking_call` | startNs, endNs, cbid, deviceId, weightNs | Opt-in via `PARCAGPU_BLOCKING_CALLS`, or under parca-agent control `PARCAGPU_FEATURE_BLOCKING_CALLS`. CUDA API call that blocked the calling host thread: GPU waits (synchronize, sync memcpy, free, stream/event query), device and pinned-host allocation, VMM map/unmap, module/library loading, and graph instantiate/update/upload. Async enqueues (`cudaMemcpyAsync`, launches) are excluded. Fired inside the call so the CPU stack is the caller's. `cbid` is signed like `cuda_correlation` (negative = driver API). Timestamps are `CLOCK_MONOTONIC`; `deviceId` is `UINT32_MAX` if unknown. `weightNs` is the blocked time the sample stands for (see `PARCAGPU_BLOCKING_THRESHOLD_US`). |
 | `kernel_executed` | start, end, correlationId, deviceId, streamId, graphId, graphNodeId, name | Kernel execution timing |
 | `activity_batch` | ptrs, count | Batch of CUPTI activity records |
 | `pc_sample_batch` | records, count | Batch of PC sampling records |
@@ -264,6 +276,7 @@ Defined in `src/probes.d`, provider `parcagpu`:
 │   ├── mock_cupti.c      # Mock CUPTI library
 │   ├── mock_cuda.c       # Mock CUDA driver library
 │   ├── test-pc-mock.sh   # Mock PC sampling end-to-end test
+│   ├── test-blocking-mock.sh # Mock cuda_blocking_call probe test (bpftrace)
 │   ├── test-pc-real.sh   # Real GPU PC sampling end-to-end test
 │   ├── agentctl/         # Agent control tests (Go, procctl agent side)
 │   └── bpf/              # BPF activity parser (Go + eBPF)

@@ -31,6 +31,7 @@ typedef struct {
     const char *kernel_names; // Path to kernel names file
     uint64_t duration;        // Run for N seconds (default: 5)
     bool stress;              // Stress mode: no sleeps, fire as fast as possible
+    int sync_us;              // Per-iteration stream sync blocking time (0 = off)
 } TestConfig;
 
 void print_usage(const char *prog) {
@@ -50,6 +51,8 @@ void print_usage(const char *prog) {
     fprintf(stderr, "  --duration=N[s|m|h]   Run for N seconds/minutes/hours (default: 5s)\n");
     fprintf(stderr, "                        Examples: 30s, 5m, 2h\n");
     fprintf(stderr, "  --stress              No sleeps, fire events as fast as possible\n");
+    fprintf(stderr, "  --sync-us=N           After each launch iteration, block N us in a\n");
+    fprintf(stderr, "                        stream sync (alternating runtime/driver; default: 0)\n");
     fprintf(stderr, "  --help, -h            Show this help message\n");
     fprintf(stderr, "\nExamples:\n");
     fprintf(stderr, "  # Simple test (backward compatible)\n");
@@ -96,7 +99,8 @@ TestConfig parse_args(int argc, char **argv, const char **lib_path) {
         .num_procs = 1,
         .kernel_names = NULL,
         .duration = 5,
-        .stress = false
+        .stress = false,
+        .sync_us = 0
     };
 
     // Check for help first (can be first arg)
@@ -128,6 +132,8 @@ TestConfig parse_args(int argc, char **argv, const char **lib_path) {
             config.duration = parse_duration(argv[i] + 11);
         } else if (strcmp(argv[i], "--stress") == 0) {
             config.stress = true;
+        } else if (strncmp(argv[i], "--sync-us=", 10) == 0) {
+            config.sync_us = atoi(argv[i] + 10);
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -497,6 +503,61 @@ NOINLINE cudaError_t cudaGraphLaunch(cudaGraphExec_t graphExec, cudaStream_t str
     return cudaSuccess;
 }
 
+// Blocking time of the fake stream syncs below (--sync-us).
+static int g_sync_us = 0;
+static atomic_uint_least64_t sync_calls_runtime = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t sync_calls_driver = ATOMIC_VAR_INIT(0);
+
+// Driver API stream sync - blocks g_sync_us between ENTER and EXIT, like a
+// host thread waiting on the GPU.
+NOINLINE CUresult cuStreamSynchronize(CUstream hStream) {
+    (void)hStream;
+
+    tls_cbdata.callbackSite = CUPTI_API_ENTER;
+    tls_cbdata.correlationId = tls_correlation_id;
+    fire_cupti_callback(CUPTI_CB_DOMAIN_DRIVER_API,
+                         CUPTI_DRIVER_TRACE_CBID_cuStreamSynchronize, &tls_cbdata);
+
+    struct timespec block = {g_sync_us / 1000000, (long)(g_sync_us % 1000000) * 1000};
+    nanosleep(&block, NULL);
+
+    tls_cbdata.callbackSite = CUPTI_API_EXIT;
+    fire_cupti_callback(CUPTI_CB_DOMAIN_DRIVER_API,
+                         CUPTI_DRIVER_TRACE_CBID_cuStreamSynchronize, &tls_cbdata);
+    return CUDA_SUCCESS;
+}
+
+// Runtime API stream sync - wraps the driver call with the same correlation
+// ID, so the profiler must report it once (as the runtime cbid).
+NOINLINE cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
+    (void)stream;
+
+    tls_cbdata.callbackSite = CUPTI_API_ENTER;
+    tls_cbdata.correlationId = tls_correlation_id;
+    fire_cupti_callback(CUPTI_CB_DOMAIN_RUNTIME_API,
+                         CUPTI_RUNTIME_TRACE_CBID_cudaStreamSynchronize_v3020, &tls_cbdata);
+
+    cuStreamSynchronize(NULL);
+
+    tls_cbdata.callbackSite = CUPTI_API_EXIT;
+    fire_cupti_callback(CUPTI_CB_DOMAIN_RUNTIME_API,
+                         CUPTI_RUNTIME_TRACE_CBID_cudaStreamSynchronize_v3020, &tls_cbdata);
+    return cudaSuccess;
+}
+
+void simulate_stream_sync(uint32_t correlationId, bool is_runtime) {
+    tls_correlation_id = correlationId;
+    memset(&tls_cbdata, 0, sizeof(tls_cbdata));
+    tls_cbdata.context = mock_context_for(correlationId);
+    if (is_runtime) {
+        cudaStreamSynchronize(NULL);
+        atomic_fetch_add(&sync_calls_runtime, 1);
+    } else {
+        cuStreamSynchronize(NULL);
+        atomic_fetch_add(&sync_calls_driver, 1);
+    }
+}
+
 //-----------------------------------------------------------------------------
 // Simulation functions that call through the fake CUDA APIs
 //-----------------------------------------------------------------------------
@@ -623,6 +684,11 @@ void *worker_thread(void *arg) {
                     simulate_driver_kernel_launch(correlationId, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, true);
                 }
             }
+        }
+
+        if (args->config->sync_us > 0) {
+            uint32_t correlationId = atomic_fetch_add(args->global_correlation_id, 1);
+            simulate_stream_sync(correlationId, (iterations % 2) == 0);
         }
 
         if (!args->config->stress)
@@ -839,6 +905,11 @@ void run_test(TestConfig *config, KernelNameList *kernel_names) {
 
     uint32_t total_events = atomic_load(&global_correlation_id) - 1;
     fprintf(stderr, "Test completed. Generated %u events\n", total_events);
+    if (config->sync_us > 0) {
+        fprintf(stderr, "Sync calls: runtime=%lu driver=%lu block_us=%d\n",
+                (unsigned long)atomic_load(&sync_calls_runtime),
+                (unsigned long)atomic_load(&sync_calls_driver), config->sync_us);
+    }
 
     free(worker_args);
     free(worker_threads);
@@ -882,6 +953,7 @@ int main(int argc, char **argv) {
     }
 
     g_num_gpus = config.num_gpus > 0 ? config.num_gpus : 1;
+    g_sync_us = config.sync_us;
     fprintf(stderr, "[Process %d] Loading library: %s\n", proc_id, lib_path);
     fprintf(stderr, "[Process %d] Configuration:\n", proc_id);
     fprintf(stderr, "  Processes: %d\n", config.num_procs);

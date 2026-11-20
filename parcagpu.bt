@@ -38,6 +38,23 @@ usdt:*:parcagpu:cuda_correlation {
     printf("%-12s.%-6u [CORR] %u: cbid=%u %s\n", strftime("%H:%M:%S", nsecs), (nsecs % 1000000000) / 1000, $correlation_id, $cbid, $name);
 }
 
+usdt:*:parcagpu:cuda_blocking_call {
+    $start = arg0;
+    $end = arg1;
+    $cbid = (int32)arg2;
+    $device_id = (int32)arg3;
+    $weight = arg4;
+
+    printf("%-12s.%-6u [BLOCK] cbid=%d dev=%d duration_ns=%lu weight_ns=%lu tid=%d\n",
+           strftime("%H:%M:%S", nsecs),
+           (nsecs % 1000000000) / 1000,
+           $cbid,
+           $device_id,
+           $end - $start,
+           $weight,
+           tid);
+}
+
 usdt:*:parcagpu:pc_sample_batch {
     $records = arg0;
     $count = arg1;

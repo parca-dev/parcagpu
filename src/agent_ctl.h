@@ -68,6 +68,10 @@ bool agentCtlAllows(CUcontext ctx, bool envDefault);
 // agent's bit if active, else envDefault. One atomic load.
 bool agentCtlFeature(uint32_t feature, bool envDefault);
 
+// The features the environment turns on, reported as in effect while no agent
+// controls the process.
+void agentCtlSetEnvFeatures(uint32_t features);
+
 // The environment's launch probe rate limits, reported as in effect while the
 // agent sets none.
 void agentCtlSetEnvRateLimits(uint32_t rateLimit, uint32_t graphRateLimit);

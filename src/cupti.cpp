@@ -18,6 +18,7 @@
 #include "Profiler/Cupti/CuptiCallbacks.h"
 #include "Utility/Singleton.h"
 #include "agent_ctl.h"
+#include "parcagpu_ctl.h"
 #include "pc_gate.h"
 #include "correlation_filter.h"
 #include "device_info.h"
@@ -236,6 +237,289 @@ static double threadRandom(PCSamplingState &s) {
   return (double)rand_r(&s.rngSeed) / RAND_MAX;
 }
 
+// ---------------------------------------------------------------------------
+// Host blocking-call sampling (cuda_blocking_call probe).
+//
+// CUDA API calls that can block the calling host thread are timed from ENTER
+// to EXIT on that thread: GPU waits (synchronize, sync memcpy, free, query),
+// allocation and page pinning, VMM mapping, module/library loading and graph
+// instantiation. The probe fires inside the API call, so the agent sees the
+// application's stack; the signed cbid tells it which call (and category).
+// Calls lasting at least the threshold T are always reported with
+// weight = duration; shorter calls are reported with probability duration/T
+// and weight = T, so summed weights are an unbiased estimate of total blocked
+// time and the emitted event rate is bounded by blocked time / T.
+// ---------------------------------------------------------------------------
+
+// Default T: 10 us. Override with PARCAGPU_BLOCKING_THRESHOLD_US (0 = all).
+static constexpr uint64_t kBlockingDefaultThresholdNs = 10'000;
+std::atomic<uint64_t> g_blockingThresholdNs{kBlockingDefaultThresholdNs};
+
+// Blocking-class callbacks: the single source for both the enable list and
+// the isBlockingCb() switch. Proton's setRuntimeCallbacks/setLaunchCallbacks
+// only cover launches, so these are enabled explicitly in init(). Names are
+// checked against the CUDA 12.9 cupti_{runtime,driver}_cbid.h.
+// Async enqueues (cudaMemcpyAsync, cudaMallocAsync, launches) are deliberately
+// excluded: they are high-frequency and their cost is GPU-side.
+#define PARCAGPU_BLOCKING_RUNTIME_CBIDS(X)                                     \
+  /* GPU waits: device / stream / event synchronize and query */               \
+  X(cudaDeviceSynchronize_v3020)                                               \
+  X(cudaThreadSynchronize_v3020)                                               \
+  X(cudaStreamSynchronize_v3020)                                               \
+  X(cudaStreamSynchronize_ptsz_v7000)                                          \
+  X(cudaStreamQuery_v3020)                                                     \
+  X(cudaStreamQuery_ptsz_v7000)                                                \
+  X(cudaEventSynchronize_v3020)                                                \
+  X(cudaEventQuery_v3020)                                                      \
+  /* Synchronous memcpy */                                                     \
+  X(cudaMemcpy_v3020)                                                          \
+  X(cudaMemcpy_ptds_v7000)                                                     \
+  X(cudaMemcpy2D_v3020)                                                        \
+  X(cudaMemcpy2D_ptds_v7000)                                                   \
+  X(cudaMemcpy3D_v3020)                                                        \
+  X(cudaMemcpy3D_ptds_v7000)                                                   \
+  X(cudaMemcpyToSymbol_v3020)                                                  \
+  X(cudaMemcpyToSymbol_ptds_v7000)                                             \
+  X(cudaMemcpyFromSymbol_v3020)                                                \
+  X(cudaMemcpyFromSymbol_ptds_v7000)                                           \
+  X(cudaMemcpyPeer_v4000)                                                      \
+  /* Device allocation / free (free implicitly synchronizes the device) */     \
+  X(cudaMalloc_v3020)                                                          \
+  X(cudaMallocPitch_v3020)                                                     \
+  X(cudaMalloc3D_v3020)                                                        \
+  X(cudaMallocManaged_v6000)                                                   \
+  X(cudaFree_v3020)                                                            \
+  X(cudaMemPoolTrimTo_v11020)                                                  \
+  /* Pinned host memory */                                                     \
+  X(cudaMallocHost_v3020)                                                      \
+  X(cudaHostAlloc_v3020)                                                       \
+  X(cudaFreeHost_v3020)                                                        \
+  X(cudaHostRegister_v4000)                                                    \
+  X(cudaHostUnregister_v4000)                                                  \
+  /* Graph instantiation / update / upload */                                  \
+  X(cudaGraphInstantiate_v10000)                                               \
+  X(cudaGraphInstantiate_v12000)                                               \
+  X(cudaGraphInstantiateWithFlags_v11040)                                      \
+  X(cudaGraphInstantiateWithParams_v12000)                                     \
+  X(cudaGraphInstantiateWithParams_ptsz_v12000)                                \
+  X(cudaGraphExecUpdate_v10020)                                                \
+  X(cudaGraphUpload_v10000)                                                    \
+  X(cudaGraphUpload_ptsz_v10000)
+
+// Legacy pre-_v2 driver cbids are kept for old binaries; current headers map
+// cuMemcpyXtoY / cuMemAlloc etc. to the _v2 entry points.
+#define PARCAGPU_BLOCKING_DRIVER_CBIDS(X)                                      \
+  /* GPU waits */                                                              \
+  X(cuCtxSynchronize)                                                          \
+  X(cuStreamSynchronize)                                                       \
+  X(cuStreamSynchronize_ptsz)                                                  \
+  X(cuStreamQuery)                                                             \
+  X(cuStreamQuery_ptsz)                                                        \
+  X(cuEventSynchronize)                                                        \
+  X(cuEventQuery)                                                              \
+  /* Synchronous memcpy */                                                     \
+  X(cuMemcpy)                                                                  \
+  X(cuMemcpy_ptds)                                                             \
+  X(cuMemcpyHtoD)                                                              \
+  X(cuMemcpyHtoD_v2)                                                           \
+  X(cuMemcpyHtoD_v2_ptds)                                                      \
+  X(cuMemcpyDtoH)                                                              \
+  X(cuMemcpyDtoH_v2)                                                           \
+  X(cuMemcpyDtoH_v2_ptds)                                                      \
+  X(cuMemcpyDtoD)                                                              \
+  X(cuMemcpyDtoD_v2)                                                           \
+  X(cuMemcpyDtoD_v2_ptds)                                                      \
+  X(cuMemcpy2D)                                                                \
+  X(cuMemcpy2D_v2)                                                             \
+  X(cuMemcpy2D_v2_ptds)                                                        \
+  X(cuMemcpy3D)                                                                \
+  X(cuMemcpy3D_v2)                                                             \
+  X(cuMemcpy3D_v2_ptds)                                                        \
+  X(cuMemcpyPeer)                                                              \
+  X(cuMemcpyPeer_ptds)                                                         \
+  /* Device allocation / free */                                               \
+  X(cuMemAlloc)                                                                \
+  X(cuMemAlloc_v2)                                                             \
+  X(cuMemAllocPitch)                                                           \
+  X(cuMemAllocPitch_v2)                                                        \
+  X(cuMemAllocManaged)                                                         \
+  X(cuMemFree)                                                                 \
+  X(cuMemFree_v2)                                                              \
+  X(cuMemPoolTrimTo)                                                           \
+  /* Pinned host memory */                                                     \
+  X(cuMemAllocHost)                                                            \
+  X(cuMemAllocHost_v2)                                                         \
+  X(cuMemHostAlloc)                                                            \
+  X(cuMemHostAlloc_v2)                                                         \
+  X(cuMemFreeHost)                                                             \
+  X(cuMemHostRegister)                                                         \
+  X(cuMemHostRegister_v2)                                                      \
+  X(cuMemHostUnregister)                                                       \
+  /* Virtual memory management (e.g. PyTorch expandable segments) */           \
+  X(cuMemCreate)                                                               \
+  X(cuMemRelease)                                                              \
+  X(cuMemMap)                                                                  \
+  X(cuMemUnmap)                                                                \
+  X(cuMemSetAccess)                                                            \
+  X(cuMemAddressReserve)                                                       \
+  X(cuMemAddressFree)                                                          \
+  /* Module / library loading and linking (includes PTX JIT) */                \
+  X(cuModuleLoad)                                                              \
+  X(cuModuleLoadData)                                                          \
+  X(cuModuleLoadDataEx)                                                        \
+  X(cuModuleLoadFatBinary)                                                     \
+  X(cuModuleUnload)                                                            \
+  X(cuLibraryLoadData)                                                         \
+  X(cuLibraryLoadFromFile)                                                     \
+  X(cuLibraryUnload)                                                           \
+  X(cuLinkComplete)                                                            \
+  /* Graph instantiation / update / upload */                                  \
+  X(cuGraphInstantiate)                                                        \
+  X(cuGraphInstantiate_v2)                                                     \
+  X(cuGraphInstantiateWithFlags)                                               \
+  X(cuGraphInstantiateWithParams)                                              \
+  X(cuGraphInstantiateWithParams_ptsz)                                         \
+  X(cuGraphExecUpdate)                                                         \
+  X(cuGraphExecUpdate_v2)                                                      \
+  X(cuGraphUpload)                                                             \
+  X(cuGraphUpload_ptsz)
+
+struct BlockingCallback {
+  CUpti_CallbackDomain domain;
+  CUpti_CallbackId cbid;
+};
+
+#define PARCAGPU_RUNTIME_ENTRY(name)                                           \
+  {CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_##name},
+#define PARCAGPU_DRIVER_ENTRY(name)                                            \
+  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_##name},
+static constexpr BlockingCallback kBlockingCallbacks[] = {
+    PARCAGPU_BLOCKING_RUNTIME_CBIDS(PARCAGPU_RUNTIME_ENTRY)
+        PARCAGPU_BLOCKING_DRIVER_CBIDS(PARCAGPU_DRIVER_ENTRY)};
+#undef PARCAGPU_RUNTIME_ENTRY
+#undef PARCAGPU_DRIVER_ENTRY
+
+// Runs on every runtime/driver callback, including kernel launches, so it is
+// a switch rather than a scan of kBlockingCallbacks.
+static bool isBlockingCb(CUpti_CallbackDomain domain, CUpti_CallbackId cbid) {
+#define PARCAGPU_RUNTIME_CASE(name) case CUPTI_RUNTIME_TRACE_CBID_##name:
+#define PARCAGPU_DRIVER_CASE(name) case CUPTI_DRIVER_TRACE_CBID_##name:
+  if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
+    switch (cbid) {
+      PARCAGPU_BLOCKING_RUNTIME_CBIDS(PARCAGPU_RUNTIME_CASE)
+      return true;
+    default:
+      return false;
+    }
+  }
+  if (domain == CUPTI_CB_DOMAIN_DRIVER_API) {
+    switch (cbid) {
+      PARCAGPU_BLOCKING_DRIVER_CBIDS(PARCAGPU_DRIVER_CASE)
+      return true;
+    default:
+      return false;
+    }
+  }
+  return false;
+#undef PARCAGPU_RUNTIME_CASE
+#undef PARCAGPU_DRIVER_CASE
+}
+
+// Per-thread timing of the in-flight blocking call. A runtime call usually
+// wraps a driver call with the same correlation ID; only the runtime
+// call is reported (same convention as cuda_correlation).
+struct BlockingState {
+  bool runtimeActive = false;
+  uint32_t runtimeCorrelationId = 0;
+  uint64_t runtimeStartNs = 0; // 0 = not timed (probe was detached at ENTER)
+  uint64_t driverStartNs = 0;
+};
+thread_local BlockingState g_blockingState;
+
+static bool isNestedDriverBlocking(CUpti_CallbackDomain domain,
+                               uint32_t correlationId) {
+  const auto &ss = g_blockingState;
+  return domain == CUPTI_CB_DOMAIN_DRIVER_API && ss.runtimeActive &&
+         ss.runtimeCorrelationId == correlationId;
+}
+
+static void blockingEnter(CUpti_CallbackDomain domain, uint32_t correlationId) {
+  auto &ss = g_blockingState;
+  // Track runtime nesting even when detached, so attaching mid-call
+  // can't report the nested driver call on its own.
+  uint64_t now = PARCAGPU_CUDA_BLOCKING_CALL_ENABLED() ? nowNs() : 0;
+  if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
+    ss.runtimeActive = true;
+    ss.runtimeCorrelationId = correlationId;
+    ss.runtimeStartNs = now;
+  } else if (!isNestedDriverBlocking(domain, correlationId)) {
+    ss.driverStartNs = now;
+  }
+}
+
+// Device of the context the API ran on. cuCtxGetDevice reads the current
+// context, which CUPTI callbacks run with; cached per thread by context.
+static uint32_t blockingDeviceId(CUcontext ctx) {
+  thread_local CUcontext cachedCtx = nullptr;
+  thread_local uint32_t cachedDev = UINT32_MAX;
+  if (ctx != nullptr && ctx == cachedCtx)
+    return cachedDev;
+  try {
+    CUdevice dev = 0;
+    if (proton::cuda::ctxGetDevice<false>(&dev) != CUDA_SUCCESS)
+      return UINT32_MAX;
+    if (ctx != nullptr) {
+      cachedCtx = ctx;
+      cachedDev = (uint32_t)dev;
+    }
+    return (uint32_t)dev;
+  } catch (...) {
+    return UINT32_MAX;
+  }
+}
+
+// endNs is taken at the top of the EXIT callback, before any PC-sampling
+// drain, so our own work is not counted as blocked time.
+static void blockingExit(CUpti_CallbackDomain domain, CUpti_CallbackId cbid,
+                     uint32_t correlationId, CUcontext ctx, uint64_t endNs) {
+  auto &ss = g_blockingState;
+  uint64_t startNs;
+  int signedCbid;
+  if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
+    startNs = ss.runtimeStartNs;
+    ss.runtimeActive = false;
+    ss.runtimeStartNs = 0;
+    signedCbid = (int)cbid;
+  } else {
+    if (isNestedDriverBlocking(domain, correlationId))
+      return; // the enclosing runtime call reports it
+    startNs = ss.driverStartNs;
+    ss.driverStartNs = 0;
+    signedCbid = -(int)cbid;
+  }
+  if (startNs == 0 || endNs == 0 || endNs < startNs)
+    return;
+
+  const uint64_t threshold = g_blockingThresholdNs.load(std::memory_order_relaxed);
+  const uint64_t duration = endNs - startNs;
+  uint64_t weight = duration;
+  if (duration < threshold) {
+    // Keep with probability duration/T and weight T: E[weight] = duration.
+    if (threadRandom(g_pcSamplingState) >= (double)duration / threshold)
+      return;
+    weight = threshold;
+  }
+
+  uint32_t deviceId = blockingDeviceId(ctx);
+  DEBUG_PRINTF("[PARCAGPU] cuda_blocking_call: cbid=%d dev=%u duration=%luns "
+               "weight=%luns\n",
+               signedCbid, deviceId, duration, weight);
+  // Keep signedCbid in a register at the probe: the compiler may otherwise
+  // pass it as a bare stack slot ([sp]), which bpftrace misreads on arm64.
+  asm volatile("" : "+r"(signedCbid));
+  PARCAGPU_CUDA_BLOCKING_CALL(startNs, endNs, signedCbid, deviceId, weight);
+}
+
 // Called from pc_sampling.cpp:processPCSamplingData() once per CUPTI batch
 // with the sum of distinct (PC, stallReason) pairs that had non-zero samples
 // — the unit the agent emits as a gpu_pc record on the receive side, and the
@@ -303,6 +587,15 @@ void init_debug() {
       }
     }
 
+    const char *blockingThresholdEnv = getenv("PARCAGPU_BLOCKING_THRESHOLD_US");
+    if (blockingThresholdEnv != nullptr) {
+      double us = atof(blockingThresholdEnv);
+      if (us >= 0.0) {
+        g_blockingThresholdNs.store((uint64_t)(us * 1000.0),
+                                std::memory_order_relaxed);
+      }
+    }
+
     const char *targetRateEnv = getenv("PARCAGPU_PC_SAMPLING_RATE");
     if (targetRateEnv) {
       double r = atof(targetRateEnv);
@@ -358,6 +651,15 @@ public:
 
     DEBUG_PRINTF("[PARCAGPU] Starting initialization\n");
 
+    // cuda_blocking_call is opt-in: CUPTI has no probe-attach hook, so its
+    // callbacks would otherwise cost every blocking call (including polling
+    // queries) even with no agent attached.
+    if (const char *v = getenv("PARCAGPU_BLOCKING_CALLS");
+        v != nullptr && strcmp(v, "0") != 0 && *v != '\0') {
+      blockingCallsEnabled = true;
+      DEBUG_PRINTF("[PARCAGPU] Blocking-call sampling enabled\n");
+    }
+
     parcagpu::agentCtlInit();
 
     // Check if PC sampling is supported: asked for by the environment, or
@@ -371,6 +673,9 @@ public:
     parcagpu::agentCtlSetEnvRateLimits(
         (uint32_t)g_eagerRateLimit.load(std::memory_order_relaxed),
         (uint32_t)g_graphRateLimit.load(std::memory_order_relaxed));
+    parcagpu::agentCtlSetEnvFeatures(
+        PARCAGPU_FEATURE_KERNEL_STATS |
+        (blockingCallsEnabled ? PARCAGPU_FEATURE_BLOCKING_CALLS : 0));
     if (pcSamplingEnabled) {
       DEBUG_PRINTF("[PARCAGPU] PC sampling enabled (serialized mode)\n");
     } else {
@@ -408,6 +713,10 @@ public:
                                         CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch);
     proton::cupti::enableCallback<true>(1, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
                                         CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
+
+    // Blocking-class callbacks for the cuda_blocking_call probe, when
+    // PARCAGPU_BLOCKING_CALLS is set; under an agent, once it turns them on.
+    syncBlockingCallbacks();
 
     // Context creation always: it drives the device_info probe and feeds
     // the device table reported to the agent. The remaining resource
@@ -483,6 +792,12 @@ public:
       proton::cupti::enableCallback<false>(
           0, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
           CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
+      // Mirror the blocking callbacks enabled by syncBlockingCallbacks().
+      if (blockingCallbacksOn.load(std::memory_order_acquire)) {
+        for (const auto &cb : kBlockingCallbacks)
+          proton::cupti::enableCallback<false>(0, subscriber, cb.domain,
+                                               cb.cbid);
+      }
       if (pcSamplingEnabled) {
         proton::setResourceCallbacks(subscriber, /*enable=*/false);
         proton::cupti::enableCallback<false>(
@@ -529,6 +844,43 @@ public:
 private:
   std::atomic<bool> initialized{false};
   bool pcSamplingEnabled = false;
+  bool blockingCallsEnabled = false; // PARCAGPU_BLOCKING_CALLS
+  // The blocking-class callbacks are enabled. Once on they stay on: under PC
+  // sampling the driver domain is enabled as a whole for the gate, and
+  // disabling one of its cbids would take that call out of the gate. While
+  // blocking calls are off, their callbacks return at once.
+  std::atomic<bool> blockingCallbacksOn{false};
+
+  // Whether cuda_blocking_call is on: the agent's feature bit, else
+  // PARCAGPU_BLOCKING_CALLS.
+  bool blockingCallsOn() const {
+    return parcagpu::agentCtlFeature(PARCAGPU_FEATURE_BLOCKING_CALLS,
+                                     blockingCallsEnabled);
+  }
+
+  // Enables the blocking-class callbacks the first time blocking calls are
+  // on. <false>: an older CUPTI rejecting one cbid must not fail injection.
+  static void syncBlockingCallbacks() {
+    auto &p = instance();
+    if (p.blockingCallbacksOn.load(std::memory_order_acquire) ||
+        !p.blockingCallsOn())
+      return;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lock(mu);
+    if (p.blockingCallbacksOn.load(std::memory_order_relaxed))
+      return;
+    for (const auto &cb : kBlockingCallbacks) {
+      if (auto r = proton::cupti::enableCallback<false>(1, p.subscriber,
+                                                        cb.domain, cb.cbid);
+          r != CUPTI_SUCCESS) {
+        DEBUG_PRINTF("[PARCAGPU] enableCallback(domain=%d, cbid=%u) failed: "
+                     "%d\n",
+                     cb.domain, cb.cbid, r);
+      }
+    }
+    p.blockingCallbacksOn.store(true, std::memory_order_release);
+    DEBUG_PRINTF("[PARCAGPU] Blocking-call callbacks enabled\n");
+  }
   CUpti_SubscriberHandle subscriber = nullptr;
 
   // PC sampling state — owned by this profiler, destroyed with it.
@@ -544,8 +896,10 @@ private:
       PCTransition transition;
       done = CuptiProfiler::instance().pcSampling.applyAgentConfig(commit);
     }
-    if (done)
+    if (done) {
       syncFlushPeriod();
+      syncBlockingCallbacks();
+    }
     return done;
   }
 
@@ -901,15 +1255,27 @@ private:
       // just determine when the boundaries fire.
       const bool isKernelLaunchCb =
           domain == CUPTI_CB_DOMAIN_DRIVER_API && proton::isLaunch(cbid);
+      // Blocking-class calls (cuda_blocking_call probe) never take the launch
+      // correlation / rate-limiter path below.
+      // A blocking-class callback while blocking calls are off does nothing
+      // more than the gate's.
+      const bool blockingCb = isBlockingCb(domain, cbid);
+      const bool isBlocking = blockingCb && profiler.blockingCallsOn();
       // Other driver calls are subscribed for the gate only (and drains).
       const bool gateOnlyCb =
-          domain == CUPTI_CB_DOMAIN_DRIVER_API && !isKernelLaunchCb;
+          (domain == CUPTI_CB_DOMAIN_DRIVER_API && !isKernelLaunchCb &&
+           !isBlocking) ||
+          (blockingCb && !isBlocking);
 
       // ENTER: open a sampling window on launch boundary if interval+prob hits.
       if (cbdata->callbackSite == CUPTI_API_ENTER) {
         if (gateOnlyCb)
           return;
-        if (domain == CUPTI_CB_DOMAIN_RUNTIME_API)
+        // Blocking calls keep their own nesting state so they don't overwrite
+        // the launch correlation ID that NVTX events read.
+        if (isBlocking)
+          blockingEnter(domain, correlationId);
+        else if (domain == CUPTI_CB_DOMAIN_RUNTIME_API)
           runtimeEnterCorrelationId = correlationId;
 
         if (profiler.pcSamplingEnabled) {
@@ -962,6 +1328,10 @@ private:
         return;
       }
 
+      // Take the blocking-call end time before the PC-sampling drain below.
+      const uint64_t blockingEndNs =
+          isBlocking && PARCAGPU_CUDA_BLOCKING_CALL_ENABLED() ? nowNs() : 0;
+
       // EXIT: while this callback's context has a window open, drain
       // CUPTI's host staging buffer on every CUDA API EXIT — not just launch
       // EXITs. Empty drains are cheap (single API call returning 0 PCs) and
@@ -990,6 +1360,11 @@ private:
       if (gateOnlyCb)
         return;
       device_info::emit();
+
+      if (isBlocking) {
+        blockingExit(domain, cbid, correlationId, cbdata->context, blockingEndNs);
+        return;
+      }
 
       // Skip correlation/rate-limiter work when no profiler is attached.
       if (!PARCAGPU_CUDA_CORRELATION_ENABLED())

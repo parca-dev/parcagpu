@@ -22,6 +22,8 @@ static const char *knownVars[] = {
     "PARCAGPU_PC_HW_BUFFER_MB",
     "PARCAGPU_GATE_STATS",
     "PARCAGPU_METADATA_REFRESH_MS",
+    "PARCAGPU_BLOCKING_CALLS",
+    "PARCAGPU_BLOCKING_THRESHOLD_US",
 };
 static constexpr size_t numKnownVars =
     sizeof(knownVars) / sizeof(knownVars[0]);
@@ -117,6 +119,16 @@ void validateEnvVars() {
       DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_PC_HW_BUFFER_MB=%s invalid "
                    "(must be >= 0), ignoring\n", val);
       fireError(0, val, "env_config: PARCAGPU_PC_HW_BUFFER_MB invalid");
+    }
+  }
+
+  val = std::getenv("PARCAGPU_BLOCKING_THRESHOLD_US");
+  if (val) {
+    double us = std::atof(val);
+    if (us < 0.0) {
+      DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_BLOCKING_THRESHOLD_US=%s "
+                   "invalid (must be >= 0), using default\n", val);
+      fireError(0, val, "env_config: PARCAGPU_BLOCKING_THRESHOLD_US invalid");
     }
   }
 }

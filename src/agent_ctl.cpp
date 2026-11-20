@@ -73,8 +73,11 @@ std::mutex g_devMutex;
 constexpr uint32_t kFeatureMask = 0xff;
 constexpr int kFeatureShift = 52;
 
-// Features in effect without an agent.
-constexpr uint32_t kEnvFeatures = PARCAGPU_FEATURE_KERNEL_STATS;
+// The features this build knows; the state reports only these.
+constexpr uint32_t kKnownFeatures =
+    PARCAGPU_FEATURE_KERNEL_STATS | PARCAGPU_FEATURE_BLOCKING_CALLS;
+// Features in effect without an agent (under g_devMutex).
+uint32_t g_envFeatures = PARCAGPU_FEATURE_KERNEL_STATS;
 
 parcagpu_ctl_state g_state{};
 CUdevice g_ordinals[PARCAGPU_CTL_MAX_DEVICES];
@@ -204,8 +207,9 @@ void reportLocked(uint64_t packed, uint64_t rates) {
   uint32_t rate = (uint32_t)rates, graphRate = (uint32_t)(rates >> 32);
   g_state.rate_limit = rate ? rate : g_envRateLimit;
   g_state.graph_rate_limit = graphRate ? graphRate : g_envGraphRateLimit;
-  g_state.features =
-      active ? (uint32_t)(packed >> kFeatureShift) & kFeatureMask : kEnvFeatures;
+  g_state.features = active ? (uint32_t)(packed >> kFeatureShift) &
+                                  kFeatureMask & kKnownFeatures
+                            : g_envFeatures;
   for (uint32_t i = 0; i < g_state.num_devices; i++) {
     g_state.devices[i].pc_state =
         active && ((packed >> i) & 1) ? PARCAGPU_PC_ON : PARCAGPU_PC_OFF;
@@ -286,7 +290,7 @@ void agentCtlInit() {
   }
   {
     std::lock_guard<std::mutex> lock(g_devMutex);
-    g_state.features = kEnvFeatures;
+    g_state.features = g_envFeatures;
     publishStateLocked();
   }
   pthread_atfork(nullptr, nullptr, atforkChild);
@@ -434,6 +438,15 @@ bool agentCtlAllows(CUcontext ctx, bool envDefault) {
   std::lock_guard<std::mutex> lock(g_devMutex);
   int slot = slotLocked(ctx);
   return slot >= 0 && ((v >> slot) & 1);
+}
+
+void agentCtlSetEnvFeatures(uint32_t features) {
+  if (!agentCtlReady())
+    return;
+  std::lock_guard<std::mutex> lock(g_devMutex);
+  g_envFeatures = features & kKnownFeatures;
+  reportLocked(g_config.load(std::memory_order_acquire),
+               g_rates.load(std::memory_order_acquire));
 }
 
 void agentCtlSetEnvRateLimits(uint32_t rateLimit, uint32_t graphRateLimit) {
