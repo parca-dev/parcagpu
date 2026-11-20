@@ -32,8 +32,11 @@ type config struct {
 	Reserved       [25]uint32 // knobs to come
 }
 
-// PARCAGPU_FEATURE_KERNEL_STATS
-const featureKernelStats = 1 << 0
+// PARCAGPU_FEATURE_*
+const (
+	featureKernelStats   = 1 << 0
+	featureBlockingCalls = 1 << 1
+)
 
 type device struct {
 	UUID           [16]byte
@@ -565,7 +568,41 @@ func TestKernelStatsFeature(t *testing.T) {
 	if !p.write(&config{Features: featureKernelStats | 1<<7}, 5*time.Second) {
 		t.Fatal("not acked")
 	}
-	p.eventually("on by the agent; unknown bits ignored", features(featureKernelStats|1<<7))
+	p.eventually("on by the agent; unknown bits ignored", features(featureKernelStats))
 	p.stopAgent()
 	p.eventually("on after lease expiry", features(featureKernelStats))
+}
+
+// cuda_blocking_call follows PARCAGPU_BLOCKING_CALLS without an agent, and
+// the agent's bit under it.
+func TestBlockingCallsFeature(t *testing.T) {
+	features := func(p *proc, want uint32) func() error {
+		return func() error {
+			s, err := p.state()
+			if err == nil && s.Features != want {
+				err = fmt.Errorf("features %#x", s.Features)
+			}
+			return err
+		}
+	}
+	t.Run("environment off", func(t *testing.T) {
+		p := start(t, nil, "--num-gpus=1")
+		p.devices(1)
+		p.eventually("off without the environment", features(p, featureKernelStats))
+		if !p.write(&config{Features: featureBlockingCalls}, 5*time.Second) {
+			t.Fatal("not acked")
+		}
+		p.eventually("on by the agent", features(p, featureBlockingCalls))
+	})
+	t.Run("environment on", func(t *testing.T) {
+		p := start(t, []string{"PARCAGPU_BLOCKING_CALLS=1"}, "--num-gpus=1")
+		p.devices(1)
+		p.eventually("on by the environment", features(p, featureKernelStats|featureBlockingCalls))
+		if !p.write(&config{}, 5*time.Second) {
+			t.Fatal("not acked")
+		}
+		p.eventually("off by the agent's default", features(p, 0))
+		p.stopAgent()
+		p.eventually("the environment's after lease expiry", features(p, featureKernelStats|featureBlockingCalls))
+	})
 }

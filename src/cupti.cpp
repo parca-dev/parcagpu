@@ -18,6 +18,7 @@
 #include "Profiler/Cupti/CuptiCallbacks.h"
 #include "Utility/Singleton.h"
 #include "agent_ctl.h"
+#include "parcagpu_ctl.h"
 #include "pc_gate.h"
 #include "correlation_filter.h"
 #include "device_info.h"
@@ -672,6 +673,9 @@ public:
     parcagpu::agentCtlSetEnvRateLimits(
         (uint32_t)g_eagerRateLimit.load(std::memory_order_relaxed),
         (uint32_t)g_graphRateLimit.load(std::memory_order_relaxed));
+    parcagpu::agentCtlSetEnvFeatures(
+        PARCAGPU_FEATURE_KERNEL_STATS |
+        (blockingCallsEnabled ? PARCAGPU_FEATURE_BLOCKING_CALLS : 0));
     if (pcSamplingEnabled) {
       DEBUG_PRINTF("[PARCAGPU] PC sampling enabled (serialized mode)\n");
     } else {
@@ -710,20 +714,9 @@ public:
     proton::cupti::enableCallback<true>(1, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
                                         CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
 
-    // Blocking-class callbacks for the cuda_blocking_call probe, only when
-    // PARCAGPU_BLOCKING_CALLS is set. <false>: an older CUPTI rejecting one
-    // cbid must not fail the whole injection.
-    for (const auto &cb : kBlockingCallbacks) {
-      if (!blockingCallsEnabled)
-        break;
-      if (auto r = proton::cupti::enableCallback<false>(1, subscriber,
-                                                        cb.domain, cb.cbid);
-          r != CUPTI_SUCCESS) {
-        DEBUG_PRINTF("[PARCAGPU] enableCallback(domain=%d, cbid=%u) failed: "
-                     "%d\n",
-                     cb.domain, cb.cbid, r);
-      }
-    }
+    // Blocking-class callbacks for the cuda_blocking_call probe, when
+    // PARCAGPU_BLOCKING_CALLS is set; under an agent, once it turns them on.
+    syncBlockingCallbacks();
 
     // Context creation always: it drives the device_info probe and feeds
     // the device table reported to the agent. The remaining resource
@@ -799,12 +792,11 @@ public:
       proton::cupti::enableCallback<false>(
           0, subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
           CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz);
-      // Mirror the blocking callbacks enabled in init().
-      for (const auto &cb : kBlockingCallbacks) {
-        if (!blockingCallsEnabled)
-          break;
-        proton::cupti::enableCallback<false>(0, subscriber, cb.domain,
-                                             cb.cbid);
+      // Mirror the blocking callbacks enabled by syncBlockingCallbacks().
+      if (blockingCallbacksOn.load(std::memory_order_acquire)) {
+        for (const auto &cb : kBlockingCallbacks)
+          proton::cupti::enableCallback<false>(0, subscriber, cb.domain,
+                                               cb.cbid);
       }
       if (pcSamplingEnabled) {
         proton::setResourceCallbacks(subscriber, /*enable=*/false);
@@ -853,6 +845,42 @@ private:
   std::atomic<bool> initialized{false};
   bool pcSamplingEnabled = false;
   bool blockingCallsEnabled = false; // PARCAGPU_BLOCKING_CALLS
+  // The blocking-class callbacks are enabled. Once on they stay on: under PC
+  // sampling the driver domain is enabled as a whole for the gate, and
+  // disabling one of its cbids would take that call out of the gate. While
+  // blocking calls are off, their callbacks return at once.
+  std::atomic<bool> blockingCallbacksOn{false};
+
+  // Whether cuda_blocking_call is on: the agent's feature bit, else
+  // PARCAGPU_BLOCKING_CALLS.
+  bool blockingCallsOn() const {
+    return parcagpu::agentCtlFeature(PARCAGPU_FEATURE_BLOCKING_CALLS,
+                                     blockingCallsEnabled);
+  }
+
+  // Enables the blocking-class callbacks the first time blocking calls are
+  // on. <false>: an older CUPTI rejecting one cbid must not fail injection.
+  static void syncBlockingCallbacks() {
+    auto &p = instance();
+    if (p.blockingCallbacksOn.load(std::memory_order_acquire) ||
+        !p.blockingCallsOn())
+      return;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lock(mu);
+    if (p.blockingCallbacksOn.load(std::memory_order_relaxed))
+      return;
+    for (const auto &cb : kBlockingCallbacks) {
+      if (auto r = proton::cupti::enableCallback<false>(1, p.subscriber,
+                                                        cb.domain, cb.cbid);
+          r != CUPTI_SUCCESS) {
+        DEBUG_PRINTF("[PARCAGPU] enableCallback(domain=%d, cbid=%u) failed: "
+                     "%d\n",
+                     cb.domain, cb.cbid, r);
+      }
+    }
+    p.blockingCallbacksOn.store(true, std::memory_order_release);
+    DEBUG_PRINTF("[PARCAGPU] Blocking-call callbacks enabled\n");
+  }
   CUpti_SubscriberHandle subscriber = nullptr;
 
   // PC sampling state — owned by this profiler, destroyed with it.
@@ -868,8 +896,10 @@ private:
       PCTransition transition;
       done = CuptiProfiler::instance().pcSampling.applyAgentConfig(commit);
     }
-    if (done)
+    if (done) {
       syncFlushPeriod();
+      syncBlockingCallbacks();
+    }
     return done;
   }
 
@@ -1227,11 +1257,15 @@ private:
           domain == CUPTI_CB_DOMAIN_DRIVER_API && proton::isLaunch(cbid);
       // Blocking-class calls (cuda_blocking_call probe) never take the launch
       // correlation / rate-limiter path below.
-      const bool isBlocking =
-          profiler.blockingCallsEnabled && isBlockingCb(domain, cbid);
+      // A blocking-class callback while blocking calls are off does nothing
+      // more than the gate's.
+      const bool blockingCb = isBlockingCb(domain, cbid);
+      const bool isBlocking = blockingCb && profiler.blockingCallsOn();
       // Other driver calls are subscribed for the gate only (and drains).
-      const bool gateOnlyCb = domain == CUPTI_CB_DOMAIN_DRIVER_API &&
-                              !isKernelLaunchCb && !isBlocking;
+      const bool gateOnlyCb =
+          (domain == CUPTI_CB_DOMAIN_DRIVER_API && !isKernelLaunchCb &&
+           !isBlocking) ||
+          (blockingCb && !isBlocking);
 
       // ENTER: open a sampling window on launch boundary if interval+prob hits.
       if (cbdata->callbackSite == CUPTI_API_ENTER) {

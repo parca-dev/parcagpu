@@ -50,6 +50,9 @@ struct parcagpu_ctl_config {
 // kernel_stats: exact kernel execution counts and durations. Without an
 // agent, they are counted whenever a consumer is attached to the probe.
 #define PARCAGPU_FEATURE_KERNEL_STATS (1u << 0)
+// cuda_blocking_call: host time blocked in CUDA API calls. Without an agent,
+// on if PARCAGPU_BLOCKING_CALLS is set.
+#define PARCAGPU_FEATURE_BLOCKING_CALLS (1u << 1)
 
 enum {
   PARCAGPU_PC_OFF = 0,
