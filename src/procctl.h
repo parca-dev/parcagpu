@@ -1,7 +1,7 @@
 /*
  * procctl.h — process side of procctl (SPEC.md).
  *
- * Vendored from github.com/parca-dev/procctl v0.1.0-alpha.1 (c/procctl.h).
+ * Vendored from github.com/parca-dev/procctl v0.1.0 (c/procctl.h).
  *
  * A node agent pushes configuration to this process through a shared-memory
  * region the process creates and maps read-only; the process answers through
