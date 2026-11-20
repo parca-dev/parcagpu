@@ -205,6 +205,16 @@ if(BUILD_TESTS)
     # Focused NVTX injection test. Acts as an NVTX client: calls
     # InitializeInjectionNvtx2 in libparcagpucupti.so, calls through the
     # installed handlers, and asserts via the collector's test-only accessors.
+    add_executable(test_machine_gpus
+        test/test_machine_gpus.cpp
+    )
+    target_include_directories(test_machine_gpus PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    set_target_properties(test_machine_gpus PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
     add_executable(test_nvtx
         test/test_nvtx.c
     )

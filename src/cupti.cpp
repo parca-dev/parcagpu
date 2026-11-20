@@ -24,6 +24,7 @@
 #include "device_info.h"
 #include "env_config.h"
 #include "kernel_stats.h"
+#include "machine_gpus.h"
 #include "nvtx_collector.h"
 #include "pc_sampling.h"
 #include "token_bucket.h"
@@ -62,9 +63,12 @@ uint32_t currentRuntimeCorrelationId() { return runtimeEnterCorrelationId; }
 // Configured probe rates (tokens/sec), read from env once in init_debug; the
 // agent's, when it sets them, take precedence. Globals because the buckets
 // below are thread_local: setRate from init_debug would only reach the single
-// thread that ran it.
-std::atomic<double> g_eagerRateLimit{100.0};
-std::atomic<double> g_graphRateLimit{20.0};
+// thread that ran it. Without PARCAGPU_RATE_LIMIT / PARCAGPU_GRAPH_RATE_LIMIT,
+// each default is split across the machine's GPUs (splitRateLimit).
+static constexpr double kDefaultLaunchRateLimit = 100.0;
+static constexpr double kDefaultGraphRateLimit = 20.0;
+std::atomic<double> g_eagerRateLimit{kDefaultLaunchRateLimit};
+std::atomic<double> g_graphRateLimit{kDefaultGraphRateLimit};
 
 // Thread-local rate limiters. Graph launches get a separate, lower bucket
 // (PARCAGPU_GRAPH_RATE_LIMIT) so graph replays don't flood cupti_events and
@@ -571,21 +575,26 @@ void init_debug() {
   if (!initialized) {
     initialized = true;
     debug_enabled = getenv("PARCAGPU_DEBUG") != nullptr;
-    const char *rateEnv = getenv("PARCAGPU_RATE_LIMIT");
-    if (rateEnv != nullptr) {
-      double rate = atof(rateEnv);
-      if (rate > 0) {
-        g_eagerRateLimit.store(rate, std::memory_order_relaxed);
-      }
-    }
-
-    const char *graphRateEnv = getenv("PARCAGPU_GRAPH_RATE_LIMIT");
-    if (graphRateEnv != nullptr) {
-      double rate = atof(graphRateEnv);
-      if (rate > 0) {
-        g_graphRateLimit.store(rate, std::memory_order_relaxed);
-      }
-    }
+    // An unset (or invalid) limit is its default split across the
+    // machine's GPUs.
+    const uint32_t gpus = countMachineGpus();
+    auto rateLimit = [gpus](const char *name, double base) {
+      const char *env = getenv(name);
+      double rate = env ? atof(env) : 0;
+      if (rate > 0)
+        return rate;
+      rate = splitRateLimit(base, gpus);
+      DEBUG_PRINTF("[PARCAGPU] %s: %.2f/s per thread (%.0f/s across %u GPUs "
+                   "on the machine)\n",
+                   name, rate, base, gpus);
+      return rate;
+    };
+    g_eagerRateLimit.store(
+        rateLimit("PARCAGPU_RATE_LIMIT", kDefaultLaunchRateLimit),
+        std::memory_order_relaxed);
+    g_graphRateLimit.store(
+        rateLimit("PARCAGPU_GRAPH_RATE_LIMIT", kDefaultGraphRateLimit),
+        std::memory_order_relaxed);
 
     const char *blockingThresholdEnv = getenv("PARCAGPU_BLOCKING_THRESHOLD_US");
     if (blockingThresholdEnv != nullptr) {
@@ -670,9 +679,14 @@ public:
     pcSampling.envSampling = parcagpu::PCSampling::envRequested();
     parcagpu::agentCtlSetCapable(pcSamplingEnabled);
     init_debug(); // reads the environment's rate limits
-    parcagpu::agentCtlSetEnvRateLimits(
-        (uint32_t)g_eagerRateLimit.load(std::memory_order_relaxed),
-        (uint32_t)g_graphRateLimit.load(std::memory_order_relaxed));
+    // Reported as whole events/s (the split defaults are fractional), at
+    // least 1: the state's 0 would read as "not set".
+    auto reported = [](const std::atomic<double> &r) {
+      double v = r.load(std::memory_order_relaxed);
+      return v < 1.0 ? 1u : (uint32_t)(v + 0.5);
+    };
+    parcagpu::agentCtlSetEnvRateLimits(reported(g_eagerRateLimit),
+                                       reported(g_graphRateLimit));
     parcagpu::agentCtlSetEnvFeatures(
         PARCAGPU_FEATURE_KERNEL_STATS |
         (blockingCallsEnabled ? PARCAGPU_FEATURE_BLOCKING_CALLS : 0));
