@@ -28,6 +28,7 @@ type config struct {
 	// Launch probe rate limits.
 	RateLimit      uint32
 	GraphRateLimit uint32
+	Reserved       [26]uint32 // knobs to come
 }
 
 type device struct {
@@ -314,6 +315,7 @@ func TestConfigAck(t *testing.T) {
 		{"unknown device", &config{Devices: 1 << 2}, false},
 		{"rate limit too high", &config{RateLimit: 1000001}, false},
 		{"graph rate limit too high", &config{GraphRateLimit: 1000001}, false},
+		{"knobs it doesn't know", &config{Devices: 1, Reserved: [26]uint32{0: 1, 25: 7}}, true},
 		{"valid again", &config{Devices: 1, Factor: 31, WindowMs: 10000}, true},
 	} {
 		wait := 5 * time.Second
@@ -323,6 +325,19 @@ func TestConfigAck(t *testing.T) {
 		if got := p.write(tc.cfg, wait); got != tc.ack {
 			t.Errorf("%s: acked %v, want %v", tc.name, got, tc.ack)
 		}
+	}
+
+	// A config of another size isn't one this schema describes.
+	for _, n := range []int{24, 132} {
+		gen, err := p.c.Write(make([]byte, n))
+		if err != nil {
+			continue // procctl refuses more than the payload capacity
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		if p.c.WaitAck(ctx, gen) == nil {
+			t.Errorf("%d-byte config acked", n)
+		}
+		cancel()
 	}
 }
 

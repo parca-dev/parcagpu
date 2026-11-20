@@ -90,7 +90,9 @@ parcagpu also takes configuration at runtime from parca-agent over
 [procctl](https://github.com/parca-dev/procctl) (vendored as `src/procctl.h`):
 each process creates a small sealed memfd named `procctl:parcagpu-v1` that the
 agent finds through `/proc` and writes to, and reports back the devices it
-uses. The schema is `src/parcagpu_ctl.h`.
+uses. The schema is `src/parcagpu_ctl.h`. Its config is a fixed 32 words with
+room for knobs to come: each new knob is 0 by default and takes a schema
+version, which the agent reads from the region before setting it.
 
 The agent drives PC sampling. CUPTI can PC sample one process per GPU at a
 time, so parca-agent hands each GPU to one process at a time and rotates it.

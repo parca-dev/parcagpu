@@ -110,6 +110,10 @@ void atforkChild() {
   g_rates.store(0, std::memory_order_relaxed);
 }
 
+static_assert(sizeof(parcagpu_ctl_config) == 4 * PARCAGPU_CTL_CONFIG_WORDS,
+              "parcagpu_ctl_config must stay PARCAGPU_CTL_CONFIG_WORDS words");
+
+// Checks the knobs this schema knows; it ignores the reserved ones.
 bool valid(const parcagpu_ctl_config &c, uint32_t numDevices) {
   if (c.pc_sampling_factor != 0 &&
       (c.pc_sampling_factor < 5 || c.pc_sampling_factor > 31))
