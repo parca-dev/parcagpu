@@ -22,9 +22,18 @@
 #include "correlation_filter.h"
 #include "device_info.h"
 #include "env_config.h"
+#include "kernel_stats.h"
 #include "nvtx_collector.h"
 #include "pc_sampling.h"
 #include "token_bucket.h"
+
+// Proton's CUPTI dispatch table lacks cuptiActivityFlushPeriod.
+#include "Driver/Dispatch.h"
+namespace proton::cupti {
+template <bool C> CUptiResult activityFlushPeriod(uint32_t);
+DEFINE_DISPATCH(ExternLibCupti, activityFlushPeriod, cuptiActivityFlushPeriod,
+                uint32_t)
+} // namespace proton::cupti
 
 namespace parcagpu {
 
@@ -439,6 +448,8 @@ public:
       DEBUG_PRINTF("[PARCAGPU] Enabled CONCURRENT_KERNEL activity\n");
     }
 
+    syncFlushPeriod();
+
     parcagpu::agentCtlStart(applyAgentConfig);
 
     DEBUG_PRINTF("[PARCAGPU] Successfully initialized CUPTI callbacks\n");
@@ -495,6 +506,8 @@ public:
         r != CUPTI_SUCCESS) {
       DEBUG_PRINTF("[PARCAGPU] activityFlushAll failed: %d\n", r);
     }
+    // The forced flush ran completeBuffer for the last records; report them.
+    kernel_stats::maybeEmit(/*force=*/true);
 
     if (auto r = proton::cupti::activityDisable<false>(
             CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
@@ -526,8 +539,42 @@ private:
 
   // False (retried) while a stream capture is in progress.
   static bool applyAgentConfig(const std::function<void()> &commit) {
-    PCTransition transition;
-    return CuptiProfiler::instance().pcSampling.applyAgentConfig(commit);
+    bool done;
+    {
+      PCTransition transition;
+      done = CuptiProfiler::instance().pcSampling.applyAgentConfig(commit);
+    }
+    if (done)
+      syncFlushPeriod();
+    return done;
+  }
+
+  // While kernel stats are on, have CUPTI's worker hand back partly filled
+  // buffers every second, so kernel_stats (and kernel_executed) stay current
+  // on workloads that launch too few kernels to fill a buffer; while they
+  // are off, leave CUPTI's default. Best effort: Dispatch throws if this
+  // libcupti lacks the symbol.
+  static void syncFlushPeriod() {
+    static std::mutex mu;
+    static int applied = -1; // flush period in ms; -1 = never set
+    std::lock_guard<std::mutex> lock(mu);
+    const int want = kernel_stats::enabled() ? 1000 : 0;
+    if (want == applied)
+      return;
+    try {
+      if (auto r = proton::cupti::activityFlushPeriod<false>(want);
+          r != CUPTI_SUCCESS) {
+        DEBUG_PRINTF("[PARCAGPU] activityFlushPeriod(%d) failed: %d\n", want,
+                     r);
+        return;
+      }
+      applied = want;
+      DEBUG_PRINTF("[PARCAGPU] activityFlushPeriod(%d)\n", want);
+    } catch (const std::exception &e) {
+      applied = want; // unavailable: don't retry
+      DEBUG_PRINTF("[PARCAGPU] activityFlushPeriod unavailable: %s\n",
+                   e.what());
+    }
   }
 
   // A stream capture is beginning on this thread (its BeginCapture ENTER,
@@ -645,6 +692,10 @@ private:
       case CUPTI_ACTIVITY_KIND_KERNEL: {
         auto *k = reinterpret_cast<CUpti_ActivityKernel5 *>(record);
 
+        // Count every execution, sampled or not, before the filter below
+        // drops the launches the rate limiter skipped.
+        kernel_stats::record(k);
+
         // Check correlation filter - only emit probe if this kernel was sampled
         bool shouldEmit = false;
         if (k->graphId != 0) {
@@ -707,6 +758,8 @@ private:
 
     // End cycle - cleanup completed graph entries
     g_graphCorrelationMap.cycle_end();
+
+    kernel_stats::maybeEmit(/*force=*/false);
 
     DEBUG_PRINTF("[PARCAGPU] Processed %d activity records (%d filtered) from "
                  "buffer %p\n",

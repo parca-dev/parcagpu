@@ -138,4 +138,35 @@ struct cupti_nvtx_event {
 _Static_assert(sizeof(struct cupti_nvtx_event) == 56,
                "cupti_nvtx_event size mismatch with parcagpu/src/nvtx.h");
 
+// ---------------------------------------------------------------------------
+// Kernel execution stats (kernel_stats probe)
+// ---------------------------------------------------------------------------
+
+// Must match parcagpu/src/kernel_stats.h kMaxEntriesPerFiring.
+#define KERNEL_STATS_MAX_ENTRIES 256
+
+// arg0 of kernel_stats. Timestamps are CUPTI kernel timestamps.
+struct cupti_kernel_stats_header {
+  u64 start_ns; // offset 0  - earliest kernel start in the interval
+  u64 end_ns;   // offset 8  - latest kernel end in the interval
+  u32 seq;      // offset 16 - per-process firing counter
+  u32 _pad;     // offset 20
+} __attribute__((aligned(8)));
+
+_Static_assert(sizeof(struct cupti_kernel_stats_header) == 24,
+               "cupti_kernel_stats_header size mismatch with parcagpu/src/kernel_stats.h");
+
+// arg1 of kernel_stats points to arg2 pointers to these. Each is a delta for
+// one (device, stream, kernel name) since the previous firing.
+struct cupti_kernel_stats_entry {
+  u32 device_id;  // offset 0  - CUDA ordinal
+  u32 stream_id;  // offset 4
+  u64 executions; // offset 8  - kernel records, graph kernel nodes included
+  u64 total_ns;   // offset 16 - sum of end - start
+  u64 name_ptr;   // offset 24 - user pointer to the NUL-terminated mangled name
+} __attribute__((aligned(8)));
+
+_Static_assert(sizeof(struct cupti_kernel_stats_entry) == 32,
+               "cupti_kernel_stats_entry size mismatch with parcagpu/src/kernel_stats.h");
+
 #endif // CUPTI_BPF_H

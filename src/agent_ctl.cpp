@@ -69,6 +69,13 @@ pthread_t g_thread;
 // state.devices[i]'s CUdevice in this process; g_contexts maps contexts to
 // slots.
 std::mutex g_devMutex;
+// Feature bits packed (bits 52-59 of the configuration word).
+constexpr uint32_t kFeatureMask = 0xff;
+constexpr int kFeatureShift = 52;
+
+// Features in effect without an agent.
+constexpr uint32_t kEnvFeatures = PARCAGPU_FEATURE_KERNEL_STATS;
+
 parcagpu_ctl_state g_state{};
 CUdevice g_ordinals[PARCAGPU_CTL_MAX_DEVICES];
 std::vector<std::pair<CUcontext, uint32_t>> g_contexts;
@@ -77,8 +84,10 @@ uint64_t pack(const parcagpu_ctl_config &c) {
   return (1ULL << 63) | (uint64_t)c.pc_sampling_devices |
          ((uint64_t)c.pc_sampling_factor << 16) |
          ((uint64_t)c.pc_sampling_window_ms << 22) |
-         ((uint64_t)c.pc_sampling_gap_ms << 36);
+         ((uint64_t)c.pc_sampling_gap_ms << 36) |
+         ((uint64_t)(c.features & kFeatureMask) << kFeatureShift);
 }
+
 
 uint64_t coarseNowNs() {
   struct timespec ts;
@@ -195,6 +204,8 @@ void reportLocked(uint64_t packed, uint64_t rates) {
   uint32_t rate = (uint32_t)rates, graphRate = (uint32_t)(rates >> 32);
   g_state.rate_limit = rate ? rate : g_envRateLimit;
   g_state.graph_rate_limit = graphRate ? graphRate : g_envGraphRateLimit;
+  g_state.features =
+      active ? (uint32_t)(packed >> kFeatureShift) & kFeatureMask : kEnvFeatures;
   for (uint32_t i = 0; i < g_state.num_devices; i++) {
     g_state.devices[i].pc_state =
         active && ((packed >> i) & 1) ? PARCAGPU_PC_ON : PARCAGPU_PC_OFF;
@@ -275,6 +286,7 @@ void agentCtlInit() {
   }
   {
     std::lock_guard<std::mutex> lock(g_devMutex);
+    g_state.features = kEnvFeatures;
     publishStateLocked();
   }
   pthread_atfork(nullptr, nullptr, atforkChild);
@@ -397,10 +409,18 @@ AgentConfig agentCtlConfig() {
   c.factor = (uint32_t)((v >> 16) & 0x3f);
   c.windowMs = (uint32_t)((v >> 22) & 0x3fff);
   c.gapMs = (uint32_t)((v >> 36) & 0xffff);
+  c.features = (uint32_t)(v >> kFeatureShift) & kFeatureMask;
   uint64_t r = g_rates.load(std::memory_order_acquire);
   c.rateLimit = (uint32_t)r;
   c.graphRateLimit = (uint32_t)(r >> 32);
   return c;
+}
+
+bool agentCtlFeature(uint32_t feature, bool envDefault) {
+  uint64_t v = g_config.load(std::memory_order_acquire);
+  if ((v >> 63) == 0)
+    return envDefault;
+  return ((v >> kFeatureShift) & feature) != 0;
 }
 
 uint64_t agentCtlGeneration() {

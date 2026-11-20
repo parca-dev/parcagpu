@@ -233,6 +233,7 @@ Defined in `src/probes.d`, provider `parcagpu`:
 | `error` | code, message, component | Profiler error event |
 | `nvtx_event_batch` | ptrs, count | Batch of NVTX events (`struct nvtx_event`, `src/nvtx.h`); flushed at 256 events or when the oldest is 100ms old |
 | `nvtx_resource_name` | kind, id, name | NVTX name for an OS thread, CUDA device/stream or domain (`NVTX_RESOURCE_*`) |
+| `kernel_stats` | header, entries, count | Exact kernel execution counts and summed durations per (device, stream, kernel name), counted before rate limiting. Deltas, fired at most once a second from the activity buffer callback and once at exit; more than 256 entries split across firings. Under parca-agent control, only while the agent sets `PARCAGPU_FEATURE_KERNEL_STATS` (off by default). Layouts: `src/kernel_stats.h`, `ebpf/cupti_bpf.h` |
 
 ## Requirements
 

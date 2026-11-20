@@ -28,8 +28,12 @@ type config struct {
 	// Launch probe rate limits.
 	RateLimit      uint32
 	GraphRateLimit uint32
-	Reserved       [26]uint32 // knobs to come
+	Features       uint32
+	Reserved       [25]uint32 // knobs to come
 }
+
+// PARCAGPU_FEATURE_KERNEL_STATS
+const featureKernelStats = 1 << 0
 
 type device struct {
 	UUID           [16]byte
@@ -45,6 +49,8 @@ type state struct {
 	GraphRateLimit uint32
 	NumDevices     uint32
 	Devices        [16]device
+	Features       uint32
+	Reserved       uint32
 }
 
 const (
@@ -315,7 +321,7 @@ func TestConfigAck(t *testing.T) {
 		{"unknown device", &config{Devices: 1 << 2}, false},
 		{"rate limit too high", &config{RateLimit: 1000001}, false},
 		{"graph rate limit too high", &config{GraphRateLimit: 1000001}, false},
-		{"knobs it doesn't know", &config{Devices: 1, Reserved: [26]uint32{0: 1, 25: 7}}, true},
+		{"knobs it doesn't know", &config{Devices: 1, Reserved: [25]uint32{0: 1, 24: 7}}, true},
 		{"valid again", &config{Devices: 1, Factor: 31, WindowMs: 10000}, true},
 	} {
 		wait := 5 * time.Second
@@ -535,4 +541,31 @@ func TestRateLimits(t *testing.T) {
 	p.eventually("environment's kernel launch rate", rates(50, 7))
 	p.stopAgent()
 	p.eventually("the environment's after lease expiry", rates(50, 20))
+}
+
+// Kernel stats follow the agent's feature bit while it controls the process,
+// and are on (for any consumer attached to the probe) without it.
+func TestKernelStatsFeature(t *testing.T) {
+	p := start(t, nil, "--num-gpus=1")
+	p.devices(1)
+	features := func(want uint32) func() error {
+		return func() error {
+			s, err := p.state()
+			if err == nil && s.Features != want {
+				err = fmt.Errorf("features %#x", s.Features)
+			}
+			return err
+		}
+	}
+	p.eventually("on without an agent", features(featureKernelStats))
+	if !p.write(&config{}, 5*time.Second) {
+		t.Fatal("not acked")
+	}
+	p.eventually("off by the agent's default", features(0))
+	if !p.write(&config{Features: featureKernelStats | 1<<7}, 5*time.Second) {
+		t.Fatal("not acked")
+	}
+	p.eventually("on by the agent; unknown bits ignored", features(featureKernelStats|1<<7))
+	p.stopAgent()
+	p.eventually("on after lease expiry", features(featureKernelStats))
 }
