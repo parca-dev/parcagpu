@@ -1001,9 +1001,12 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData) {
 // (detach and re-attach between two of our reads), or a second consumer
 // joining one already attached. The kernel bumps a USDT semaphore only when
 // it writes the breakpoint, so a second consumer leaves it at 1.
-// PARCAGPU_METADATA_REFRESH_MS overrides it (tests running beside a
-// parca-agent use it).
+// The agent's metadata_refresh_ms, else PARCAGPU_METADATA_REFRESH_MS,
+// overrides it (tests running beside a parca-agent use it). Read on every
+// call, so an agent's change applies at the next check.
 static uint64_t emitRefreshPeriodNs() {
+  if (const uint32_t ms = agentCtlMetadataRefreshMs())
+    return uint64_t(ms) * 1000 * 1000;
   static const uint64_t period = [] {
     const char *v = std::getenv("PARCAGPU_METADATA_REFRESH_MS");
     const long ms = v ? std::atol(v) : 0;
@@ -1035,9 +1038,12 @@ void PCSampling::emitMetadata() {
 
   const uint64_t nowNs = emitMetadataNowNs();
   const uint64_t lastRefresh = lastRefreshNs.load(std::memory_order_relaxed);
-  const bool refresh = (nowNs - lastRefresh) > emitRefreshPeriodNs();
+  const uint64_t refreshPeriodNs = emitRefreshPeriodNs();
+  const bool refresh = (nowNs - lastRefresh) > refreshPeriodNs;
   if (refresh) {
     lastRefreshNs.store(nowNs, std::memory_order_relaxed);
+    DEBUG_PRINTF("[PARCAGPU] metadata refresh (period %lu ms)\n",
+                 (unsigned long)(refreshPeriodNs / 1000000));
   }
 
   // Stall reason map (small, ~4KB) — no per-entry state needed.
@@ -1063,7 +1069,7 @@ void PCSampling::emitMetadata() {
     std::lock_guard<std::mutex> lock(contextMutex);
     for (auto &ref : loadedCubins) {
       if (cubinJoin ||
-          (nowNs - ref.lastEmittedNs) > emitRefreshPeriodNs()) {
+          (nowNs - ref.lastEmittedNs) > refreshPeriodNs) {
         fireCubinLoaded(ref.crc, ref.data, ref.size);
         fireCubinLoadedFile(ref.crc, ref.data, ref.size, ref.path.c_str());
         ref.lastEmittedNs = nowNs;
@@ -1080,7 +1086,7 @@ void PCSampling::emitMetadata() {
     std::lock_guard<std::mutex> lock(contextMutex);
     for (auto &ref : loadedConfigs) {
       if (cfgJoin ||
-          (nowNs - ref.lastEmittedNs) > emitRefreshPeriodNs()) {
+          (nowNs - ref.lastEmittedNs) > refreshPeriodNs) {
         fireGpuConfig(ref.dev, ref.samplingFactor, ref.clockKHz, ref.smCount);
         ref.lastEmittedNs = nowNs;
       }

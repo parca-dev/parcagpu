@@ -13,7 +13,8 @@
 #include <stdint.h>
 
 #define PARCAGPU_CTL_CONSUMER "parcagpu"
-// 1: PC sampling and launch rate limits. 2: features. 3: pc_hw_buffer_mb.
+// 1: PC sampling and launch rate limits. 2: features. 3: pc_hw_buffer_mb,
+// metadata_refresh_ms.
 #define PARCAGPU_CTL_SCHEMA_VERSION 3
 #define PARCAGPU_CTL_MAX_DEVICES 16
 // The config's size in 32-bit words, room for knobs to come included.
@@ -52,11 +53,20 @@ struct parcagpu_ctl_config {
   // default. Schema version 3.
   uint32_t pc_hw_buffer_mb;
 
+  // Period of the forced re-emission of cubins, the stall reason map and
+  // gpu_config, ms (as PARCAGPU_METADATA_REFRESH_MS): 0 = environment/
+  // default (30000), else any value (as the environment's: 1 re-emits on
+  // nearly every launch). Takes effect at the next kernel launch: the period
+  // is checked against the time since the last refresh, so lowering it from
+  // 30 s to 1 s refreshes at once rather than waiting out the old period.
+  // Not reported in the state. Schema version 3.
+  uint32_t metadata_refresh_ms;
+
   // Knobs to come. Each is 0 = default, so an agent that doesn't know one
   // leaves it alone; a process ignores those it doesn't know, so an agent
   // sets one only for a process whose schema_version (procctl's header)
   // has it. The config's size never changes.
-  uint32_t reserved[PARCAGPU_CTL_CONFIG_WORDS - 8];
+  uint32_t reserved[PARCAGPU_CTL_CONFIG_WORDS - 9];
 };
 
 // kernel_stats: exact kernel execution counts and durations. Without an

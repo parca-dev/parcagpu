@@ -26,11 +26,12 @@ type config struct {
 	WindowMs uint32
 	GapMs    uint32
 	// Launch probe rate limits.
-	RateLimit      uint32
-	GraphRateLimit uint32
-	Features       uint32
-	HWBufferMB     uint32
-	Reserved       [24]uint32 // knobs to come
+	RateLimit         uint32
+	GraphRateLimit    uint32
+	Features          uint32
+	HWBufferMB        uint32
+	MetadataRefreshMs uint32
+	Reserved          [23]uint32 // knobs to come
 }
 
 // PARCAGPU_FEATURE_*
@@ -82,6 +83,7 @@ type proc struct {
 	cmd       *exec.Cmd
 	stopAgent context.CancelFunc // stops heartbeats, as if the agent died
 	mockState string             // MOCK_PC_STATE_FILE
+	out       string             // test_cupti_prof's output
 }
 
 // start runs test_cupti_prof with args and env and waits for its region.
@@ -121,7 +123,7 @@ func start(t *testing.T, env []string, args ...string) *proc {
 	go func() { _ = reg.Run(ctx) }()
 	t.Cleanup(func() { cancel(); _ = reg.Close() })
 
-	p := &proc{t: t, reg: reg, cmd: cmd, stopAgent: cancel, mockState: mockState}
+	p := &proc{t: t, reg: reg, cmd: cmd, stopAgent: cancel, mockState: mockState, out: out.Name()}
 	p.eventually("region attached", func() error {
 		for _, c := range reg.Clients() {
 			if c.Info().HostPID == cmd.Process.Pid {
@@ -338,7 +340,8 @@ func TestConfigAck(t *testing.T) {
 		{"graph rate limit too high", &config{GraphRateLimit: 1000001}, false},
 		{"hw buffer too large", &config{HWBufferMB: 4097}, false},
 		{"largest hw buffer", &config{HWBufferMB: 4096}, true},
-		{"knobs it doesn't know", &config{Devices: 1, Reserved: [24]uint32{0: 1, 23: 7}}, true},
+		{"any metadata refresh period", &config{MetadataRefreshMs: 0xffffffff}, true},
+		{"knobs it doesn't know", &config{Devices: 1, Reserved: [23]uint32{0: 1, 22: 7}}, true},
 		{"valid again", &config{Devices: 1, Factor: 31, WindowMs: 10000}, true},
 	} {
 		wait := 5 * time.Second
@@ -556,6 +559,51 @@ func TestHWBufferDefault(t *testing.T) {
 	p.eventually("the agent's", size(16, 16))
 	p.grant(config{Devices: 1, WindowMs: 50}, 1)
 	p.eventually("CUPTI's default", size(0, 0))
+}
+
+// refreshesIn reports how many metadata refreshes parcagpu logged in d
+// (PARCAGPU_DEBUG=1).
+func (p *proc) refreshesIn(d time.Duration) int {
+	count := func() int {
+		b, _ := os.ReadFile(p.out)
+		return bytes.Count(b, []byte("metadata refresh (period"))
+	}
+	before := count()
+	time.Sleep(d)
+	return count() - before
+}
+
+// The agent's metadata refresh period replaces the environment's while it
+// sets one, from the next launch: lowering it doesn't wait out the old period.
+func TestMetadataRefresh(t *testing.T) {
+	p := start(t, []string{"PARCAGPU_DEBUG=1", "PARCAGPU_METADATA_REFRESH_MS=60000"},
+		"--num-gpus=1", "--launch-rate=2000")
+	p.devices(1)
+	slow := func(what string) {
+		p.eventually(what, func() error {
+			if n := p.refreshesIn(time.Second); n > 1 {
+				return fmt.Errorf("%d refreshes in 1 s", n)
+			}
+			return nil
+		})
+	}
+	slow("the environment's 60 s")
+	if !p.write(&config{MetadataRefreshMs: 100}, 5*time.Second) {
+		t.Fatal("not acked")
+	}
+	// At once: within a second of the ack, not after the rest of 60 s.
+	if n := p.refreshesIn(time.Second); n < 5 {
+		t.Errorf("agent's 100 ms: %d refreshes in 1 s", n)
+	}
+	if !p.write(&config{}, 5*time.Second) {
+		t.Fatal("not acked")
+	}
+	slow("the environment's again")
+	if !p.write(&config{MetadataRefreshMs: 100}, 5*time.Second) {
+		t.Fatal("not acked")
+	}
+	p.stopAgent()
+	slow("the environment's after lease expiry")
 }
 
 // When the agent's lease expires, parcagpu goes back to its environment:

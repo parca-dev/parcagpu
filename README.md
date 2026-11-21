@@ -84,7 +84,7 @@ is attached to the `nvtx_event_batch` probe.
 | `PARCAGPU_BLOCKING_THRESHOLD_US` | 10 | Threshold T for `cuda_blocking_call` (only used when `PARCAGPU_BLOCKING_CALLS` is set). Calls blocked at least T are always reported with weight = duration; shorter calls are reported with probability duration/T and weight = T, so summed weights estimate total blocked time without bias. 0 reports every call. |
 | `PARCAGPU_PC_HW_BUFFER_MB` | (unset) | Force the CUPTI PC-sampling hardware buffer to this many MB, at most 4096. Unset, 0 or out of range leaves it at the CUPTI default (512 MB). On a GB10 forcing any size has made PC sampling return no data. The agent can override it (`pc_hw_buffer_mb`). |
 | `PARCAGPU_GATE_STATS` | off | Print the PC sampling gate's counters every 10 s (see below) |
-| `PARCAGPU_METADATA_REFRESH_MS` | 30000 | Re-emit cubins, the stall reason map and `gpu_config` this often. A consumer that attaches while another is attached only gets them at the next refresh: the USDT semaphore stays at 1. |
+| `PARCAGPU_METADATA_REFRESH_MS` | 30000 | Re-emit cubins, the stall reason map and `gpu_config` this often. A consumer that attaches while another is attached only gets them at the next refresh: the USDT semaphore stays at 1. Unset, 0 or negative is the default. The agent can override it (`metadata_refresh_ms`). |
 
 ### Runtime control from parca-agent
 
@@ -123,6 +123,12 @@ set up again (disabled, re-enabled and configured, as for a new sampling
 factor) on its next kernel launch outside a window, a device not granted when
 it is granted. The configuration is acknowledged before that, once accepted.
 Each process reports the size its contexts are set up with from then on.
+
+It can set the metadata refresh period (`PARCAGPU_METADATA_REFRESH_MS`'s
+meaning; 0 leaves the environment's, else 30 s). It applies from the next
+kernel launch: the period is checked against the time since the last
+refresh, so lowering it refreshes at once instead of waiting out the old
+period. It isn't reported in the state.
 
 It also turns optional instrumentation on and off with feature bits:
 `kernel_stats` (`PARCAGPU_FEATURE_KERNEL_STATS`) and `cuda_blocking_call`
