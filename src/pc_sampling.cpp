@@ -385,15 +385,18 @@ CUpti_PCSamplingConfigurationInfo ConfigureData::configureScratchBuffer() {
   return scratchBufferInfo;
 }
 
-// MB to force for the PC-sampling hardware buffer, from PARCAGPU_PC_HW_BUFFER_MB.
-// 0 (unset/invalid/negative) means "leave at CUPTI default" — see the note in
-// ConfigureData::initialize() for why we don't force it by default.
-int pcHardwareBufferMB() {
-  const char *env = getenv("PARCAGPU_PC_HW_BUFFER_MB");
-  if (!env)
-    return 0;
-  int mb = atoi(env);
-  return mb > 0 ? mb : 0;
+// 0 (unset, invalid, negative or too large) means "leave at CUPTI default":
+// see the note in ConfigureData::initialize() for why we don't force it by
+// default.
+uint32_t pcHardwareBufferMB(uint32_t agentMB) {
+  if (agentMB != 0)
+    return agentMB;
+  static const uint32_t envMB = [] {
+    const char *env = getenv("PARCAGPU_PC_HW_BUFFER_MB");
+    long mb = env ? atol(env) : 0;
+    return mb > 0 && mb <= (long)kMaxPCHardwareBufferMB ? (uint32_t)mb : 0u;
+  }();
+  return envMB;
 }
 
 CUpti_PCSamplingConfigurationInfo ConfigureData::configureHardwareBufferSize() {
@@ -423,7 +426,8 @@ CUpti_PCSamplingConfigurationInfo ConfigureData::configureStartStopControl() {
   return startStopControlInfo;
 }
 
-void ConfigureData::initialize(CUcontext context, uint32_t factor) {
+void ConfigureData::initialize(CUcontext context, uint32_t factor,
+                               uint32_t hwBufferMB) {
   this->context = context;
   this->requestedFactor = factor;
   proton::cupti::getContextId<true>(context, &contextId);
@@ -431,7 +435,7 @@ void ConfigureData::initialize(CUcontext context, uint32_t factor) {
   DEBUG_PRINTF("Initializing PC sampling for context %p (id %u)\n", context,
                contextId);
 
-  hardwareBufferMB = pcHardwareBufferMB();
+  hardwareBufferMB = pcHardwareBufferMB(hwBufferMB);
 
   configurationInfos.emplace_back(configureStallReasons());
   configurationInfos.emplace_back(configureCollectionMode());
@@ -450,12 +454,14 @@ void ConfigureData::initialize(CUcontext context, uint32_t factor) {
   // default hardware buffer works; if it overflows it reports droppedSamples
   // rather than wedging GetData.
   //
-  // Escape hatch: set PARCAGPU_PC_HW_BUFFER_MB=<n> to force an n-MB hardware
-  // buffer (0 = leave at CUPTI default, same as unset). Lets ops re-enable /
-  // tune it on GPUs where the larger buffer helps busy workloads.
+  // Escape hatch: set PARCAGPU_PC_HW_BUFFER_MB=<n>, or the agent's
+  // pc_hw_buffer_mb, to force an n-MB hardware buffer (0 = leave at CUPTI
+  // default, same as unset). Lets ops re-enable / tune it on GPUs where the
+  // larger buffer helps busy workloads.
   if (hardwareBufferMB > 0) {
-    DEBUG_PRINTF("[PARCAGPU] Forcing PC hardware buffer = %d MB "
-                 "(PARCAGPU_PC_HW_BUFFER_MB)\n", hardwareBufferMB);
+    DEBUG_PRINTF("[PARCAGPU] Forcing PC hardware buffer = %u MB%s\n",
+                 hardwareBufferMB,
+                 hwBufferMB ? " (agent)" : " (PARCAGPU_PC_HW_BUFFER_MB)");
     configurationInfos.emplace_back(configureHardwareBufferSize());
   }
   // Sampling period: the agent's factor if it set one, else
@@ -571,7 +577,8 @@ bool PCSampling::cachedContextId(CUcontext context, uint32_t *contextId) {
   return true;
 }
 
-void PCSampling::initialize(CUcontext context, uint32_t factor) {
+void PCSampling::initialize(CUcontext context, uint32_t factor,
+                            uint32_t hwBufferMB) {
   uint32_t contextId = 0;
   proton::cupti::getContextId<true>(context, &contextId);
   contextIds[context] = contextId;
@@ -609,7 +616,7 @@ void PCSampling::initialize(CUcontext context, uint32_t factor) {
 
         auto *configData = getConfigureData(contextId);
         try {
-          configData->initialize(context, factor);
+          configData->initialize(context, factor, hwBufferMB);
         } catch (const std::exception &e) {
           // E.g. a CUPTI older than the driver (a container's CUDA 12
           // libraries on a CUDA 13 host): don't leave it enabled, unusable
@@ -763,8 +770,8 @@ bool PCSampling::windowDue(CUcontext context, uint64_t windowNs) {
          emitMetadataNowNs() - it->second >= windowNs;
 }
 
-void PCSampling::prepare(CUcontext context, uint32_t factor, uint64_t gen,
-                         bool agent) {
+void PCSampling::prepare(CUcontext context, uint32_t factor,
+                         uint32_t hwBufferMB, uint64_t gen, bool agent) {
   uint32_t contextId = 0;
   if (!cachedContextId(context, &contextId)) {
     // Never set up: do it now (once; initialize() caches the id).
@@ -781,7 +788,7 @@ void PCSampling::prepare(CUcontext context, uint32_t factor, uint64_t gen,
       return;
     DEBUG_PRINTF("PC sampling: setting up ctx=%p (factor %u)\n", context,
                  factor);
-    initialize(context, factor);
+    initialize(context, factor, hwBufferMB);
     return;
   }
   auto needed = [&](bool *rearm) {
@@ -798,7 +805,8 @@ void PCSampling::prepare(CUcontext context, uint32_t factor, uint64_t gen,
     if (contextNeedsReset.contain(contextId))
       return true; // CUPTI_ERROR_OUT_OF_MEMORY (collectData)
     auto cd = contextIdToConfigureData.find(contextId);
-    return cd && cd->get().requestedFactor != factor;
+    return cd && (cd->get().requestedFactor != factor ||
+                  cd->get().hardwareBufferMB != pcHardwareBufferMB(hwBufferMB));
   };
   bool rearm;
   if (!needed(&rearm) || isSampling(context))
@@ -820,7 +828,7 @@ void PCSampling::prepare(CUcontext context, uint32_t factor, uint64_t gen,
                rearm ? "re-arming" : "re-configuring", context, factor);
   finalize(context);
   contextNeedsReset.erase(contextId);
-  initialize(context, factor);
+  initialize(context, factor, hwBufferMB);
 }
 
 bool PCSampling::applyAgentConfig(const std::function<void()> &commit) {

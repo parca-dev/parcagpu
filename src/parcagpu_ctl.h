@@ -13,8 +13,8 @@
 #include <stdint.h>
 
 #define PARCAGPU_CTL_CONSUMER "parcagpu"
-// 1: PC sampling and launch rate limits. 2: features.
-#define PARCAGPU_CTL_SCHEMA_VERSION 2
+// 1: PC sampling and launch rate limits. 2: features. 3: pc_hw_buffer_mb.
+#define PARCAGPU_CTL_SCHEMA_VERSION 3
 #define PARCAGPU_CTL_MAX_DEVICES 16
 // The config's size in 32-bit words, room for knobs to come included.
 #define PARCAGPU_CTL_CONFIG_WORDS 32
@@ -40,11 +40,23 @@ struct parcagpu_ctl_config {
   // Unknown bits are ignored. Schema version 2.
   uint32_t features;
 
+  // CUPTI's PC sampling hardware buffer, MB (as PARCAGPU_PC_HW_BUFFER_MB):
+  // 0 = environment/CUPTI default (512 MB), else [1,4096]. A context takes
+  // the size when it is set up for PC sampling, so a change doesn't touch one
+  // that is set up already until its next setup: a granted device is set up
+  // again (disabled and re-enabled, as for a new factor) on its next kernel
+  // launch outside a window, a device not granted when it is granted. The ack
+  // comes at once, before that. On a GB10 forcing any size has made
+  // cuptiPCSamplingGetData fail with CUPTI_ERROR_OUT_OF_MEMORY (see
+  // pc_sampling.cpp), which is why parcagpu leaves CUPTI's default by
+  // default. Schema version 3.
+  uint32_t pc_hw_buffer_mb;
+
   // Knobs to come. Each is 0 = default, so an agent that doesn't know one
   // leaves it alone; a process ignores those it doesn't know, so an agent
   // sets one only for a process whose schema_version (procctl's header)
   // has it. The config's size never changes.
-  uint32_t reserved[PARCAGPU_CTL_CONFIG_WORDS - 7];
+  uint32_t reserved[PARCAGPU_CTL_CONFIG_WORDS - 8];
 };
 
 // kernel_stats: exact kernel execution counts and durations. Without an
@@ -77,7 +89,10 @@ struct parcagpu_ctl_state {
   uint32_t num_devices;
   struct parcagpu_ctl_device devices[PARCAGPU_CTL_MAX_DEVICES];
   uint32_t features; // PARCAGPU_FEATURE_* in effect
-  uint32_t reserved;
+  // PC sampling hardware buffer, MB, that contexts are set up with from now
+  // on: the agent's, else PARCAGPU_PC_HW_BUFFER_MB; 0 = CUPTI's default.
+  // Schema version 3.
+  uint32_t pc_hw_buffer_mb;
 };
 
 #endif // PARCAGPU_CTL_H_

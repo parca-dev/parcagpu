@@ -114,10 +114,10 @@ void validateEnvVars() {
 
   val = std::getenv("PARCAGPU_PC_HW_BUFFER_MB");
   if (val) {
-    int mb = std::atoi(val);
-    if (mb < 0) {
+    long mb = std::atol(val);
+    if (mb < 0 || mb > (long)kMaxPCHardwareBufferMB) {
       DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_PC_HW_BUFFER_MB=%s invalid "
-                   "(must be >= 0), ignoring\n", val);
+                   "(must be 0-%u), ignoring\n", val, kMaxPCHardwareBufferMB);
       fireError(0, val, "env_config: PARCAGPU_PC_HW_BUFFER_MB invalid");
     }
   }

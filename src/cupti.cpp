@@ -687,6 +687,7 @@ public:
     };
     parcagpu::agentCtlSetEnvRateLimits(reported(g_eagerRateLimit),
                                        reported(g_graphRateLimit));
+    parcagpu::agentCtlSetEnvHWBuffer(parcagpu::pcHardwareBufferMB(0));
     parcagpu::agentCtlSetEnvFeatures(
         PARCAGPU_FEATURE_KERNEL_STATS |
         (blockingCallsEnabled ? PARCAGPU_FEATURE_BLOCKING_CALLS : 0));
@@ -1227,7 +1228,7 @@ private:
         if (profiler.pcSampling.envSampling && !agentCtlConfig().active) {
           // Inside the driver, with the new context not yet in use.
           parcagpu::gate::Bypass bypass;
-          profiler.pcSampling.initialize(ctx, 0);
+          profiler.pcSampling.initialize(ctx, 0, 0);
         }
         break;
       }
@@ -1309,12 +1310,13 @@ private:
               PCTransition transition;
               if (!PCTransition::captureFree())
                 return;
-              // First set the context up, bring it to the agent's factor, or
-              // re-arm it after a failure (skipped while it samples). The
+              // First set the context up, bring it to the agent's factor and
+              // hardware buffer size, or re-arm it after a failure (skipped while it samples). The
               // context is current here.
-              profiler.pcSampling.prepare(cbdata->context,
-                                          cfg.active ? cfg.factor : 0,
-                                          agentCtlGeneration(), cfg.active);
+              profiler.pcSampling.prepare(
+                  cbdata->context, cfg.active ? cfg.factor : 0,
+                  cfg.active ? cfg.hwBufferMB : 0, agentCtlGeneration(),
+                  cfg.active);
               // Under the agent, its window and gap set the duty cycle (per
               // context, in start()); else the dice roll, steered by the
               // rate controller.

@@ -82,7 +82,7 @@ is attached to the `nvtx_event_batch` probe.
 | `PARCAGPU_SAMPLING_FACTOR` | 20 | Hardware PC sampling period (log2 cycles between samples per SM), [5,31]. A factor set by parca-agent takes precedence. Applied rather than CUPTI's per-GPU default, which is 10 on a GB10. |
 | `PARCAGPU_BLOCKING_CALLS` | (unset) | Set to a non-empty value other than `0` to enable the `cuda_blocking_call` probe. Off by default, because its CUPTI callbacks run on every covered API call (including stream/event query polling) even when no agent is attached. Under parca-agent control, the agent's `PARCAGPU_FEATURE_BLOCKING_CALLS` decides instead (off by default). |
 | `PARCAGPU_BLOCKING_THRESHOLD_US` | 10 | Threshold T for `cuda_blocking_call` (only used when `PARCAGPU_BLOCKING_CALLS` is set). Calls blocked at least T are always reported with weight = duration; shorter calls are reported with probability duration/T and weight = T, so summed weights estimate total blocked time without bias. 0 reports every call. |
-| `PARCAGPU_PC_HW_BUFFER_MB` | (unset) | Force the CUPTI PC-sampling hardware buffer to this many MB. Unset or 0 leaves it at the CUPTI default. |
+| `PARCAGPU_PC_HW_BUFFER_MB` | (unset) | Force the CUPTI PC-sampling hardware buffer to this many MB, at most 4096. Unset, 0 or out of range leaves it at the CUPTI default (512 MB). On a GB10 forcing any size has made PC sampling return no data. The agent can override it (`pc_hw_buffer_mb`). |
 | `PARCAGPU_GATE_STATS` | off | Print the PC sampling gate's counters every 10 s (see below) |
 | `PARCAGPU_METADATA_REFRESH_MS` | 30000 | Re-emit cubins, the stall reason map and `gpu_config` this often. A consumer that attaches while another is attached only gets them at the next refresh: the USDT semaphore stays at 1. |
 
@@ -114,6 +114,15 @@ failed, is reported as unavailable.
 The agent can also set the launch probe rate limits (`PARCAGPU_RATE_LIMIT`
 and `PARCAGPU_GRAPH_RATE_LIMIT`'s meaning, applied live); a limit it leaves at
 0 stays the environment's. Each process reports the limits in effect.
+
+It can set the size of CUPTI's PC sampling hardware buffer
+(`PARCAGPU_PC_HW_BUFFER_MB`'s meaning, 1-4096 MB; 0 leaves the environment's,
+else CUPTI's default). A context takes the size when it is set up for PC
+sampling, so a change reaches a context at its next setup: a granted device is
+set up again (disabled, re-enabled and configured, as for a new sampling
+factor) on its next kernel launch outside a window, a device not granted when
+it is granted. The configuration is acknowledged before that, once accepted.
+Each process reports the size its contexts are set up with from then on.
 
 It also turns optional instrumentation on and off with feature bits:
 `kernel_stats` (`PARCAGPU_FEATURE_KERNEL_STATS`) and `cuda_blocking_call`

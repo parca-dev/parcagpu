@@ -29,7 +29,8 @@ type config struct {
 	RateLimit      uint32
 	GraphRateLimit uint32
 	Features       uint32
-	Reserved       [25]uint32 // knobs to come
+	HWBufferMB     uint32
+	Reserved       [24]uint32 // knobs to come
 }
 
 // PARCAGPU_FEATURE_*
@@ -53,7 +54,7 @@ type state struct {
 	NumDevices     uint32
 	Devices        [16]device
 	Features       uint32
-	Reserved       uint32
+	HWBufferMB     uint32
 }
 
 const (
@@ -237,6 +238,17 @@ func (p *proc) bad() (starts, stops uint32) {
 	return binary.LittleEndian.Uint32(b[i:]), binary.LittleEndian.Uint32(b[i+4:])
 }
 
+// hwBuffer reports the hardware buffer size set on slot's context, MB (0: not
+// set since PC sampling was enabled on it).
+func (p *proc) hwBuffer(slot int) uint32 {
+	b, err := os.ReadFile(p.mockState)
+	i := (2*65 + 3 + 65 + 1 + slot) * 4
+	if err != nil || len(b) < i+4 {
+		p.t.Fatalf("mock state: %v (%d bytes)", err, len(b))
+	}
+	return binary.LittleEndian.Uint32(b[i:])
+}
+
 // enabled reports whether PC sampling is enabled on slot's context.
 func (p *proc) enabled(slot int) bool {
 	b, err := os.ReadFile(p.mockState)
@@ -324,7 +336,9 @@ func TestConfigAck(t *testing.T) {
 		{"unknown device", &config{Devices: 1 << 2}, false},
 		{"rate limit too high", &config{RateLimit: 1000001}, false},
 		{"graph rate limit too high", &config{GraphRateLimit: 1000001}, false},
-		{"knobs it doesn't know", &config{Devices: 1, Reserved: [25]uint32{0: 1, 24: 7}}, true},
+		{"hw buffer too large", &config{HWBufferMB: 4097}, false},
+		{"largest hw buffer", &config{HWBufferMB: 4096}, true},
+		{"knobs it doesn't know", &config{Devices: 1, Reserved: [24]uint32{0: 1, 23: 7}}, true},
 		{"valid again", &config{Devices: 1, Factor: 31, WindowMs: 10000}, true},
 	} {
 		wait := 5 * time.Second
@@ -488,6 +502,60 @@ func TestFactor(t *testing.T) {
 	p.eventually("both at 15", factors(15, 15))
 	p.grant(config{Devices: 3, WindowMs: 50}, 2)
 	p.eventually("both back to the default", factors(20, 20))
+}
+
+// A hardware buffer size change applies at a context's next setup: a granted
+// device is set up again, live; one not granted keeps what it was set up with
+// until granted. The state reports the size in effect.
+func TestHWBuffer(t *testing.T) {
+	p := start(t, append([]string{"PARCAGPU_PC_HW_BUFFER_MB=32"}, sampleAll...),
+		"--num-gpus=2", "--launch-rate=2000")
+	p.devices(2)
+	sizes := func(wantState, want0, want1 uint32) func() error {
+		return func() error {
+			s, err := p.state()
+			if err != nil {
+				return err
+			}
+			if s.HWBufferMB != wantState || p.hwBuffer(0) != want0 || p.hwBuffer(1) != want1 {
+				err = fmt.Errorf("state %d, set %d %d", s.HWBufferMB, p.hwBuffer(0), p.hwBuffer(1))
+			}
+			return err
+		}
+	}
+	// Set up by the environment when created.
+	p.eventually("the environment's", sizes(32, 32, 32))
+	p.grant(config{Devices: 1, HWBufferMB: 64, WindowMs: 50}, 2)
+	// Slot 1 was disabled when the agent took it away.
+	p.eventually("slot 0 at 64", sizes(64, 64, 0))
+	p.grant(config{Devices: 3, HWBufferMB: 64, WindowMs: 50}, 2)
+	p.eventually("both at 64", sizes(64, 64, 64))
+	p.grant(config{Devices: 3, HWBufferMB: 128, WindowMs: 50}, 2)
+	p.eventually("both at 128", sizes(128, 128, 128))
+	p.grant(config{Devices: 3, WindowMs: 50}, 2)
+	p.eventually("both back to the environment's", sizes(32, 32, 32))
+	p.stopAgent()
+	p.eventually("the environment's after lease expiry", sizes(32, 32, 32))
+}
+
+// Without PARCAGPU_PC_HW_BUFFER_MB, 0 leaves CUPTI's default: the attribute
+// isn't set at all.
+func TestHWBufferDefault(t *testing.T) {
+	p := start(t, sampleAll, "--num-gpus=1", "--launch-rate=2000")
+	p.devices(1)
+	size := func(wantState, want uint32) func() error {
+		return func() error {
+			s, err := p.state()
+			if err == nil && (s.HWBufferMB != wantState || p.hwBuffer(0) != want) {
+				err = fmt.Errorf("state %d, set %d", s.HWBufferMB, p.hwBuffer(0))
+			}
+			return err
+		}
+	}
+	p.grant(config{Devices: 1, HWBufferMB: 16, WindowMs: 50}, 1)
+	p.eventually("the agent's", size(16, 16))
+	p.grant(config{Devices: 1, WindowMs: 50}, 1)
+	p.eventually("CUPTI's default", size(0, 0))
 }
 
 // When the agent's lease expires, parcagpu goes back to its environment:

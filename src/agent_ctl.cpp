@@ -51,6 +51,9 @@ std::atomic<uint64_t> g_config{0};
 // The rate limits, bits 0-31 and 32-63; 0 while inactive.
 std::atomic<uint64_t> g_rates{0};
 uint32_t g_envRateLimit = 0, g_envGraphRateLimit = 0; // under g_devMutex
+// The PC sampling hardware buffer size, MB; 0 while inactive or not set.
+std::atomic<uint32_t> g_hwBuffer{0};
+uint32_t g_envHWBufferMB = 0; // under g_devMutex
 std::atomic<uint64_t> g_configGen{0};
 std::atomic<uint64_t> g_nextLeaseCheckNs{0};
 std::atomic<bool> g_leaseExpired{true};
@@ -120,10 +123,14 @@ void atforkChild() {
   }
   g_config.store(0, std::memory_order_relaxed);
   g_rates.store(0, std::memory_order_relaxed);
+  g_hwBuffer.store(0, std::memory_order_relaxed);
 }
 
 static_assert(sizeof(parcagpu_ctl_config) == 4 * PARCAGPU_CTL_CONFIG_WORDS,
               "parcagpu_ctl_config must stay PARCAGPU_CTL_CONFIG_WORDS words");
+// 536 bytes since schema version 1: new fields took reserved words.
+static_assert(sizeof(parcagpu_ctl_state) == 536,
+              "parcagpu_ctl_state's size must not change");
 
 // Checks the knobs this schema knows; it ignores the reserved ones.
 bool valid(const parcagpu_ctl_config &c, uint32_t numDevices) {
@@ -135,6 +142,8 @@ bool valid(const parcagpu_ctl_config &c, uint32_t numDevices) {
     return false;
   if (c.rate_limit > kMaxRateLimit || c.graph_rate_limit > kMaxRateLimit)
     return false;
+  if (c.pc_hw_buffer_mb > kMaxPCHardwareBufferMB)
+    return false;
   return (c.pc_sampling_devices >> numDevices) == 0;
 }
 
@@ -142,6 +151,7 @@ bool valid(const parcagpu_ctl_config &c, uint32_t numDevices) {
 struct Update {
   uint64_t packed = 0;
   uint64_t rates = 0;
+  uint32_t hwBuffer = 0;
   uint64_t gen = 0;
   bool ack = false;
 };
@@ -165,9 +175,10 @@ bool decode(int n, const parcagpu_ctl_config &c, uint64_t gen, Update *u) {
     }
     if (n != (int)sizeof c || !valid(c, numDevices)) {
       DEBUG_PRINTF("[PARCAGPU] agent control: rejected gen %lu (len %d, "
-                   "devices 0x%x, factor %u, window %u ms)\n",
+                   "devices 0x%x, factor %u, window %u ms, hw buffer %u "
+                   "MB)\n",
                    gen, n, c.pc_sampling_devices, c.pc_sampling_factor,
-                   c.pc_sampling_window_ms);
+                   c.pc_sampling_window_ms, c.pc_hw_buffer_mb);
       fireError(EINVAL, "invalid agent configuration", "agent_ctl");
       return false;
     }
@@ -176,6 +187,7 @@ bool decode(int n, const parcagpu_ctl_config &c, uint64_t gen, Update *u) {
   u->rates = n == -ENODATA ? 0
                            : (uint64_t)c.rate_limit |
                                  ((uint64_t)c.graph_rate_limit << 32);
+  u->hwBuffer = n == -ENODATA ? 0 : c.pc_hw_buffer_mb;
   u->gen = gen;
   u->ack = true;
   return true;
@@ -201,12 +213,13 @@ bool checkLease(Update *u) {
 
 // Reports pc_state for the configuration just applied: ON where it grants
 // sampling, OFF elsewhere (sampling there has been stopped); and the rate
-// limits in effect.
-void reportLocked(uint64_t packed, uint64_t rates) {
+// limits and hardware buffer size in effect.
+void reportLocked(uint64_t packed, uint64_t rates, uint32_t hwBuffer) {
   bool active = (packed >> 63) != 0;
   uint32_t rate = (uint32_t)rates, graphRate = (uint32_t)(rates >> 32);
   g_state.rate_limit = rate ? rate : g_envRateLimit;
   g_state.graph_rate_limit = graphRate ? graphRate : g_envGraphRateLimit;
+  g_state.pc_hw_buffer_mb = hwBuffer ? hwBuffer : g_envHWBufferMB;
   g_state.features = active ? (uint32_t)(packed >> kFeatureShift) &
                                   kFeatureMask & kKnownFeatures
                             : g_envFeatures;
@@ -225,13 +238,15 @@ void apply(const Update &u) {
   const bool retry = g_hasPending.load(std::memory_order_relaxed) &&
                      g_pending.ack == u.ack && g_pending.gen == u.gen &&
                      g_pending.packed == u.packed &&
-                     g_pending.rates == u.rates;
+                     g_pending.rates == u.rates &&
+                     g_pending.hwBuffer == u.hwBuffer;
   t_applying = true;
   bool done = g_apply.load(std::memory_order_acquire)([&] {
     if (retry)
       return;
     g_config.store(u.packed, std::memory_order_release);
     g_rates.store(u.rates, std::memory_order_release);
+    g_hwBuffer.store(u.hwBuffer, std::memory_order_release);
     g_configGen.fetch_add(1, std::memory_order_release);
   });
   t_applying = false;
@@ -243,7 +258,7 @@ void apply(const Update &u) {
   g_hasPending.store(false, std::memory_order_release);
   {
     std::lock_guard<std::mutex> lock2(g_devMutex);
-    reportLocked(u.packed, u.rates);
+    reportLocked(u.packed, u.rates, u.hwBuffer);
   }
   if (u.ack) {
     g_appliedGen = u.gen;
@@ -417,6 +432,7 @@ AgentConfig agentCtlConfig() {
   uint64_t r = g_rates.load(std::memory_order_acquire);
   c.rateLimit = (uint32_t)r;
   c.graphRateLimit = (uint32_t)(r >> 32);
+  c.hwBufferMB = g_hwBuffer.load(std::memory_order_acquire);
   return c;
 }
 
@@ -446,7 +462,8 @@ void agentCtlSetEnvFeatures(uint32_t features) {
   std::lock_guard<std::mutex> lock(g_devMutex);
   g_envFeatures = features & kKnownFeatures;
   reportLocked(g_config.load(std::memory_order_acquire),
-               g_rates.load(std::memory_order_acquire));
+               g_rates.load(std::memory_order_acquire),
+               g_hwBuffer.load(std::memory_order_acquire));
 }
 
 void agentCtlSetEnvRateLimits(uint32_t rateLimit, uint32_t graphRateLimit) {
@@ -456,7 +473,18 @@ void agentCtlSetEnvRateLimits(uint32_t rateLimit, uint32_t graphRateLimit) {
   g_envRateLimit = rateLimit;
   g_envGraphRateLimit = graphRateLimit;
   reportLocked(g_config.load(std::memory_order_acquire),
-               g_rates.load(std::memory_order_acquire));
+               g_rates.load(std::memory_order_acquire),
+               g_hwBuffer.load(std::memory_order_acquire));
+}
+
+void agentCtlSetEnvHWBuffer(uint32_t mb) {
+  if (!agentCtlReady())
+    return;
+  std::lock_guard<std::mutex> lock(g_devMutex);
+  g_envHWBufferMB = mb;
+  reportLocked(g_config.load(std::memory_order_acquire),
+               g_rates.load(std::memory_order_acquire),
+               g_hwBuffer.load(std::memory_order_acquire));
 }
 
 void agentCtlSetCapable(bool capable) {
