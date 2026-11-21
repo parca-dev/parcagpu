@@ -81,7 +81,7 @@ is attached to the `nvtx_event_batch` probe.
 | `PARCAGPU_PC_SAMPLING_RATE` | (unset) | Setting this env var to a non-negative number enables PC sampling. The value is the target samples/sec; a controller adjusts the per-window dice-roll probability internally to converge on this rate. Set to 0 to enable sampling with rate control disabled (controller off, fixed probability). |
 | `PARCAGPU_SAMPLING_FACTOR` | 20 | Hardware PC sampling period (log2 cycles between samples per SM), [5,31]. A factor set by parca-agent takes precedence. Applied rather than CUPTI's per-GPU default, which is 10 on a GB10. |
 | `PARCAGPU_BLOCKING_CALLS` | (unset) | Set to a non-empty value other than `0` to enable the `cuda_blocking_call` probe. Off by default, because its CUPTI callbacks run on every covered API call (including stream/event query polling) even when no agent is attached. Under parca-agent control, the agent's `PARCAGPU_FEATURE_BLOCKING_CALLS` decides instead (off by default). |
-| `PARCAGPU_BLOCKING_THRESHOLD_US` | 10 | Threshold T for `cuda_blocking_call` (only used when `PARCAGPU_BLOCKING_CALLS` is set). Calls blocked at least T are always reported with weight = duration; shorter calls are reported with probability duration/T and weight = T, so summed weights estimate total blocked time without bias. 0 reports every call. |
+| `PARCAGPU_BLOCKING_THRESHOLD_US` | 10 | Threshold T for `cuda_blocking_call`, used whenever blocking calls are on (`PARCAGPU_BLOCKING_CALLS`, or the agent's `PARCAGPU_FEATURE_BLOCKING_CALLS`). Calls blocked at least T are always reported with weight = duration; shorter calls are reported with probability duration/T and weight = T, so summed weights estimate total blocked time without bias. 0 reports every call. The agent can override it (`blocking_threshold_us`, 1 us to 1 s). |
 | `PARCAGPU_PC_HW_BUFFER_MB` | (unset) | Force the CUPTI PC-sampling hardware buffer to this many MB, at most 4096. Unset, 0 or out of range leaves it at the CUPTI default (512 MB). On a GB10 forcing any size has made PC sampling return no data. The agent can override it (`pc_hw_buffer_mb`). |
 | `PARCAGPU_GATE_STATS` | off | Print the PC sampling gate's counters every 10 s (see below) |
 | `PARCAGPU_METADATA_REFRESH_MS` | 30000 | Re-emit cubins, the stall reason map and `gpu_config` this often. A consumer that attaches while another is attached only gets them at the next refresh: the USDT semaphore stays at 1. Unset, 0 or negative is the default. The agent can override it (`metadata_refresh_ms`). |
@@ -129,6 +129,14 @@ meaning; 0 leaves the environment's, else 30 s). It applies from the next
 kernel launch: the period is checked against the time since the last
 refresh, so lowering it refreshes at once instead of waiting out the old
 period. It isn't reported in the state.
+
+And it can set the `cuda_blocking_call` threshold (`PARCAGPU_BLOCKING_THRESHOLD_US`'s
+meaning, 1 us to 1 s; 0 leaves the environment's, else 10 us). The
+environment's 0, report every call, has no equivalent: 1 us differs from it
+only for calls shorter than that, which are still reported with probability
+duration/T. It applies from the next blocking call, and is kept, without
+effect, while the blocking-calls feature is off. It isn't reported in the
+state.
 
 It also turns optional instrumentation on and off with feature bits:
 `kernel_stats` (`PARCAGPU_FEATURE_KERNEL_STATS`) and `cuda_blocking_call`

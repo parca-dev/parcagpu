@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"testing"
 	"time"
 
@@ -26,12 +28,13 @@ type config struct {
 	WindowMs uint32
 	GapMs    uint32
 	// Launch probe rate limits.
-	RateLimit         uint32
-	GraphRateLimit    uint32
-	Features          uint32
-	HWBufferMB        uint32
-	MetadataRefreshMs uint32
-	Reserved          [23]uint32 // knobs to come
+	RateLimit           uint32
+	GraphRateLimit      uint32
+	Features            uint32
+	HWBufferMB          uint32
+	MetadataRefreshMs   uint32
+	BlockingThresholdUs uint32
+	Reserved            [22]uint32 // knobs to come
 }
 
 // PARCAGPU_FEATURE_*
@@ -341,7 +344,9 @@ func TestConfigAck(t *testing.T) {
 		{"hw buffer too large", &config{HWBufferMB: 4097}, false},
 		{"largest hw buffer", &config{HWBufferMB: 4096}, true},
 		{"any metadata refresh period", &config{MetadataRefreshMs: 0xffffffff}, true},
-		{"knobs it doesn't know", &config{Devices: 1, Reserved: [23]uint32{0: 1, 22: 7}}, true},
+		{"blocking threshold too high", &config{BlockingThresholdUs: 1000001}, false},
+		{"highest blocking threshold", &config{BlockingThresholdUs: 1000000}, true},
+		{"knobs it doesn't know", &config{Devices: 1, Reserved: [22]uint32{0: 1, 21: 7}}, true},
 		{"valid again", &config{Devices: 1, Factor: 31, WindowMs: 10000}, true},
 	} {
 		wait := 5 * time.Second
@@ -604,6 +609,81 @@ func TestMetadataRefresh(t *testing.T) {
 	}
 	p.stopAgent()
 	slow("the environment's after lease expiry")
+}
+
+// blockingIn reports the weights, ns, of the cuda_blocking_call events
+// parcagpu logged in d (PARCAGPU_DEBUG=1), and how many were their call's
+// duration.
+func (p *proc) blockingIn(d time.Duration) (weights []uint64, exact int) {
+	read := func() []byte { b, _ := os.ReadFile(p.out); return b }
+	before := len(read())
+	time.Sleep(d)
+	for _, m := range blockingRe.FindAllSubmatch(read()[before:], -1) {
+		dur, _ := strconv.ParseUint(string(m[1]), 10, 64)
+		w, _ := strconv.ParseUint(string(m[2]), 10, 64)
+		weights = append(weights, w)
+		if w == dur {
+			exact++
+		}
+	}
+	return weights, exact
+}
+
+var blockingRe = regexp.MustCompile(`cuda_blocking_call: cbid=-?\d+ dev=\d+ duration=(\d+)ns weight=(\d+)ns`)
+
+// The agent's cuda_blocking_call threshold replaces the environment's while
+// it sets one, from the next call; it is kept while blocking calls are off.
+func TestBlockingThreshold(t *testing.T) {
+	// 50 us syncs; the environment's threshold is 1 ms.
+	p := start(t, []string{"PARCAGPU_DEBUG=1", "PARCAGPU_BLOCKING_THRESHOLD_US=1000"},
+		"--num-gpus=1", "--launch-rate=200", "--sync-us=50")
+	p.devices(1)
+	// Every weight is the threshold (ns): calls are shorter than it. Some
+	// are kept unless they rarely are (minEvents 0).
+	atThreshold := func(what string, ns uint64, minEvents int) {
+		p.t.Helper()
+		w, _ := p.blockingIn(time.Second)
+		if len(w) < minEvents {
+			t.Errorf("%s: %d events", what, len(w))
+		}
+		for _, x := range w {
+			if x != ns {
+				t.Errorf("%s: weight %d, want %d", what, x, ns)
+				return
+			}
+		}
+	}
+	// Every call kept, at its duration: calls are longer than the threshold.
+	// Checked right after the ack: it applies from the next call.
+	allKept := func(what string) {
+		p.t.Helper()
+		if w, exact := p.blockingIn(time.Second); len(w) < 20 || exact != len(w) {
+			t.Errorf("%s: %d events, %d at their duration", what, len(w), exact)
+		}
+	}
+	// Set while blocking calls are off: kept, without effect.
+	if !p.write(&config{BlockingThresholdUs: 10}, 5*time.Second) {
+		t.Fatal("not acked")
+	}
+	if w, _ := p.blockingIn(time.Second); len(w) != 0 {
+		t.Errorf("blocking calls off: %d events", len(w))
+	}
+	if !p.write(&config{Features: featureBlockingCalls, BlockingThresholdUs: 10}, 5*time.Second) {
+		t.Fatal("not acked")
+	}
+	allKept("the agent's 10 us")
+	if !p.write(&config{Features: featureBlockingCalls}, 5*time.Second) {
+		t.Fatal("not acked")
+	}
+	atThreshold("the environment's 1 ms", 1_000_000, 1)
+	if !p.write(&config{Features: featureBlockingCalls, BlockingThresholdUs: 1}, 5*time.Second) {
+		t.Fatal("not acked")
+	}
+	allKept("the agent's 1 us")
+	if !p.write(&config{Features: featureBlockingCalls, BlockingThresholdUs: 1000000}, 5*time.Second) {
+		t.Fatal("not acked")
+	}
+	atThreshold("the agent's 1 s", 1_000_000_000, 0)
 }
 
 // When the agent's lease expires, parcagpu goes back to its environment:

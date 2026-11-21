@@ -58,6 +58,7 @@ struct AgentConfig {
   uint32_t features = 0;   // PARCAGPU_FEATURE_*
   uint32_t hwBufferMB = 0; // PC sampling hardware buffer, MB; 0 = environment's
   uint32_t metadataRefreshMs = 0; // 0 = the environment's
+  uint32_t blockingThresholdUs = 0; // 0 = the environment's
 };
 AgentConfig agentCtlConfig();
 uint64_t agentCtlGeneration();
@@ -65,6 +66,10 @@ uint64_t agentCtlGeneration();
 // The agent's metadata refresh period, ms; 0 while inactive or not set (the
 // environment decides then). One atomic load.
 uint32_t agentCtlMetadataRefreshMs();
+
+// The agent's cuda_blocking_call threshold, us; 0 while inactive or not set
+// (the environment decides then). One atomic load.
+uint32_t agentCtlBlockingThresholdUs();
 
 // Whether ctx may PC sample: the agent's configuration if active, else
 // envDefault.

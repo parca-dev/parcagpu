@@ -37,6 +37,7 @@ constexpr uint64_t kLeaseCheckNs = 250'000'000ULL;
 constexpr uint32_t kMaxWindowMs = 10'000;
 constexpr uint32_t kMaxGapMs = 60'000;
 constexpr uint32_t kMaxRateLimit = 1'000'000;
+constexpr uint32_t kMaxBlockingThresholdUs = 1'000'000; // 1 s
 constexpr long kReleaseTickNs = 100'000'000L;
 
 procctl_t g_ctx;
@@ -56,6 +57,8 @@ std::atomic<uint32_t> g_hwBuffer{0};
 uint32_t g_envHWBufferMB = 0; // under g_devMutex
 // The metadata refresh period, ms; 0 while inactive or not set.
 std::atomic<uint32_t> g_metadataRefresh{0};
+// The cuda_blocking_call threshold, us; 0 while inactive or not set.
+std::atomic<uint32_t> g_blockingThreshold{0};
 std::atomic<uint64_t> g_configGen{0};
 std::atomic<uint64_t> g_nextLeaseCheckNs{0};
 std::atomic<bool> g_leaseExpired{true};
@@ -127,6 +130,7 @@ void atforkChild() {
   g_rates.store(0, std::memory_order_relaxed);
   g_hwBuffer.store(0, std::memory_order_relaxed);
   g_metadataRefresh.store(0, std::memory_order_relaxed);
+  g_blockingThreshold.store(0, std::memory_order_relaxed);
 }
 
 static_assert(sizeof(parcagpu_ctl_config) == 4 * PARCAGPU_CTL_CONFIG_WORDS,
@@ -147,7 +151,8 @@ bool valid(const parcagpu_ctl_config &c, uint32_t numDevices) {
     return false;
   if (c.rate_limit > kMaxRateLimit || c.graph_rate_limit > kMaxRateLimit)
     return false;
-  if (c.pc_hw_buffer_mb > kMaxPCHardwareBufferMB)
+  if (c.pc_hw_buffer_mb > kMaxPCHardwareBufferMB ||
+      c.blocking_threshold_us > kMaxBlockingThresholdUs)
     return false;
   return (c.pc_sampling_devices >> numDevices) == 0;
 }
@@ -158,6 +163,7 @@ struct Update {
   uint64_t rates = 0;
   uint32_t hwBuffer = 0;
   uint32_t metadataRefresh = 0;
+  uint32_t blockingThreshold = 0;
   uint64_t gen = 0;
   bool ack = false;
 };
@@ -195,6 +201,7 @@ bool decode(int n, const parcagpu_ctl_config &c, uint64_t gen, Update *u) {
                                  ((uint64_t)c.graph_rate_limit << 32);
   u->hwBuffer = n == -ENODATA ? 0 : c.pc_hw_buffer_mb;
   u->metadataRefresh = n == -ENODATA ? 0 : c.metadata_refresh_ms;
+  u->blockingThreshold = n == -ENODATA ? 0 : c.blocking_threshold_us;
   u->gen = gen;
   u->ack = true;
   return true;
@@ -247,7 +254,8 @@ void apply(const Update &u) {
                      g_pending.packed == u.packed &&
                      g_pending.rates == u.rates &&
                      g_pending.hwBuffer == u.hwBuffer &&
-                     g_pending.metadataRefresh == u.metadataRefresh;
+                     g_pending.metadataRefresh == u.metadataRefresh &&
+                     g_pending.blockingThreshold == u.blockingThreshold;
   t_applying = true;
   bool done = g_apply.load(std::memory_order_acquire)([&] {
     if (retry)
@@ -256,6 +264,7 @@ void apply(const Update &u) {
     g_rates.store(u.rates, std::memory_order_release);
     g_hwBuffer.store(u.hwBuffer, std::memory_order_release);
     g_metadataRefresh.store(u.metadataRefresh, std::memory_order_release);
+    g_blockingThreshold.store(u.blockingThreshold, std::memory_order_release);
     g_configGen.fetch_add(1, std::memory_order_release);
   });
   t_applying = false;
@@ -443,7 +452,12 @@ AgentConfig agentCtlConfig() {
   c.graphRateLimit = (uint32_t)(r >> 32);
   c.hwBufferMB = g_hwBuffer.load(std::memory_order_acquire);
   c.metadataRefreshMs = agentCtlMetadataRefreshMs();
+  c.blockingThresholdUs = agentCtlBlockingThresholdUs();
   return c;
+}
+
+uint32_t agentCtlBlockingThresholdUs() {
+  return g_blockingThreshold.load(std::memory_order_acquire);
 }
 
 uint32_t agentCtlMetadataRefreshMs() {

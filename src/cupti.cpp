@@ -255,9 +255,25 @@ static double threadRandom(PCSamplingState &s) {
 // time and the emitted event rate is bounded by blocked time / T.
 // ---------------------------------------------------------------------------
 
-// Default T: 10 us. Override with PARCAGPU_BLOCKING_THRESHOLD_US (0 = all).
+// Default T: 10 us. Override with PARCAGPU_BLOCKING_THRESHOLD_US (0 = all),
+// and the agent's blocking_threshold_us over that (blockingThresholdNs).
 static constexpr uint64_t kBlockingDefaultThresholdNs = 10'000;
 std::atomic<uint64_t> g_blockingThresholdNs{kBlockingDefaultThresholdNs};
+
+// T in effect: read on every reported call, so an agent's change applies at
+// the next one.
+static inline uint64_t blockingThresholdNs() {
+  if (const uint32_t us = parcagpu::agentCtlBlockingThresholdUs())
+    return uint64_t(us) * 1000;
+  return g_blockingThresholdNs.load(std::memory_order_relaxed);
+}
+
+// Whether to time blocking calls: a consumer is attached to
+// cuda_blocking_call, or PARCAGPU_DEBUG is set (which logs each call kept,
+// with its weight; test-agent-ctl reads that).
+static inline bool blockingTimed() {
+  return PARCAGPU_CUDA_BLOCKING_CALL_ENABLED() || debug_enabled;
+}
 
 // Blocking-class callbacks: the single source for both the enable list and
 // the isBlockingCb() switch. Proton's setRuntimeCallbacks/setLaunchCallbacks
@@ -451,7 +467,7 @@ static void blockingEnter(CUpti_CallbackDomain domain, uint32_t correlationId) {
   auto &ss = g_blockingState;
   // Track runtime nesting even when detached, so attaching mid-call
   // can't report the nested driver call on its own.
-  uint64_t now = PARCAGPU_CUDA_BLOCKING_CALL_ENABLED() ? nowNs() : 0;
+  uint64_t now = blockingTimed() ? nowNs() : 0;
   if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
     ss.runtimeActive = true;
     ss.runtimeCorrelationId = correlationId;
@@ -504,7 +520,7 @@ static void blockingExit(CUpti_CallbackDomain domain, CUpti_CallbackId cbid,
   if (startNs == 0 || endNs == 0 || endNs < startNs)
     return;
 
-  const uint64_t threshold = g_blockingThresholdNs.load(std::memory_order_relaxed);
+  const uint64_t threshold = blockingThresholdNs();
   const uint64_t duration = endNs - startNs;
   uint64_t weight = duration;
   if (duration < threshold) {
@@ -1346,7 +1362,7 @@ private:
 
       // Take the blocking-call end time before the PC-sampling drain below.
       const uint64_t blockingEndNs =
-          isBlocking && PARCAGPU_CUDA_BLOCKING_CALL_ENABLED() ? nowNs() : 0;
+          isBlocking && blockingTimed() ? nowNs() : 0;
 
       // EXIT: while this callback's context has a window open, drain
       // CUPTI's host staging buffer on every CUDA API EXIT — not just launch

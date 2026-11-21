@@ -14,7 +14,7 @@
 
 #define PARCAGPU_CTL_CONSUMER "parcagpu"
 // 1: PC sampling and launch rate limits. 2: features. 3: pc_hw_buffer_mb,
-// metadata_refresh_ms.
+// metadata_refresh_ms, blocking_threshold_us.
 #define PARCAGPU_CTL_SCHEMA_VERSION 3
 #define PARCAGPU_CTL_MAX_DEVICES 16
 // The config's size in 32-bit words, room for knobs to come included.
@@ -62,11 +62,21 @@ struct parcagpu_ctl_config {
   // Not reported in the state. Schema version 3.
   uint32_t metadata_refresh_ms;
 
+  // cuda_blocking_call threshold T, us (as PARCAGPU_BLOCKING_THRESHOLD_US):
+  // 0 = environment/default (10 us), else [1,1000000]. Calls blocked at least
+  // T are reported with weight = duration, shorter ones with probability
+  // duration/T and weight T. The environment's 0 (every call) has no
+  // equivalent here; 1 differs from it only for calls under 1 us. Takes
+  // effect at the next blocking call. Stored, and without effect, while
+  // PARCAGPU_FEATURE_BLOCKING_CALLS is off. Not reported in the state.
+  // Schema version 3.
+  uint32_t blocking_threshold_us;
+
   // Knobs to come. Each is 0 = default, so an agent that doesn't know one
   // leaves it alone; a process ignores those it doesn't know, so an agent
   // sets one only for a process whose schema_version (procctl's header)
   // has it. The config's size never changes.
-  uint32_t reserved[PARCAGPU_CTL_CONFIG_WORDS - 9];
+  uint32_t reserved[PARCAGPU_CTL_CONFIG_WORDS - 10];
 };
 
 // kernel_stats: exact kernel execution counts and durations. Without an
