@@ -55,10 +55,21 @@ struct AgentConfig {
   uint32_t gapMs = 0;
   uint32_t rateLimit = 0; // launch probe rate limits; 0 = the environment's
   uint32_t graphRateLimit = 0;
-  uint32_t features = 0; // PARCAGPU_FEATURE_*
+  uint32_t features = 0;   // PARCAGPU_FEATURE_*
+  uint32_t hwBufferMB = 0; // PC sampling hardware buffer, MB; 0 = environment's
+  uint32_t metadataRefreshMs = 0; // 0 = the environment's
+  uint32_t blockingThresholdUs = 0; // 0 = the environment's
 };
 AgentConfig agentCtlConfig();
 uint64_t agentCtlGeneration();
+
+// The agent's metadata refresh period, ms; 0 while inactive or not set (the
+// environment decides then). One atomic load.
+uint32_t agentCtlMetadataRefreshMs();
+
+// The agent's cuda_blocking_call threshold, us; 0 while inactive or not set
+// (the environment decides then). One atomic load.
+uint32_t agentCtlBlockingThresholdUs();
 
 // Whether ctx may PC sample: the agent's configuration if active, else
 // envDefault.
@@ -75,6 +86,10 @@ void agentCtlSetEnvFeatures(uint32_t features);
 // The environment's launch probe rate limits, reported as in effect while the
 // agent sets none.
 void agentCtlSetEnvRateLimits(uint32_t rateLimit, uint32_t graphRateLimit);
+
+// The environment's PC sampling hardware buffer size, MB (0 = CUPTI's
+// default), reported as in effect while the agent sets none.
+void agentCtlSetEnvHWBuffer(uint32_t mb);
 
 // Reported state, per device: pc_capable, and for ctx's device its PC
 // sampling state (PARCAGPU_PC_*) and applied sampling factor.

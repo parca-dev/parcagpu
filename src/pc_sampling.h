@@ -71,8 +71,9 @@ struct ConfigureData {
   }
 
   // factor: sampling period (2^factor cycles); 0 = PARCAGPU_SAMPLING_FACTOR
-  // or CUPTI's default.
-  void initialize(CUcontext context, uint32_t factor);
+  // or CUPTI's default. hwBufferMB: hardware buffer size, MB; 0 =
+  // PARCAGPU_PC_HW_BUFFER_MB or CUPTI's default.
+  void initialize(CUcontext context, uint32_t factor, uint32_t hwBufferMB);
 
   CUpti_PCSamplingConfigurationInfo configureStallReasons();
   CUpti_PCSamplingConfigurationInfo configureSamplingPeriod(uint32_t factor);
@@ -96,7 +97,7 @@ struct ConfigureData {
   uint32_t requestedFactor{}; // the factor initialize() was given
   uint32_t numStallReasons{};
   uint32_t numValidStallReasons{};
-  int hardwareBufferMB{}; // PARCAGPU_PC_HW_BUFFER_MB; 0 = CUPTI default
+  uint32_t hardwareBufferMB{}; // set up with (pcHardwareBufferMB); 0 = CUPTI's
   char **stallReasonNames{};
   uint32_t *stallReasonIndices{};
   std::map<size_t, size_t> stallReasonIndexToMetricIndex{};
@@ -125,8 +126,8 @@ public:
   bool envSampling = false;
 
   // Enables and configures PC sampling on a new context (not started). factor
-  // as for ConfigureData::initialize.
-  void initialize(CUcontext context, uint32_t factor);
+  // and hwBufferMB as for ConfigureData::initialize.
+  void initialize(CUcontext context, uint32_t factor, uint32_t hwBufferMB);
 
   // Start PC sampling on `context` — its kernels become serialized until
   // stop(context). Contexts are independent: CUPTI supports one sampled
@@ -149,8 +150,10 @@ public:
   // enables and configures it if it isn't yet (under agent control, contexts
   // are set up only once granted), re-arms it if it was unavailable or failed
   // (once per configuration gen; only when `agent`, as a grant), and
-  // re-configures it if `factor` changed. Skipped while it samples.
-  void prepare(CUcontext context, uint32_t factor, uint64_t gen, bool agent);
+  // re-configures it if `factor` or the hardware buffer size (hwBufferMB as
+  // for ConfigureData::initialize) changed. Skipped while it samples.
+  void prepare(CUcontext context, uint32_t factor, uint32_t hwBufferMB,
+               uint64_t gen, bool agent);
 
   // Applies an agent configuration change: commit() under the sampling lock,
   // then stops (and drains) every context it no longer allows, and disables
@@ -281,6 +284,14 @@ private:
 
 // Fire the error USDT probe. Callable from any translation unit.
 void fireError(int32_t code, const char *message, const char *component);
+
+// Largest PC sampling hardware buffer accepted, MB (agent configuration and
+// PARCAGPU_PC_HW_BUFFER_MB): 8x CUPTI's 512 MB default.
+constexpr uint32_t kMaxPCHardwareBufferMB = 4096;
+
+// The PC sampling hardware buffer size to set up a context with, MB: agentMB
+// if not 0, else PARCAGPU_PC_HW_BUFFER_MB; 0 = leave CUPTI's default.
+uint32_t pcHardwareBufferMB(uint32_t agentMB);
 
 } // namespace parcagpu
 
