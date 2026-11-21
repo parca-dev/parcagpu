@@ -283,10 +283,12 @@ static uint32_t __pc_period[MOCK_MAX_CTX + 1];
 // tests that watch it from outside the process: for each context index i
 // (0..MOCK_MAX_CTX), uint32 [2i] = sampling now, [2i+1] = starts so far;
 // then bad starts, bad stops, and cuptiGetContextId calls; then, per context
-// index, whether PC sampling is enabled.
+// index, whether PC sampling is enabled; then, per context index, the
+// hardware buffer size set, MB (0 = not set since enabled).
 static uint32_t *__pc_state_file;
 #define MOCK_PC_ENABLED_WORD (2 * (MOCK_MAX_CTX + 1) + 3)
-#define MOCK_PC_STATE_WORDS (MOCK_PC_ENABLED_WORD + MOCK_MAX_CTX + 1)
+#define MOCK_PC_HWBUF_WORD (MOCK_PC_ENABLED_WORD + MOCK_MAX_CTX + 1)
+#define MOCK_PC_STATE_WORDS (MOCK_PC_HWBUF_WORD + MOCK_MAX_CTX + 1)
 
 static void __pc_state_enabled(CUcontext ctx, uint32_t on);
 
@@ -339,6 +341,12 @@ static void __pc_state_enabled(CUcontext ctx, uint32_t on) {
                          on, __ATOMIC_RELEASE);
 }
 
+static void __pc_state_hwbuf(CUcontext ctx, uint32_t mb) {
+    if (__pc_state_file)
+        __atomic_store_n(&__pc_state_file[MOCK_PC_HWBUF_WORD + __mock_ctx_index(ctx)],
+                         mb, __ATOMIC_RELEASE);
+}
+
 // Exported: test_cupti_prof ends in _exit(), which skips destructors, so the
 // harness calls this explicitly.
 void __mock_pc_report(void) {
@@ -360,6 +368,7 @@ CUptiResult cuptiPCSamplingEnable(CUpti_PCSamplingEnableParams *params) {
 CUptiResult cuptiPCSamplingDisable(CUpti_PCSamplingDisableParams *params) {
     __pc_period[__mock_ctx_index(params->ctx)] = 0;
     __pc_state_enabled(params->ctx, 0);
+    __pc_state_hwbuf(params->ctx, 0);
     fprintf(stderr, "[MOCK_CUPTI] cuptiPCSamplingDisable()\n");
     return CUPTI_SUCCESS;
 }
@@ -431,6 +440,11 @@ CUptiResult cuptiPCSamplingSetConfigurationAttribute(
             CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD)
             __pc_period[__mock_ctx_index(params->ctx)] =
                 info->attributeData.samplingPeriodData.samplingPeriod;
+        else if (info->attributeType ==
+                 CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_HARDWARE_BUFFER_SIZE)
+            __pc_state_hwbuf(params->ctx,
+                             (uint32_t)(info->attributeData.hardwareBufferSizeData
+                                            .hardwareBufferSize >> 20));
     }
     fprintf(stderr, "[MOCK_CUPTI] cuptiPCSamplingSetConfigurationAttribute()\n");
     return CUPTI_SUCCESS;
