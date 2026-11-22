@@ -1,12 +1,13 @@
 // Copyright 2026 The Parca Authors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "pc_sampling.h"
 #include "Driver/GPU/CudaApi.h"
 #include "Driver/GPU/CuptiApi.h"
 #include "agent_ctl.h"
+#include "log.h"
 #include "parcagpu_ctl.h"
 #include "pc_gate.h"
-#include "pc_sampling.h"
 #include "probes.h"
 #include <algorithm>
 #include <cstdio>
@@ -15,6 +16,10 @@
 #include <memory>
 #include <stdexcept>
 #include <tuple>
+
+namespace {
+constexpr const char *kLogComponent = "pc_sampling";
+} // namespace
 
 // Proton's CUPTI dispatch table has no getter for PC sampling attributes;
 // declare one here (same macro, same lazily-dlopen'd libcupti) rather than
@@ -107,7 +112,8 @@ bool startPCSampling(CUcontext context) {
   };
   auto ret = proton::cupti::pcSamplingStart<false>(&params);
   if (ret != CUPTI_SUCCESS) {
-    DEBUG_PRINTF("cuptiPCSamplingStart failed: %d\n", ret);
+    PLOG_WARN(ret, kLogComponent, "cuptiPCSamplingStart failed: %d (ctx=%p)",
+              ret, context);
     return false;
   }
   return true;
@@ -121,7 +127,8 @@ bool stopPCSampling(CUcontext context) {
   };
   auto ret = proton::cupti::pcSamplingStop<false>(&params);
   if (ret != CUPTI_SUCCESS) {
-    DEBUG_PRINTF("cuptiPCSamplingStop failed: %d\n", ret);
+    PLOG_WARN(ret, kLogComponent, "cuptiPCSamplingStop failed: %d (ctx=%p)",
+              ret, context);
     return false;
   }
   return true;
@@ -137,7 +144,8 @@ void disablePCSampling(CUcontext context) {
   // with C++ EH, so a throw here would propagate up and abort the process.
   auto ret = proton::cupti::pcSamplingDisable<false>(&params);
   if (ret != CUPTI_SUCCESS) {
-    DEBUG_PRINTF("cuptiPCSamplingDisable failed: %d (ctx=%p)\n", ret, context);
+    PLOG_WARN(ret, kLogComponent, "cuptiPCSamplingDisable failed: %d (ctx=%p)",
+              ret, context);
   }
 }
 
@@ -153,9 +161,12 @@ CUptiResult getPCSamplingData(CUcontext context,
       /*pcSamplingData=*/pcSamplingData,
   };
   auto result = proton::cupti::pcSamplingGetData<false>(&params);
-  if (result != CUPTI_SUCCESS) {
-    DEBUG_PRINTF("cuptiPCSamplingGetData failed: error %d (ctx=%p)\n", result,
-                 context);
+  // The caller reports CUPTI_ERROR_UNKNOWN and CUPTI_ERROR_OUT_OF_MEMORY,
+  // once per context.
+  if (result != CUPTI_SUCCESS && result != CUPTI_ERROR_UNKNOWN &&
+      result != CUPTI_ERROR_OUT_OF_MEMORY) {
+    PLOG_WARN(result, kLogComponent,
+              "cuptiPCSamplingGetData failed: %d (ctx=%p)", result, context);
   }
   return result;
 }
@@ -224,12 +235,14 @@ uint32_t getGPUSamplingFrequency() {
     int factor = atoi(sampling_factor_env);
     if (factor >= 5 && factor <= 31) {
       samplingPeriod = factor;
-      DEBUG_PRINTF("Using PARCAGPU_SAMPLING_FACTOR=%u\n", samplingPeriod);
+      PLOG_DEBUG(kLogComponent, "Using PARCAGPU_SAMPLING_FACTOR=%u",
+                 samplingPeriod);
     } else if (factor != 0) {
-      fprintf(stderr,
-              "[PARCAGPU] Warning: PARCAGPU_SAMPLING_FACTOR=%d out of range "
-              "[5,31], using default %u\n",
-              factor, PARCAGPU_DEFAULT_FREQUENCY);
+      // env_config warns about it.
+      PLOG_DEBUG(kLogComponent,
+                 "PARCAGPU_SAMPLING_FACTOR=%d out of range [5,31], using "
+                 "default %u",
+                 factor, PARCAGPU_DEFAULT_FREQUENCY);
     }
   }
   return samplingPeriod;
@@ -248,8 +261,9 @@ uint32_t readSamplingPeriod(CUcontext context) {
   params.pPCSamplingConfigurationInfo = &info;
   auto r = proton::cupti::pcSamplingGetConfigurationAttribute<false>(&params);
   if (r != CUPTI_SUCCESS || info.attributeStatus != CUPTI_SUCCESS) {
-    DEBUG_PRINTF("Reading PC sampling period failed: %d/%d (ctx=%p)\n", r,
-                 info.attributeStatus, context);
+    PLOG_DEBUG(kLogComponent,
+               "Reading PC sampling period failed: %d/%d (ctx=%p)", r,
+               info.attributeStatus, context);
     return 0;
   }
   return info.attributeData.samplingPeriodData.samplingPeriod;
@@ -432,8 +446,8 @@ void ConfigureData::initialize(CUcontext context, uint32_t factor,
   this->requestedFactor = factor;
   proton::cupti::getContextId<true>(context, &contextId);
 
-  DEBUG_PRINTF("Initializing PC sampling for context %p (id %u)\n", context,
-               contextId);
+  PLOG_DEBUG(kLogComponent, "Initializing PC sampling for context %p (id %u)",
+             context, contextId);
 
   hardwareBufferMB = pcHardwareBufferMB(hwBufferMB);
 
@@ -459,9 +473,9 @@ void ConfigureData::initialize(CUcontext context, uint32_t factor,
   // default, same as unset). Lets ops re-enable / tune it on GPUs where the
   // larger buffer helps busy workloads.
   if (hardwareBufferMB > 0) {
-    DEBUG_PRINTF("[PARCAGPU] Forcing PC hardware buffer = %u MB%s\n",
-                 hardwareBufferMB,
-                 hwBufferMB ? " (agent)" : " (PARCAGPU_PC_HW_BUFFER_MB)");
+    PLOG_DEBUG(kLogComponent, "Forcing PC hardware buffer = %u MB%s",
+               hardwareBufferMB,
+               hwBufferMB ? " (agent)" : " (PARCAGPU_PC_HW_BUFFER_MB)");
     configurationInfos.emplace_back(configureHardwareBufferSize());
   }
   // Sampling period: the agent's factor if it set one, else
@@ -475,7 +489,7 @@ void ConfigureData::initialize(CUcontext context, uint32_t factor,
   if (factor == 0)
     factor = getGPUSamplingFrequency();
   if (factor != 0) {
-    DEBUG_PRINTF("[PARCAGPU] Setting PC sampling period = %u\n", factor);
+    PLOG_DEBUG(kLogComponent, "Setting PC sampling period = %u", factor);
     configurationInfos.emplace_back(configureSamplingPeriod(factor));
   }
 
@@ -487,8 +501,9 @@ void ConfigureData::initialize(CUcontext context, uint32_t factor,
   this->outputData =
       allocPCSamplingData(DataBufferPCCount, numValidStallReasons);
 
-  DEBUG_PRINTF("PC sampling configured with %u stall reasons (%u valid)\n",
-               numStallReasons, numValidStallReasons);
+  PLOG_DEBUG(kLogComponent,
+             "PC sampling configured with %u stall reasons (%u valid)",
+             numStallReasons, numValidStallReasons);
 }
 
 // GPUPCSampling implementation
@@ -503,7 +518,9 @@ bool PCSampling::isSupported(bool agentControl) {
   // PARCAGPU_SAMPLING_FACTOR (it has a default). Under agent control,
   // contexts are set up for it so that the agent can turn it on.
   if (!envRequested() && !agentControl) {
-    DEBUG_PRINTF("PC sampling disabled (set PARCAGPU_PC_SAMPLING_RATE to enable)\n");
+    PLOG_DEBUG(
+        kLogComponent,
+        "PC sampling disabled (set PARCAGPU_PC_SAMPLING_RATE to enable)");
     return false;
   }
 
@@ -515,12 +532,9 @@ bool PCSampling::isSupported(bool agentControl) {
     int major = driverVersion / 1000;
     int minor = (driverVersion % 1000) / 10;
     int patch = driverVersion % 10;
-    DEBUG_PRINTF("PC sampling not supported: CUDA driver version %d.%d.%d < "
-                 "required 12.8.1\n",
-                 major, minor, patch);
-    fireError(driverVersion,
-              "CUDA driver version too low for PC sampling (need >= 12.8.1)",
-              "pc_sampling");
+    PLOG_WARN(driverVersion, kLogComponent,
+              "PC sampling not supported: CUDA driver %d.%d.%d < 12.8.1", major,
+              minor, patch);
     return false;
   }
 
@@ -534,13 +548,10 @@ bool PCSampling::isSupported(bool agentControl) {
        CUPTI_API_VERSION >= CUPTI_CUDA12_4_VERSION) ||
       (cuptiVersion >= CUPTI_CUDA12_4_VERSION &&
        CUPTI_API_VERSION < CUPTI_CUDA12_4_VERSION)) {
-    DEBUG_PRINTF(
-        "PC sampling disabled: CUPTI API version %d and driver version %d "
-        "are incompatible across the 12.4 (v22) ABI boundary\n",
-        CUPTI_API_VERSION, cuptiVersion);
-    fireError((int32_t)cuptiVersion,
-              "CUPTI API/driver version mismatch (12.4 ABI boundary)",
-              "pc_sampling");
+    PLOG_WARN((int32_t)cuptiVersion, kLogComponent,
+              "PC sampling disabled: CUPTI API version %d and runtime CUPTI "
+              "v%u are incompatible across the 12.4 (v22) ABI boundary",
+              CUPTI_API_VERSION, cuptiVersion);
     return false;
   }
 
@@ -556,8 +567,9 @@ bool PCSampling::isSupported(bool agentControl) {
   int major = driverVersion / 1000;
   int minor = (driverVersion % 1000) / 10;
   int patch = driverVersion % 10;
-  DEBUG_PRINTF("PC sampling supported: CUDA %d.%d.%d, CUPTI v%u (API v%d)\n",
-               major, minor, patch, cuptiVersion, CUPTI_API_VERSION);
+  PLOG_DEBUG(kLogComponent,
+             "PC sampling supported: CUDA %d.%d.%d, CUPTI v%u (API v%d)", major,
+             minor, patch, cuptiVersion, CUPTI_API_VERSION);
   return true;
 }
 
@@ -600,15 +612,12 @@ void PCSampling::initialize(CUcontext context, uint32_t factor,
         auto result =
             proton::cupti::pcSamplingEnable<false>(&enableParams);
         if (result != CUPTI_SUCCESS) {
-          DEBUG_PRINTF(
-              "Failed to enable PC sampling for context %u: CUPTI error %d\n"
-              "This may be a permission issue. See:\n"
-              "https://developer.nvidia.com/nvidia-development-tools-solutions-"
-              "err_nvgpuctrperm-permission-issue-performance-counters\n",
-              contextId, result);
-          fireError((int32_t)result,
-                    "Failed to enable PC sampling (possible permission issue)",
-                    "pc_sampling");
+          PLOG_WARN(result, kLogComponent,
+                    "PC sampling unavailable on context %u: "
+                    "cuptiPCSamplingEnable failed: %d. This may be a "
+                    "permission issue (needs root, CAP_SYS_ADMIN or "
+                    "NVreg_RestrictProfilingToAdminUsers=0)",
+                    contextId, result);
           contextFailed.insert(contextId);
           agentCtlSetPCState(context, PARCAGPU_PC_UNAVAILABLE);
           return;
@@ -621,10 +630,10 @@ void PCSampling::initialize(CUcontext context, uint32_t factor,
           // E.g. a CUPTI older than the driver (a container's CUDA 12
           // libraries on a CUDA 13 host): don't leave it enabled, unusable
           // and owning the GPU's sampler.
-          DEBUG_PRINTF("Configuring PC sampling failed for context %u: %s\n",
-                       contextId, e.what());
-          fireError(0, "configuring PC sampling failed; disabled",
-                    "pc_sampling");
+          PLOG_WARN(0, kLogComponent,
+                    "PC sampling unavailable on context %u: configuring it "
+                    "failed: %s",
+                    contextId, e.what());
           disablePCSampling(context);
           contextIdToConfigureData.erase(contextId);
           contextFailed.insert(contextId);
@@ -643,9 +652,9 @@ void PCSampling::initialize(CUcontext context, uint32_t factor,
 
         contextInitialized.insert(contextId);
         initializedContextIds.push_back(contextId);
-        DEBUG_PRINTF(
-            "PC sampling initialized (serialized mode) for context %u\n",
-            contextId);
+        PLOG_INFO(kLogComponent,
+                  "PC sampling initialized (serialized mode) for context %u",
+                  contextId);
 
         // Capture per-device config so the agent can convert PC sample counts
         // to nanoseconds. cuCtxGetDevice reads the current context; the
@@ -669,9 +678,10 @@ void PCSampling::initialize(CUcontext context, uint32_t factor,
         // the (correct) raw sample counts and only lacks the ns conversion.
         const uint32_t applied = readSamplingPeriod(context);
         if (applied == 0) {
-          fireError(0, "could not read PC sampling period; gpu_config not "
-                       "emitted",
-                    "pc_sampling");
+          PLOG_WARN(0, kLogComponent,
+                    "could not read the PC sampling period of device %u; "
+                    "gpu_config not emitted",
+                    (uint32_t)dev);
           return;
         }
         const uint64_t emittedNs = emitMetadataNowNs();
@@ -731,8 +741,8 @@ bool PCSampling::start(CUcontext context, uint64_t gapNs, uint64_t windowNs) {
   numSampling.fetch_add(1, std::memory_order_release);
   windowStartNs[context] = emitMetadataNowNs();
   gate::own(context, windowNs); // with the gate still closed
-  DEBUG_PRINTF("PC sampling started on ctx=%p (kernels serialized)\n",
-               context);
+  PLOG_DEBUG(kLogComponent,
+             "PC sampling started on ctx=%p (kernels serialized)", context);
   return true;
 }
 
@@ -753,8 +763,8 @@ bool PCSampling::stop(CUcontext context, uint64_t closeTimeoutNs,
     lastStopNs[context] = emitMetadataNowNs();
     gate::disown(context);
   }
-  DEBUG_PRINTF("PC sampling stopped on ctx=%p (kernels concurrent)\n",
-               context);
+  PLOG_DEBUG(kLogComponent,
+             "PC sampling stopped on ctx=%p (kernels concurrent)", context);
   // Drain data collected during this window (outside pcSamplingMutex: see
   // drainMutex's lock order).
   collectData(context);
@@ -786,8 +796,8 @@ void PCSampling::prepare(CUcontext context, uint32_t factor,
     if (!agentCtlAllows(context, envSampling) ||
         (captureFree && !captureFree()))
       return;
-    DEBUG_PRINTF("PC sampling: setting up ctx=%p (factor %u)\n", context,
-                 factor);
+    PLOG_DEBUG(kLogComponent, "PC sampling: setting up ctx=%p (factor %u)",
+               context, factor);
     initialize(context, factor, hwBufferMB);
     return;
   }
@@ -824,8 +834,8 @@ void PCSampling::prepare(CUcontext context, uint32_t factor,
     contextRearmGen[contextId] = gen;
     contextUnavailable.erase(contextId);
   }
-  DEBUG_PRINTF("PC sampling: %s ctx=%p (factor %u)\n",
-               rearm ? "re-arming" : "re-configuring", context, factor);
+  PLOG_DEBUG(kLogComponent, "PC sampling: %s ctx=%p (factor %u)",
+             rearm ? "re-arming" : "re-configuring", context, factor);
   finalize(context);
   contextNeedsReset.erase(contextId);
   initialize(context, factor, hwBufferMB);
@@ -870,7 +880,8 @@ bool PCSampling::applyAgentConfig(const std::function<void()> &commit) {
     finalize(ctx);
     if (pushed)
       agentCtlPopContext();
-    DEBUG_PRINTF("PC sampling disabled on ctx=%p (agent control)\n", ctx);
+    PLOG_DEBUG(kLogComponent, "PC sampling disabled on ctx=%p (agent control)",
+               ctx);
   }
   return true;
 }
@@ -894,7 +905,8 @@ std::vector<CUcontext> PCSampling::stopDisallowedLocked() {
     if (pushed)
       agentCtlPopContext();
     stopped.push_back(ctx);
-    DEBUG_PRINTF("PC sampling stopped on ctx=%p (agent control)\n", ctx);
+    PLOG_DEBUG(kLogComponent, "PC sampling stopped on ctx=%p (agent control)",
+               ctx);
   }
   return stopped;
 }
@@ -926,8 +938,8 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData) {
     return;
   }
 
-  DEBUG_PRINTF("Processing %zu PCs (remaining: %zu)\n",
-               pcSamplingData->totalNumPcs, pcSamplingData->remainingNumPcs);
+  PLOG_TRACE(kLogComponent, "Processing %zu PCs (remaining: %zu)",
+             pcSamplingData->totalNumPcs, pcSamplingData->remainingNumPcs);
 
   // Count distinct (PC, stallReason) pairs with non-zero samples — that is
   // the unit the agent sees as a "sample" record on the receive side, and the
@@ -953,7 +965,7 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData) {
     }
     batchSamples += distinctPairs;
 
-    if (debug_enabled) {
+    if (log::stderrDebug()) {
       auto *cubinData = getCubinData(pcData->cubinCrc);
       auto key =
           CubinData::LineInfoKey{pcData->functionIndex, pcData->pcOffset};
@@ -969,10 +981,10 @@ void PCSampling::processPCSamplingData(ConfigureData *configureData) {
       std::string fullPath = lineInfo.fileName.size()
                                  ? lineInfo.dirName + "/" + lineInfo.fileName
                                  : "";
-      DEBUG_PRINTF("  [%zu] func=%s pc=0x%lx total=%lu stalled=%lu %s:%u\n", i,
-                   lineInfo.functionName.c_str(), pcData->pcOffset,
-                   totalSamples, stalledSamples, fullPath.c_str(),
-                   lineInfo.lineNumber);
+      PLOG_TRACE(kLogComponent,
+                 "  [%zu] func=%s pc=0x%lx total=%lu stalled=%lu %s:%u", i,
+                 lineInfo.functionName.c_str(), pcData->pcOffset, totalSamples,
+                 stalledSamples, fullPath.c_str(), lineInfo.lineNumber);
     }
   }
   recordPCSamples(batchSamples);
@@ -1042,8 +1054,8 @@ void PCSampling::emitMetadata() {
   const bool refresh = (nowNs - lastRefresh) > refreshPeriodNs;
   if (refresh) {
     lastRefreshNs.store(nowNs, std::memory_order_relaxed);
-    DEBUG_PRINTF("[PARCAGPU] metadata refresh (period %lu ms)\n",
-                 (unsigned long)(refreshPeriodNs / 1000000));
+    PLOG_DEBUG(kLogComponent, "metadata refresh (period %lu ms)",
+               (unsigned long)(refreshPeriodNs / 1000000));
   }
 
   // Stall reason map (small, ~4KB) — no per-entry state needed.
@@ -1102,17 +1114,19 @@ void PCSampling::collectData(CUcontext context) {
 
   if (!contextInitialized.contain(contextId) ||
       contextUnavailable.contain(contextId)) {
-    DEBUG_PRINTF("Context %u not initialized or unavailable, skipping data "
-                 "collection\n",
-                 contextId);
+    PLOG_TRACE(kLogComponent,
+               "Context %u not initialized or unavailable, skipping data "
+               "collection",
+               contextId);
     return;
   }
 
   auto *configureData = getConfigureData(contextId);
-  DEBUG_PRINTF("Collecting PC sampling data for context %u (cfg total=%zu "
-               "remaining=%zu)\n",
-               contextId, configureData->pcSamplingData.totalNumPcs,
-               configureData->pcSamplingData.remainingNumPcs);
+  PLOG_TRACE(kLogComponent,
+             "Collecting PC sampling data for context %u (cfg total=%zu "
+             "remaining=%zu)",
+             contextId, configureData->pcSamplingData.totalNumPcs,
+             configureData->pcSamplingData.remainingNumPcs);
 
   // Drain all available PCs in a loop. Each getData call returns at most
   // DataBufferPCCount (1024) PCs; a single sampling window can produce
@@ -1120,12 +1134,13 @@ void PCSampling::collectData(CUcontext context) {
   // buffers, which eventually causes CUPTI_ERROR_OUT_OF_MEMORY (error 8).
   do {
     CUptiResult res = getPCSamplingData(context, &configureData->outputData);
-    DEBUG_PRINTF("getData: res=%d output total=%zu remaining=%zu "
-                 "cfg total=%zu remaining=%zu\n",
-                 res, configureData->outputData.totalNumPcs,
-                 configureData->outputData.remainingNumPcs,
-                 configureData->pcSamplingData.totalNumPcs,
-                 configureData->pcSamplingData.remainingNumPcs);
+    PLOG_TRACE(kLogComponent,
+               "getData: res=%d output total=%zu remaining=%zu "
+               "cfg total=%zu remaining=%zu",
+               res, configureData->outputData.totalNumPcs,
+               configureData->outputData.remainingNumPcs,
+               configureData->pcSamplingData.totalNumPcs,
+               configureData->pcSamplingData.remainingNumPcs);
     if (res == CUPTI_SUCCESS) {
       processPCSamplingData(configureData);
       continue;
@@ -1137,13 +1152,11 @@ void PCSampling::collectData(CUcontext context) {
       // and don't start this context again.
       if (!contextUnavailable.contain(contextId)) {
         contextUnavailable.insert(contextId);
-        DEBUG_PRINTF("PC sampling unavailable on ctx=%p: GetData returned "
-                     "CUPTI_ERROR_UNKNOWN (GPU likely sampled by another "
-                     "process); disabling for this context\n", context);
-        fireError((int32_t)res,
-                  "PC sampling GetData failed (GPU likely sampled by another "
+        PLOG_WARN(res, kLogComponent,
+                  "PC sampling unavailable on context %u: GetData returned "
+                  "CUPTI_ERROR_UNKNOWN (GPU likely sampled by another "
                   "process); disabled for this context",
-                  "pc_sampling");
+                  contextId);
         agentCtlSetPCState(context, PARCAGPU_PC_UNAVAILABLE);
       }
       // Its window ends as usual (stop(), with the gate closed: not here,
@@ -1158,8 +1171,11 @@ void PCSampling::collectData(CUcontext context) {
       // needs the gate closed and so can't happen here, under drainMutex:
       // prepare() does it before the context's next window.
       if (!contextNeedsReset.contain(contextId)) {
-        DEBUG_PRINTF("CUPTI_ERROR_OUT_OF_MEMORY on ctx=%p: resetting before "
-                     "its next window\n", context);
+        PLOG_WARN(res, kLogComponent,
+                  "PC sampling GetData on context %u: "
+                  "CUPTI_ERROR_OUT_OF_MEMORY, samples lost; resetting before "
+                  "its next window",
+                  contextId);
         contextNeedsReset.insert(contextId);
       }
     }
@@ -1172,13 +1188,15 @@ void PCSampling::collectAllData() {
   for (auto contextId : initializedContextIds) {
     auto result = contextIdToConfigureData.find(contextId);
     if (!result) {
-      DEBUG_PRINTF("Context %u in initializedContextIds but not in map, "
-                   "skipping\n",
-                   contextId);
+      PLOG_DEBUG(kLogComponent,
+                 "Context %u in initializedContextIds but not in map, "
+                 "skipping",
+                 contextId);
       continue;
     }
     auto *configureData = &result->get();
-    DEBUG_PRINTF("Draining PC sampling data for context %u\n", contextId);
+    PLOG_TRACE(kLogComponent, "Draining PC sampling data for context %u",
+               contextId);
     // Fetch and drain all pending data from CUPTI.
     do {
       if (getPCSamplingData(configureData->context,
@@ -1208,7 +1226,7 @@ bool PCSampling::finalize(CUcontext context) {
   // from racing with us (it iterates initializedContextIds under this lock).
   std::lock_guard<std::mutex> lock(contextMutex);
 
-  DEBUG_PRINTF("Finalizing PC sampling for context %p\n", context);
+  PLOG_DEBUG(kLogComponent, "Finalizing PC sampling for context %p", context);
 
   // Remove from iteration list first so collectAllData won't touch this context
   initializedContextIds.erase(std::remove(initializedContextIds.begin(),
@@ -1253,8 +1271,8 @@ void PCSampling::loadModule(const char *cubin, size_t cubinSize,
   if (cubinCrcToCubinData.contain(cubinCrc)) {
     // Increment reference count
     cubinCrcToCubinData[cubinCrc].second++;
-    DEBUG_PRINTF("Module 0x%lx loaded (refcount=%zu)\n", cubinCrc,
-                 cubinCrcToCubinData[cubinCrc].second);
+    PLOG_DEBUG(kLogComponent, "Module 0x%lx loaded (refcount=%zu)", cubinCrc,
+               cubinCrcToCubinData[cubinCrc].second);
   } else {
     // New module — getCubinData after the contain() check so operator[]
     // doesn't auto-insert before we test.
@@ -1263,7 +1281,7 @@ void PCSampling::loadModule(const char *cubin, size_t cubinSize,
     cubinData->cubinSize = cubinSize;
     cubinData->cubin = cubin;
     cubinCrcToCubinData[cubinCrc].second = 1;
-    DEBUG_PRINTF("Module 0x%lx loaded (new)\n", cubinCrc);
+    PLOG_DEBUG(kLogComponent, "Module 0x%lx loaded (new)", cubinCrc);
     const uint64_t emittedNs = emitMetadataNowNs();
     fireCubinLoaded(cubinCrc, cubin, cubinSize);
     fireCubinLoadedFile(cubinCrc, cubin, cubinSize, path.c_str());
@@ -1283,10 +1301,11 @@ void PCSampling::unloadModule(const char *cubin, size_t cubinSize) {
   auto count = cubinCrcToCubinData[cubinCrc].second;
   if (count > 1) {
     cubinCrcToCubinData[cubinCrc].second = count - 1;
-    DEBUG_PRINTF("Module 0x%lx unloaded (refcount=%zu)\n", cubinCrc, count - 1);
+    PLOG_DEBUG(kLogComponent, "Module 0x%lx unloaded (refcount=%zu)", cubinCrc,
+               count - 1);
   } else {
     cubinCrcToCubinData.erase(cubinCrc);
-    DEBUG_PRINTF("Module 0x%lx unloaded (removed)\n", cubinCrc);
+    PLOG_DEBUG(kLogComponent, "Module 0x%lx unloaded (removed)", cubinCrc);
     fireCubinUnloaded(cubinCrc);
     {
       std::lock_guard<std::mutex> lock(contextMutex);

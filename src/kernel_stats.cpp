@@ -14,8 +14,12 @@
 #include <vector>
 
 #include "agent_ctl.h"
+#include "log.h"
 #include "parcagpu_ctl.h"
-#include "pc_sampling.h" // DEBUG_PRINTF
+
+namespace {
+constexpr const char *kLogComponent = "kernel_stats";
+} // namespace
 
 // Single call site for the probe (see the fireX wrappers in pc_sampling.cpp).
 __attribute__((noinline)) void
@@ -97,8 +101,8 @@ void fire(Interval &iv, uint32_t seq) {
         uint32_t(std::min<size_t>(kMaxEntriesPerFiring, ptrs.size() - off));
     fireKernelStats(&header, ptrs.data() + off, n);
   }
-  DEBUG_PRINTF("[PARCAGPU] kernel_stats: seq=%u entries=%zu\n", seq,
-               entries.size());
+  PLOG_DEBUG(kLogComponent, "kernel_stats: seq=%u entries=%zu", seq,
+             entries.size());
 }
 
 } // namespace

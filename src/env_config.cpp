@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "env_config.h"
-#include "pc_sampling.h" // DEBUG_PRINTF, fireError
-#include "probes.h"
+#include "log.h"
+#include "pc_sampling.h" // kMaxPCHardwareBufferMB
 
 #include <cstdlib>
 #include <cstring>
@@ -12,9 +12,12 @@ extern char **environ;
 
 namespace parcagpu {
 
+static constexpr const char *kComponent = "env_config";
+
 // Known PARCAGPU_* environment variables.
 static const char *knownVars[] = {
     "PARCAGPU_DEBUG",
+    "PARCAGPU_LOG_LEVEL",
     "PARCAGPU_RATE_LIMIT",
     "PARCAGPU_GRAPH_RATE_LIMIT",
     "PARCAGPU_SAMPLING_FACTOR",
@@ -56,21 +59,29 @@ void validateEnvVars() {
       size_t copyLen = nameLen < sizeof(nameBuf) - 1 ? nameLen : sizeof(nameBuf) - 1;
       std::memcpy(nameBuf, *ep, copyLen);
 
-      DEBUG_PRINTF("[PARCAGPU] Warning: unrecognized env var '%s'\n", nameBuf);
-      fireError(0, nameBuf, "env_config: unrecognized variable");
+      PLOG_WARN(0, kComponent, "unrecognized env var '%s'", nameBuf);
     }
   }
 
   // Validate specific variables.
   const char *val;
 
+  val = std::getenv("PARCAGPU_LOG_LEVEL");
+  if (val && !log::parseLevel(val)) {
+    PLOG_WARN(0, kComponent,
+              "PARCAGPU_LOG_LEVEL=%s invalid (debug, info, warn or error), "
+              "using info",
+              val);
+  }
+
   val = std::getenv("PARCAGPU_RATE_LIMIT");
   if (val) {
     double rate = std::atof(val);
     if (rate <= 0) {
-      DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_RATE_LIMIT=%s invalid "
-                   "(must be > 0), using default\n", val);
-      fireError(0, val, "env_config: PARCAGPU_RATE_LIMIT invalid");
+      PLOG_WARN(0, kComponent,
+                "PARCAGPU_RATE_LIMIT=%s invalid "
+                "(must be > 0), using default",
+                val);
     }
   }
 
@@ -78,9 +89,10 @@ void validateEnvVars() {
   if (val) {
     double rate = std::atof(val);
     if (rate <= 0) {
-      DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_GRAPH_RATE_LIMIT=%s invalid "
-                   "(must be > 0), using default\n", val);
-      fireError(0, val, "env_config: PARCAGPU_GRAPH_RATE_LIMIT invalid");
+      PLOG_WARN(0, kComponent,
+                "PARCAGPU_GRAPH_RATE_LIMIT=%s invalid "
+                "(must be > 0), using default",
+                val);
     }
   }
 
@@ -88,9 +100,10 @@ void validateEnvVars() {
   if (val) {
     int factor = std::atoi(val);
     if (factor != 0 && (factor < 5 || factor > 31)) {
-      DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_SAMPLING_FACTOR=%s out of "
-                   "range [0, 5-31], using default\n", val);
-      fireError(0, val, "env_config: PARCAGPU_SAMPLING_FACTOR out of range");
+      PLOG_WARN(0, kComponent,
+                "PARCAGPU_SAMPLING_FACTOR=%s out of "
+                "range [0, 5-31], using default",
+                val);
     }
   }
 
@@ -98,27 +111,29 @@ void validateEnvVars() {
   if (val) {
     double r = std::atof(val);
     if (r < 0.0) {
-      DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_PC_SAMPLING_RATE=%s "
-                   "invalid (must be >= 0), using default\n", val);
-      fireError(0, val,
-                "env_config: PARCAGPU_PC_SAMPLING_RATE invalid");
+      PLOG_WARN(0, kComponent,
+                "PARCAGPU_PC_SAMPLING_RATE=%s "
+                "invalid (must be >= 0), using default",
+                val);
     }
   }
 
   val = std::getenv("PARCAGPU_METADATA_REFRESH_MS");
   if (val && std::atol(val) <= 0) {
-    DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_METADATA_REFRESH_MS=%s invalid "
-                 "(must be > 0), using default\n", val);
-    fireError(0, val, "env_config: PARCAGPU_METADATA_REFRESH_MS invalid");
+    PLOG_WARN(0, kComponent,
+              "PARCAGPU_METADATA_REFRESH_MS=%s invalid "
+              "(must be > 0), using default",
+              val);
   }
 
   val = std::getenv("PARCAGPU_PC_HW_BUFFER_MB");
   if (val) {
     long mb = std::atol(val);
     if (mb < 0 || mb > (long)kMaxPCHardwareBufferMB) {
-      DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_PC_HW_BUFFER_MB=%s invalid "
-                   "(must be 0-%u), ignoring\n", val, kMaxPCHardwareBufferMB);
-      fireError(0, val, "env_config: PARCAGPU_PC_HW_BUFFER_MB invalid");
+      PLOG_WARN(0, kComponent,
+                "PARCAGPU_PC_HW_BUFFER_MB=%s invalid "
+                "(must be 0-%u), ignoring",
+                val, kMaxPCHardwareBufferMB);
     }
   }
 
@@ -126,9 +141,10 @@ void validateEnvVars() {
   if (val) {
     double us = std::atof(val);
     if (us < 0.0) {
-      DEBUG_PRINTF("[PARCAGPU] Warning: PARCAGPU_BLOCKING_THRESHOLD_US=%s "
-                   "invalid (must be >= 0), using default\n", val);
-      fireError(0, val, "env_config: PARCAGPU_BLOCKING_THRESHOLD_US invalid");
+      PLOG_WARN(0, kComponent,
+                "PARCAGPU_BLOCKING_THRESHOLD_US=%s "
+                "invalid (must be >= 0), using default",
+                val);
     }
   }
 }

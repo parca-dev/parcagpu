@@ -33,6 +33,7 @@ jobs:
           mkdir -p build/amd64
           docker buildx build -f Dockerfile \
             --build-arg CUDA_HEADERS=${{ env.CUDA_HEADERS }} \
+            --build-arg PARCAGPU_VERSION=${{ github.sha }} \
             --target export \
             --output type=local,dest=build/amd64 \
             --platform linux/amd64 \
@@ -72,6 +73,7 @@ jobs:
           file: ./Dockerfile
           build-args: |
             CUDA_HEADERS=${{ env.CUDA_HEADERS }}
+            PARCAGPU_VERSION=${{ github.sha }}
           platforms: linux/amd64,linux/arm64
           target: runtime
           push: true
@@ -105,6 +107,7 @@ jobs:
           mkdir -p build/${{ matrix.arch }}
           docker buildx build -f Dockerfile \
             --build-arg CUDA_HEADERS=${{ env.CUDA_HEADERS }} \
+            --build-arg PARCAGPU_VERSION=${{ github.sha }} \
             --target export \
             --output type=local,dest=build/${{ matrix.arch }} \
             --platform linux/${{ matrix.arch }} \

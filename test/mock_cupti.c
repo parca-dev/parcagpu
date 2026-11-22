@@ -42,6 +42,10 @@ CUptiResult cuptiSubscribe(CUpti_SubscriberHandle *subscriber,
                            CUpti_CallbackFunc callback,
                            void *userdata) {
     fprintf(stderr, "[MOCK_CUPTI] cuptiSubscribe()\n");
+    // Another CUPTI client holding the subscriber slot, etc.
+    const char *fail = getenv("MOCK_CUPTI_SUBSCRIBE_RESULT");
+    if (fail && atoi(fail) != 0)
+      return (CUptiResult)atoi(fail);
     __cupti_runtime_api_callback = callback;
     __cupti_runtime_api_userdata = userdata;
     *subscriber = (CUpti_SubscriberHandle)0x1234;

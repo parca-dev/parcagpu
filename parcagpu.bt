@@ -132,17 +132,18 @@ usdt:*:parcagpu:kernel_stats {
            arg2);
 }
 
-usdt:*:parcagpu:error {
-    $code = arg0;
-    $message = str(arg1);
-    $component = str(arg2);
-
-    printf("%-12s.%-6u [ERROR] code=%d component=%s msg=%s\n",
+// The log channel (PARCAGPU_LOG_LEVEL, info by default). The error probe
+// carries its warnings and errors again, for older consumers.
+usdt:*:parcagpu:log {
+    $level = arg0 == 4 ? "ERROR" : arg0 == 3 ? "WARN" :
+             arg0 == 2 ? "INFO" : "DEBUG";
+    printf("%-12s.%-6u [LOG] %s %s: %s (code=%d)\n",
            strftime("%H:%M:%S", nsecs),
            (nsecs % 1000000000) / 1000,
-           $code,
-           $component,
-           $message);
+           $level,
+           str(arg3),
+           str(arg4),
+           (int32)arg1);
 }
 
 END {

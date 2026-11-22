@@ -27,9 +27,13 @@
 #define NVTX_NO_IMPL
 #include <nvtx3/nvToolsExt.h>
 
+#include "log.h"
 #include "nvtx.h"
 #include "nvtx_collector.h"
-#include "pc_sampling.h" // DEBUG_PRINTF
+
+namespace {
+constexpr const char *kLogComponent = "nvtx";
+} // namespace
 
 namespace parcagpu {
 namespace nvtx {
@@ -227,8 +231,8 @@ nvtxDomainHandle_t domainCreateA(const char *name) {
   } catch (...) {
     return nullptr;
   }
-  DEBUG_PRINTF("[PARCAGPU] nvtx domain created: id=%u name=%s\n", d->id,
-               d->name);
+  PLOG_DEBUG(kLogComponent, "nvtx domain created: id=%u name=%s", d->id,
+             d->name);
   if (resourceNameEnabled())
     announceDomain(d, nowNs());
   return reinterpret_cast<nvtxDomainHandle_t>(d);
@@ -345,6 +349,6 @@ extern "C" int InitializeInjectionNvtx2(NvtxGetExportTableFunc_t getExportTable)
       ver->SetInjectionNvtxVersion)
     ver->SetInjectionNvtxVersion(NVTX_VERSION);
 
-  DEBUG_PRINTF("[PARCAGPU] InitializeInjectionNvtx2: handlers installed\n");
+  PLOG_INFO(kLogComponent, "InitializeInjectionNvtx2: handlers installed");
   return 1;
 }

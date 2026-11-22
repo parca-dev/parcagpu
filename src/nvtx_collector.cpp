@@ -17,9 +17,13 @@
 
 #include "Driver/GPU/CudaApi.h"
 
+#include "log.h"
 #include "nvtx.h"
 #include "nvtx_collector.h"
-#include "pc_sampling.h" // DEBUG_PRINTF, parcagpu::debug_enabled
+
+namespace {
+constexpr const char *kLogComponent = "nvtx";
+} // namespace
 
 // CMake defines this at configure time. Default here is a clangd/IDE
 // convenience only; real builds get the value from CMakeLists.txt.
@@ -96,12 +100,12 @@ namespace nvtx {
 bool captureEnabled() {
   return PARCAGPU_NVTX_EVENT_BATCH_ENABLED() ||
          g_testForceCapture.load(std::memory_order_relaxed) ||
-         debug_enabled;
+         log::stderrDebug();
 }
 bool resourceNameEnabled() {
   return PARCAGPU_NVTX_RESOURCE_NAME_ENABLED() ||
          g_testForceCapture.load(std::memory_order_relaxed) ||
-         debug_enabled;
+         log::stderrDebug();
 }
 
 } // namespace nvtx
@@ -151,7 +155,7 @@ __attribute__((noinline)) void fireNvtxResourceName(uint32_t kind, uint64_t id,
 void flushBatchLocked(ThreadState *s) {
   if (s->count == 0)
     return;
-  DEBUG_PRINTF("[PARCAGPU] nvtx batch fire: count=%u\n", s->count);
+  PLOG_TRACE(kLogComponent, "nvtx batch fire: count=%u", s->count);
   fireNvtxEventBatch(s->eventPtrs, s->count);
   g_testBatchesFired.fetch_add(1, std::memory_order_relaxed);
   s->count = 0;
@@ -234,10 +238,11 @@ void captureEvent(uint16_t kind, uint32_t domainId, uint64_t rangeId,
     copyMessage(g_testLastMessage, msg);
   }
   g_testEventsCaptured.fetch_add(1, std::memory_order_relaxed);
-  DEBUG_PRINTF("[PARCAGPU] nvtx capture: kind=%u domain=%u tid=%u corr=%u dev=%u range_id=%llu msg=%s\n",
-               (unsigned)kind, domainId, ev->tid, ev->correlation_id,
-               ev->device_id, (unsigned long long)ev->range_id,
-               msg);
+  PLOG_TRACE(kLogComponent,
+             "nvtx capture: kind=%u domain=%u tid=%u corr=%u dev=%u "
+             "range_id=%llu msg=%s",
+             (unsigned)kind, domainId, ev->tid, ev->correlation_id,
+             ev->device_id, (unsigned long long)ev->range_id, msg);
   if (s->count == kBatchSize ||
       ev->timestamp_ns - s->firstNs >= kMaxBatchAgeNs) {
     flushBatchLocked(s);
@@ -249,8 +254,8 @@ void emitResourceName(uint32_t kind, uint64_t id, const char *name) {
     return;
   if (!name)
     name = "";
-  DEBUG_PRINTF("[PARCAGPU] nvtx name: kind=%u id=0x%llx name=%s\n",
-               kind, (unsigned long long)id, name);
+  PLOG_TRACE(kLogComponent, "nvtx name: kind=%u id=0x%llx name=%s", kind,
+             (unsigned long long)id, name);
   fireNvtxResourceName(kind, id, name);
   g_testResourceNamesFired.fetch_add(1, std::memory_order_relaxed);
 }
@@ -268,8 +273,8 @@ void onCudaInjected() {
     setenv("NVTX_INJECTION64_PATH", info.dli_fname, /*overwrite=*/0);
   }
   const char *injectPath = getenv("NVTX_INJECTION64_PATH");
-  DEBUG_PRINTF("[PARCAGPU] NVTX_INJECTION64_PATH=%s\n",
-               injectPath ? injectPath : "(unset)");
+  PLOG_DEBUG(kLogComponent, "NVTX_INJECTION64_PATH=%s",
+             injectPath ? injectPath : "(unset)");
 }
 
 void flushCurrentThread() {

@@ -11,8 +11,12 @@
 #include <vector>
 
 #include "Driver/Dispatch.h"
-#include "pc_sampling.h" // DEBUG_PRINTF
+#include "log.h"
 #include "probes.h"
+
+namespace {
+constexpr const char *kLogComponent = "device_info";
+} // namespace
 
 // Proton's CUDA dispatch table lacks these driver calls, and its ExternLibCuda
 // is private to CudaApi.cpp; declare an equivalent lazily-dlopen'd handle here
@@ -111,8 +115,7 @@ void onContextCreated(CUcontext ctx) {
                                                dev) != CUDA_SUCCESS)
       d.pciBusId[0] = '\0';
     d.lastEmittedNs = nowNs();
-    DEBUG_PRINTF("[PARCAGPU] device_info: ordinal=%u pci=%s\n", d.ordinal,
-                 d.pciBusId);
+    PLOG_INFO(kLogComponent, "device %u: PCI %s", d.ordinal, d.pciBusId);
     fireDeviceInfo(d.ordinal, d.uuid, d.pciBusId);
     g_devices.push_back(d);
   } catch (...) {

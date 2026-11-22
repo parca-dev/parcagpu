@@ -1000,6 +1000,10 @@ int main(int argc, char **argv) {
 
     if (!parcagpuCuptiCallback || !bufferCompletedCallback) {
         fprintf(stderr, "Warning: Could not get callback pointers from mock CUPTI.\n");
+        // A process parcagpu failed to start in: stay up for the duration,
+        // so that a consumer can attach to it (test-log).
+        if (result == 0)
+          sleep((unsigned)config.duration);
         dlclose(cupti_prof_handle);
         return 0;
     }

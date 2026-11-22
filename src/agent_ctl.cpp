@@ -18,8 +18,13 @@
 
 #include "Driver/Dispatch.h"
 #include "Driver/GPU/CudaApi.h"
+#include "log.h"
 #include "parcagpu_ctl.h"
 #include "pc_sampling.h"
+
+namespace {
+constexpr const char *kLogComponent = "agent_ctl";
+} // namespace
 
 // Driver calls Proton's dispatch table lacks, defined in device_info.cpp
 // (lazily dlsym'd from the already-loaded libcuda).
@@ -186,12 +191,11 @@ bool decode(int n, const parcagpu_ctl_config &c, uint64_t gen, Update *u) {
       numDevices = g_state.num_devices;
     }
     if (n != (int)sizeof c || !valid(c, numDevices)) {
-      DEBUG_PRINTF("[PARCAGPU] agent control: rejected gen %lu (len %d, "
-                   "devices 0x%x, factor %u, window %u ms, hw buffer %u "
-                   "MB)\n",
-                   gen, n, c.pc_sampling_devices, c.pc_sampling_factor,
-                   c.pc_sampling_window_ms, c.pc_hw_buffer_mb);
-      fireError(EINVAL, "invalid agent configuration", "agent_ctl");
+      PLOG_WARN(EINVAL, kLogComponent,
+                "rejected invalid agent configuration gen %lu (len %d, "
+                "devices 0x%x, factor %u, window %u ms, hw buffer %u MB)",
+                gen, n, c.pc_sampling_devices, c.pc_sampling_factor,
+                c.pc_sampling_window_ms, c.pc_hw_buffer_mb);
       return false;
     }
   }
@@ -217,8 +221,8 @@ bool checkLease(Update *u) {
     return false;
   bool expired = procctl_lease_expired(&g_ctx, 0);
   if (g_leaseExpired.exchange(expired) != expired)
-    DEBUG_PRINTF("[PARCAGPU] agent control: lease %s\n",
-                 expired ? "expired" : "recovered");
+    PLOG_INFO(kLogComponent, "agent control: lease %s",
+              expired ? "expired" : "recovered");
   if (!expired || g_config.load(std::memory_order_relaxed) == 0)
     return false;
   *u = Update{};
@@ -282,12 +286,12 @@ void apply(const Update &u) {
     g_appliedGen = u.gen;
     procctl_ack(&g_ctx, u.gen);
   }
-  DEBUG_PRINTF("[PARCAGPU] agent control: applied %s: devices 0x%x factor "
-               "%u window %u ms\n",
-               u.ack ? "configuration" : "lease expiry",
-               (uint32_t)(u.packed & 0xffff),
-               (uint32_t)((u.packed >> 16) & 0x3f),
-               (uint32_t)((u.packed >> 22) & 0x3fff));
+  PLOG_INFO(kLogComponent,
+            "agent control: applied %s: devices 0x%x factor "
+            "%u window %u ms",
+            u.ack ? "configuration" : "lease expiry",
+            (uint32_t)(u.packed & 0xffff), (uint32_t)((u.packed >> 16) & 0x3f),
+            (uint32_t)((u.packed >> 22) & 0x3fff));
 }
 
 void *releaseThread(void *) {
@@ -297,9 +301,14 @@ void *releaseThread(void *) {
     try {
       InternalScope internal;
       agentCtlPoll();
+      // Replay the log to a consumer that attached since the last tick,
+      // also in a process making no CUDA calls.
+      log::poll();
     } catch (const std::exception &e) {
-      DEBUG_PRINTF("[PARCAGPU] agent control thread caught: %s\n", e.what());
+      PLOG_WARN(0, kLogComponent, "agent control thread caught: %s", e.what());
     } catch (...) {
+      PLOG_WARN(0, kLogComponent,
+                "agent control thread caught an unknown exception");
     }
   }
   return nullptr;
@@ -316,9 +325,8 @@ void agentCtlInit() {
   cfg.state_storage = g_stateStorage;
   int r = procctl_init(&g_ctx, &cfg);
   if (r != 0) {
-    DEBUG_PRINTF("[PARCAGPU] agent control unavailable: procctl_init %d\n", r);
-    fireError(r, "agent control unavailable (procctl_init failed)",
-              "agent_ctl");
+    PLOG_WARN(r, kLogComponent,
+              "agent control unavailable: procctl_init failed: %d", r);
     return;
   }
   {
@@ -328,7 +336,7 @@ void agentCtlInit() {
   }
   pthread_atfork(nullptr, nullptr, atforkChild);
   g_ready.store(true, std::memory_order_release);
-  DEBUG_PRINTF("[PARCAGPU] agent control ready\n");
+  PLOG_DEBUG(kLogComponent, "agent control ready");
 }
 
 bool agentCtlReady() { return g_ready.load(std::memory_order_acquire); }
@@ -345,7 +353,7 @@ void agentCtlStart(AgentApplyFn apply) {
       pthread_create(&g_thread, nullptr, releaseThread, nullptr) == 0;
   pthread_sigmask(SIG_SETMASK, &old, nullptr);
   if (!g_threadRunning)
-    fireError(0, "agent control: release thread not started", "agent_ctl");
+    PLOG_WARN(0, kLogComponent, "agent control: release thread not started");
 }
 
 void agentCtlShutdown() {
@@ -380,7 +388,7 @@ void agentCtlPoll() {
       apply(p);
   }
   else if (n == -E2BIG)
-    fireError(E2BIG, "agent configuration too large", "agent_ctl");
+    PLOG_WARN(E2BIG, kLogComponent, "agent configuration too large, ignored");
   if (checkLease(&u))
     apply(u);
 }
@@ -405,8 +413,9 @@ void agentCtlAddContext(CUcontext ctx) {
   }
   if (slot == n) {
     if (n == PARCAGPU_CTL_MAX_DEVICES) {
-      fireError((int32_t)dev, "too many devices for agent control",
-                "agent_ctl");
+      PLOG_WARN((int32_t)dev, kLogComponent,
+                "device %d: more than %u devices, not under agent control",
+                (int)dev, PARCAGPU_CTL_MAX_DEVICES);
       return;
     }
     auto &d = g_state.devices[n];
@@ -425,8 +434,8 @@ void agentCtlAddContext(CUcontext ctx) {
     g_ordinals[n] = dev;
     g_state.num_devices = n + 1;
     publishStateLocked();
-    DEBUG_PRINTF("[PARCAGPU] agent control: device %d is slot %u\n", (int)dev,
-                 n);
+    PLOG_DEBUG(kLogComponent, "agent control: device %d is slot %u", (int)dev,
+               n);
   }
   // A destroyed context's address can be reused: the latest mapping wins.
   for (auto &e : g_contexts) {
