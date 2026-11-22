@@ -6,6 +6,7 @@
 #include "kernel_stats.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -109,6 +110,37 @@ void fire(Interval &iv, uint32_t seq) {
 
 bool enabled() {
   return agentCtlFeature(PARCAGPU_FEATURE_KERNEL_STATS, /*envDefault=*/true);
+}
+
+namespace {
+std::atomic<bool> g_activityEnabled{false};
+std::atomic<bool> g_recording{false}; // last state logged
+} // namespace
+
+void setActivityEnabled(bool on) {
+  g_activityEnabled.store(on, std::memory_order_relaxed);
+}
+
+void logStateChange() {
+  const bool activity = g_activityEnabled.load(std::memory_order_relaxed);
+  const bool buffers = PARCAGPU_CUDA_CORRELATION_ENABLED();
+  const bool consumer = PARCAGPU_KERNEL_STATS_ENABLED();
+  const bool feature = enabled();
+  const bool on = activity && buffers && consumer && feature;
+  bool was = !on;
+  if (!g_recording.compare_exchange_strong(was, on, std::memory_order_relaxed))
+    return; // unchanged, or another thread logs this change
+  if (on) {
+    PLOG_INFO(kLogComponent,
+              "recording every kernel: kernel_stats consumer attached%s",
+              agentCtlConfig().active ? ", agent turned kernel_stats on" : "");
+  } else {
+    PLOG_INFO(kLogComponent, "stopped recording every kernel: %s",
+              !activity   ? "kernel activity off"
+              : !feature  ? "agent turned kernel_stats off"
+              : !consumer ? "kernel_stats consumer detached"
+                          : "cuda_correlation consumer detached");
+  }
 }
 
 void record(const CUpti_ActivityKernel5 *k) {

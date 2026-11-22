@@ -822,6 +822,8 @@ public:
     } else {
       PLOG_DEBUG(kLogComponent, "Enabled CONCURRENT_KERNEL activity");
     }
+    kernelActivityEnabled = result == CUPTI_SUCCESS;
+    kernel_stats::setActivityEnabled(kernelActivityEnabled);
 
     syncFlushPeriod();
 
@@ -911,6 +913,7 @@ private:
   std::atomic<bool> initialized{false};
   bool pcSamplingEnabled = false;
   bool blockingCallsEnabled = false; // PARCAGPU_BLOCKING_CALLS
+  bool kernelActivityEnabled = false; // CONCURRENT_KERNEL activity
 
   // One record saying what parcagpu does in this process, so an agent log
   // shows it for every process it attaches to (replayed on attach).
@@ -921,10 +924,11 @@ private:
     proton::cupti::getVersion<false>(&cupti);
     PLOG_INFO(kLogComponent,
               "parcagpu %s active: CUDA driver %d.%d.%d, CUPTI v%u (headers "
-              "API %d), PC sampling %s, blocking calls %s, launch rate "
-              "limit %.1f/s, graph %.1f/s per thread, agent control %s",
+              "API %d), kernel activity %s, PC sampling %s, blocking calls "
+              "%s, launch rate limit %.1f/s, graph %.1f/s per thread, agent "
+              "control %s",
               log::version(), driver / 1000, (driver % 1000) / 10, driver % 10,
-              cupti, CUPTI_API_VERSION,
+              cupti, CUPTI_API_VERSION, kernelActivityEnabled ? "on" : "off",
               !pcSamplingEnabled       ? "off"
               : pcSampling.envSampling ? "on (environment)"
                                        : "available to the agent",
@@ -1443,6 +1447,7 @@ private:
           profiler.pcSampling.emitMetadata();
         }
         device_info::emit();
+        kernel_stats::logStateChange();
         log::poll();
         return;
       }
@@ -1484,6 +1489,7 @@ private:
       if (gateOnlyCb)
         return;
       device_info::emit();
+      kernel_stats::logStateChange();
       log::poll();
 
       if (isBlocking) {

@@ -151,7 +151,6 @@ constexpr uint64_t kReplayDelayNs = 500'000'000ULL;
 std::atomic<bool> g_replayPending{false};
 bool g_replayLog = false;   // replay on the log probe
 bool g_replayError = false; // replay warnings and errors on the error probe
-size_t g_replayEnd = 0;     // replay records before this; the rest went live
 std::atomic<uint64_t> g_replayDueNs{0}; // monotonic
 
 void fire(const Record &r, bool toLog, bool toError) {
@@ -174,8 +173,6 @@ void replayLocked() {
   if (logJoin || errorJoin) {
     g_replayLog |= logJoin;
     g_replayError |= errorJoin;
-    // Records from here on are fired live, to the new consumer as well.
-    g_replayEnd = g_ringNext;
     g_replayDueNs.store(now + kReplayDelayNs, std::memory_order_relaxed);
     g_replayPending.store(true, std::memory_order_relaxed);
     return;
@@ -184,12 +181,11 @@ void replayLocked() {
       now < g_replayDueNs.load(std::memory_order_relaxed))
     return;
   const Level threshold = config().probe;
-  // Records pushed since the join pushed older ones out of the ring.
+  // The whole ring, records kept since the join included: write() holds
+  // those back from the probes being replayed to, so each goes out once.
   const size_t begin =
       g_ringNext > kReplayRecords ? g_ringNext - kReplayRecords : 0;
-  const size_t start =
-      g_replayEnd > kReplayRecords ? g_replayEnd - kReplayRecords : 0;
-  for (size_t i = start > begin ? start : begin; i < g_replayEnd; i++) {
+  for (size_t i = begin; i < g_ringNext; i++) {
     const Record &r = g_ring[i % kReplayRecords];
     fire(r, g_replayLog && r.level >= threshold && logSem() > 0,
          g_replayError && r.level >= kWarn && errorSem() > 0);
@@ -246,8 +242,13 @@ void write(Level level, int32_t code, const char *component, const char *fmt,
   replayLocked();
   if (level >= kInfo)
     g_ring[g_ringNext++ % kReplayRecords] = r;
-  const bool toLog = level >= c.probe && logSem() > 0;
-  const bool toError = level >= kWarn && errorSem() > 0;
+  // A record the ring keeps waits for a pending replay to a probe rather
+  // than fire now, maybe before the new consumer's program is attached.
+  const bool held =
+      level >= kInfo && g_replayPending.load(std::memory_order_relaxed);
+  const bool toLog = level >= c.probe && logSem() > 0 && !(held && g_replayLog);
+  const bool toError =
+      level >= kWarn && errorSem() > 0 && !(held && g_replayError);
   if (toLog || toError) {
     Bucket &b = level >= kWarn ? g_highBucket : g_lowBucket;
     if (b.take()) {

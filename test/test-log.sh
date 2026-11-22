@@ -10,6 +10,9 @@
 # Phase subscribe: cuptiSubscribe fails (another CUPTI client): the error
 #                  goes to stderr and is replayed, though parcagpu is inactive.
 # Phase level:     PARCAGPU_LOG_LEVEL=warn keeps info records off the probe.
+# Phase kernels:   a consumer attaching to cuda_correlation and kernel_stats
+#                  (as parca-agent does) and detaching is logged as parcagpu
+#                  starting and stopping recording every kernel.
 #
 # Prerequisites:
 #   make local
@@ -85,6 +88,8 @@ check_expr "invalid value warning replayed once on log" \
   "[ $(count "^L3 .* env_config: PARCAGPU_RATE_LIMIT=abc invalid" "$BT_LOG") -eq 1 ]"
 check_expr "startup record replayed once on log" \
   "[ $(count "^L2 .* cupti: parcagpu .* active: " "$BT_LOG") -eq 1 ]"
+check_expr "startup record says kernel activity is on" \
+  "[ $(count "^L2 .* active: .*, kernel activity on, " "$BT_LOG") -eq 1 ]"
 check_expr "warnings replayed once on error" \
   "[ $(count "^E code=0 env_config: " "$BT_LOG") -eq 2 ]"
 check_expr "info not on error" "[ $(count "^E .* active: " "$BT_LOG") -eq 0 ]"
@@ -108,6 +113,34 @@ run_phase level PARCAGPU_LOG_LEVEL=warn PARCAGPU_BOGUS=1
 check_expr "warning on log at warn" \
   "[ $(count "^L3 .* unrecognized env var" "$BT_LOG") -eq 1 ]"
 check_expr "no info on log at warn" "[ $(count "^L[012] " "$BT_LOG") -eq 0 ]"
+
+# --- Recording every kernel: a second consumer attaches, then detaches ---
+TEST_LOG="/tmp/parcagpu-log-kernels-test.log"
+BT_LOG="/tmp/parcagpu-log-kernels-bt.log"
+echo "=== Phase kernels ==="
+env LD_LIBRARY_PATH="$ROOT/build-local/lib:${LD_LIBRARY_PATH:-}" \
+  "$TEST_BIN" "$LIB" --launch-rate=50 --duration=7 > "$TEST_LOG" 2>&1 &
+TEST_PID=$!
+while kill -0 "$TEST_PID" 2>/dev/null &&
+      ! grep -q libparcagpucupti "/proc/$TEST_PID/maps" 2>/dev/null; do
+  sleep 0.1
+done
+sleep 1
+bpftrace -p "$TEST_PID" -e "$BT_PROG" > "$BT_LOG" 2>&1 &
+LOG_BT=$!
+sleep 1.5 # the log consumer's replay is done
+timeout 2 bpftrace -p "$TEST_PID" -e 'usdt:'"$LIB"':parcagpu:cuda_correlation,
+  usdt:'"$LIB"':parcagpu:kernel_stats { @n = count(); }' > /dev/null 2>&1 || true
+wait "$TEST_PID" 2>/dev/null || true
+TEST_PID=""
+wait "$LOG_BT" 2>/dev/null || true
+grep -E "^L" "$BT_LOG" | grep "every kernel" || true
+check_expr "start of recording every kernel logged once" \
+  "[ $(count "^L2 .* kernel_stats: recording every kernel: kernel_stats consumer attached" "$BT_LOG") -eq 1 ]"
+check_expr "stop of recording every kernel logged once" \
+  "[ $(count "^L2 .* kernel_stats: stopped recording every kernel: .* detached" "$BT_LOG") -eq 1 ]"
+check_expr "start before stop" \
+  "grep -E 'every kernel' '$BT_LOG' | head -1 | grep -q 'recording every kernel: '"
 
 if $PASS; then
   echo; echo "=== ALL CHECKS PASSED ==="

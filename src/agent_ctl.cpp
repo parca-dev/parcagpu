@@ -18,6 +18,7 @@
 
 #include "Driver/Dispatch.h"
 #include "Driver/GPU/CudaApi.h"
+#include "kernel_stats.h"
 #include "log.h"
 #include "parcagpu_ctl.h"
 #include "pc_sampling.h"
@@ -301,8 +302,9 @@ void *releaseThread(void *) {
     try {
       InternalScope internal;
       agentCtlPoll();
-      // Replay the log to a consumer that attached since the last tick,
-      // also in a process making no CUDA calls.
+      // Also in a process making no CUDA calls: note an attach or detach,
+      // and replay the log to a consumer that attached since the last tick.
+      kernel_stats::logStateChange();
       log::poll();
     } catch (const std::exception &e) {
       PLOG_WARN(0, kLogComponent, "agent control thread caught: %s", e.what());

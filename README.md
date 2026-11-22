@@ -105,7 +105,8 @@ parcagpu logs to the `log` probe, so that an agent can show what parcagpu does
 in each process it attaches to. Levels: 1 debug (per window, context or
 call), 2 info (once per process or per change: a startup record with the
 version, CUDA and CUPTI versions and what is on, each device, agent
-configurations applied), 3 warn (something degraded: a feature off, input
+configurations applied, starting and stopping recording every kernel for
+`kernel_stats`), 3 warn (something degraded: a feature off, input
 ignored, data lost), 4 error (parcagpu isn't working in this process, such as
 `cuptiSubscribe` failing because Nsight or DCGM profiling holds CUPTI). Records
 at or above `PARCAGPU_LOG_LEVEL` fire while a consumer is attached, at most
@@ -118,7 +119,8 @@ attached to the new process. So parcagpu keeps the last 64 info, warning and
 error records and fires them again half a second after a consumer attaches (the
 probe's semaphore count goes up). Replayed records keep their `timeNs`, so a
 consumer that sees one twice, because another consumer attached, can drop it by
-(pid, `timeNs`). The `error` probe gets the same replay of warnings and errors.
+(pid, `timeNs`). Info and higher records logged while a replay is pending go
+out with it. The `error` probe gets the same replay of warnings and errors.
 `trace` records (per PC sample, per NVTX event, per launch) go only to stderr.
 
 **Cubin files.** Attach to one of `cubin_loaded` and `cubin_loaded_file`,
