@@ -16,6 +16,14 @@
 //    consumer that sees one twice can drop it by (pid, time_ns).
 //  - stderr: everything with PARCAGPU_DEBUG set, else errors only.
 //
+// The first record a process writes is preceded by a build record: info,
+// component "build", message buildInfo() (version.h), e.g.
+//   version=v0.4.0-4-gabc1234 sha=<40 hex> dirty=0 build_type=RelWithDebInfo
+//   cuda_headers=12.8 cupti_api=24
+// It goes to the log probe whatever PARCAGPU_LOG_LEVEL says, never to the
+// error probe, and is kept apart from the ring: every replay starts with it,
+// however many records were written since.
+//
 // Levels (the probe's `level` argument):
 //   trace  stderr only, never on the probe: per-event detail (per PC, per
 //          NVTX event) that would flood any channel but a terminal.
@@ -78,10 +86,6 @@ bool parseLevel(const char *s);
 bool stderrDebug();
 
 const char *levelName(Level level);
-
-// The build's version (git describe, or the PARCAGPU_VERSION CMake/Docker
-// variable), "unknown" if neither was available.
-const char *version();
 
 // Test hook: the probe threshold, as from PARCAGPU_LOG_LEVEL.
 Level probeLevel();

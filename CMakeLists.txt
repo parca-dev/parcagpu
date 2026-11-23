@@ -16,24 +16,6 @@ set(PARCAGPU_NVTX_BATCH_SIZE 256 CACHE STRING
     "Max NVTX events per nvtx_event_batch probe (128/256/512/1024)")
 add_compile_definitions(PARCAGPU_NVTX_BATCH_SIZE=${PARCAGPU_NVTX_BATCH_SIZE})
 
-# Version reported in parcagpu's startup log record. Docker builds have no
-# .git and pass it in (Dockerfile ARG PARCAGPU_VERSION).
-if(NOT DEFINED PARCAGPU_VERSION)
-    execute_process(
-        COMMAND git describe --always --dirty --tags
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        OUTPUT_VARIABLE PARCAGPU_VERSION
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
-    )
-    if(NOT PARCAGPU_VERSION)
-        set(PARCAGPU_VERSION "unknown")
-    endif()
-endif()
-message(STATUS "parcagpu version: ${PARCAGPU_VERSION}")
-set_property(SOURCE src/log.cpp APPEND PROPERTY
-    COMPILE_DEFINITIONS PARCAGPU_VERSION="${PARCAGPU_VERSION}")
-
 # Default to Release with debug symbols
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
@@ -105,6 +87,27 @@ add_custom_command(
     COMMENT "Generating USDT probe object (probes.o)"
 )
 
+# Build identity (src/version.cpp): version, git sha and dirty flag, read
+# from git on every build by cmake/version.cmake. Builds without .git
+# (Docker) pass them in; the Dockerfile has matching ARGs.
+set(PARCAGPU_VERSION "" CACHE STRING "Version (default: git describe)")
+set(PARCAGPU_GIT_SHA "" CACHE STRING "Git sha (default: git rev-parse HEAD)")
+set(PARCAGPU_GIT_DIRTY "" CACHE STRING
+    "1 if built from a modified tree, 0 if not (default: from git)")
+add_custom_target(parcagpu_version
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -DOUTPUT=${GENERATED_DIR}/parcagpu_version.h
+        -DBUILD_TYPE=${CMAKE_BUILD_TYPE}
+        "-DCUDA_INCLUDE_DIR=${CUDA_INCLUDE_DIR}"
+        -DPARCAGPU_VERSION=${PARCAGPU_VERSION}
+        -DPARCAGPU_GIT_SHA=${PARCAGPU_GIT_SHA}
+        -DPARCAGPU_GIT_DIRTY=${PARCAGPU_GIT_DIRTY}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/version.cmake
+    BYPRODUCTS ${GENERATED_DIR}/parcagpu_version.h
+    COMMENT "Checking parcagpu version"
+)
+
 # Collect proton driver source files we need
 # Note: We only link driver APIs and callback utilities (no profiler dependencies)
 set(PROTON_SOURCES
@@ -126,6 +129,7 @@ add_library(parcagpucupti SHARED
     src/log.cpp
     src/nvtx_collector.cpp
     src/nvtx_injection.cpp
+    src/version.cpp
     ${PROTON_SOURCES}
 )
 
@@ -134,7 +138,7 @@ add_custom_target(probes_generated
     DEPENDS ${GENERATED_DIR}/probes.h
             ${CMAKE_CURRENT_BINARY_DIR}/probes.o
 )
-add_dependencies(parcagpucupti probes_generated)
+add_dependencies(parcagpucupti probes_generated parcagpu_version)
 target_link_libraries(parcagpucupti ${CMAKE_CURRENT_BINARY_DIR}/probes.o)
 
 # Link against system libraries only (NOT libcupti - loaded dynamically by Proton)

@@ -2,8 +2,14 @@
 
 LIB_NAME = libparcagpucupti.so
 
-# Version for parcagpu's startup log record; Docker builds have no .git.
-PARCAGPU_VERSION ?= $(shell git describe --always --dirty --tags 2>/dev/null || echo unknown)
+# Build identity (src/version.h). Docker builds have no .git, so it is
+# worked out here and passed in.
+PARCAGPU_VERSION ?= $(shell git describe --always --dirty --tags 2>/dev/null)
+PARCAGPU_GIT_SHA ?= $(shell git rev-parse HEAD 2>/dev/null)
+PARCAGPU_GIT_DIRTY ?= $(if $(PARCAGPU_VERSION),$(if $(filter %-dirty,$(PARCAGPU_VERSION)),1,0))
+VERSION_ARGS = --build-arg PARCAGPU_VERSION=$(PARCAGPU_VERSION) \
+	--build-arg PARCAGPU_GIT_SHA=$(PARCAGPU_GIT_SHA) \
+	--build-arg PARCAGPU_GIT_DIRTY=$(PARCAGPU_GIT_DIRTY)
 
 # Default target: build for both architectures
 all: build-all
@@ -14,7 +20,7 @@ build-amd64:
 	@mkdir -p /tmp/parcagpu-build-amd64
 	@docker buildx create --name parcagpu-builder --use --bootstrap 2>/dev/null || docker buildx use parcagpu-builder
 	@docker buildx build -f Dockerfile \
-		--build-arg PARCAGPU_VERSION=$(PARCAGPU_VERSION) \
+		$(VERSION_ARGS) \
 		--target export \
 		--output type=local,dest=/tmp/parcagpu-build-amd64 \
 		--platform linux/amd64 .
@@ -28,7 +34,7 @@ build-arm64:
 	@mkdir -p /tmp/parcagpu-build-arm64
 	@docker buildx create --name parcagpu-builder --use --bootstrap 2>/dev/null || docker buildx use parcagpu-builder
 	@docker buildx build -f Dockerfile \
-		--build-arg PARCAGPU_VERSION=$(PARCAGPU_VERSION) \
+		$(VERSION_ARGS) \
 		--target export \
 		--output type=local,dest=/tmp/parcagpu-build-arm64 \
 		--platform linux/arm64 .
@@ -48,7 +54,7 @@ cross:
 	@echo "=== Building runtime container for AMD64 and ARM64 ==="
 	@docker buildx create --name parcagpu-builder --use --bootstrap 2>/dev/null || docker buildx use parcagpu-builder
 	@docker buildx build -f Dockerfile \
-		--build-arg PARCAGPU_VERSION=$(PARCAGPU_VERSION) \
+		$(VERSION_ARGS) \
 		--target runtime \
 		--platform linux/amd64,linux/arm64 \
 		.
@@ -112,7 +118,7 @@ docker-push:
 	@docker buildx create --name parcagpu-builder --use --bootstrap 2>/dev/null || docker buildx use parcagpu-builder
 	@echo "=== Building and pushing multi-arch Docker images to $(IMAGE):$(IMAGE_TAG) ==="
 	@docker buildx build -f Dockerfile \
-		--build-arg PARCAGPU_VERSION=$(PARCAGPU_VERSION) \
+		$(VERSION_ARGS) \
 		--target runtime \
 		--platform linux/amd64,linux/arm64 \
 		--tag $(IMAGE):$(IMAGE_TAG) \
