@@ -24,22 +24,7 @@
 #include "Utility/Map.h"
 #include "Utility/Set.h"
 
-#define DEBUG_PRINTF(...)                                                      \
-  do {                                                                         \
-    parcagpu::init_debug();                                                    \
-    if (parcagpu::debug_enabled) {                                             \
-      struct timespec ts;                                                      \
-      clock_gettime(CLOCK_REALTIME, &ts);                                      \
-      fprintf(stderr, "[%ld.%09ld] ", ts.tv_sec, ts.tv_nsec);                  \
-      fprintf(stderr, __VA_ARGS__);                                            \
-    }                                                                          \
-  } while (0)
-
 namespace parcagpu {
-
-// Debug logging control — defined in cupti.cpp.
-extern bool debug_enabled;
-extern void init_debug();
 
 // Notify the PC rate controller of a batch of samples just drained from CUPTI.
 extern void recordPCSamples(uint64_t n);

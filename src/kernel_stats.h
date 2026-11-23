@@ -58,6 +58,17 @@ void record(const CUpti_ActivityKernel5 *k);
 // or unconditionally when force is set (process exit).
 void maybeEmit(bool force);
 
+// Whether CUPTI's kernel activity was enabled at startup; set once by the
+// profiler. Without it no kernel is recorded.
+void setActivityEnabled(bool on);
+
+// Logs (info) when parcagpu starts or stops recording every kernel: kernel
+// activity on, consumers attached to cuda_correlation (which gets CUPTI
+// activity buffers allocated) and kernel_stats, and the agent's
+// PARCAGPU_FEATURE_KERNEL_STATS bit on while it controls the process.
+// Called on CUDA API callbacks and from the agent control thread.
+void logStateChange();
+
 } // namespace parcagpu::kernel_stats
 
 #endif // PARCAGPU_KERNEL_STATS_H_

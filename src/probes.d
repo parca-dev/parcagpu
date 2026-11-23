@@ -17,6 +17,8 @@ provider parcagpu {
   probe gpu_config(uint32_t deviceId, uint32_t samplingFactor,
                     uint32_t clockKHz, uint32_t smCount);
   probe error(int32_t code, const char *message, const char *component);
+  probe log(uint32_t level, int32_t code, uint64_t timeNs,
+            const char *component, const char *message);
   probe nvtx_event_batch(const void **events, uint32_t count);
   probe nvtx_resource_name(uint32_t kind, uint64_t id, const char *name);
   probe device_info(uint32_t deviceId, const uint8_t *uuid,

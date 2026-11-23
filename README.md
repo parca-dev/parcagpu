@@ -27,7 +27,7 @@ capture.
 
 Under control from [parca-agent](https://github.com/parca-dev/parca-agent), the
 agent's settings replace these (see below). An unrecognized `PARCAGPU_*`
-variable is reported on the `error` probe.
+variable or an invalid value is logged as a warning (see [Logging](#logging)).
 
 | Variable | Default | Description |
 |---|---|---|
@@ -39,7 +39,8 @@ variable is reported on the `error` probe.
 | `PARCAGPU_METADATA_REFRESH_MS` | 30000 | How often cubins, the stall reason map and `gpu_config` are re-emitted. A consumer that attaches while another is attached gets them only then: the USDT semaphore stays at 1. |
 | `PARCAGPU_BLOCKING_CALLS` | unset | Any value but empty or `0` enables `cuda_blocking_call`. Off by default because its callbacks run on every covered API call, query polling included, even with no consumer. |
 | `PARCAGPU_BLOCKING_THRESHOLD_US` | 10 | Threshold T for `cuda_blocking_call`. Calls blocked at least T are reported with weight = duration, shorter ones with probability duration/T and weight T, so summed weights estimate total blocked time without bias. 0 reports every call. |
-| `PARCAGPU_DEBUG` | unset | Debug logging. |
+| `PARCAGPU_LOG_LEVEL` | `info` | Lowest level on the `log` probe: `debug`, `info`, `warn` or `error`. |
+| `PARCAGPU_DEBUG` | unset | Every log record, `trace` included, on stderr. Without it only errors go to stderr. |
 | `PARCAGPU_GATE_STATS` | unset | Print the PC sampling gate's counters every 10 s. |
 
 ### Runtime control from [parca-agent](https://github.com/parca-dev/parca-agent)
@@ -92,10 +93,35 @@ the driver API, positive for the runtime API. Timestamps are
 | `device_info` | deviceId, uuid, pciBusId | A device's UUID and PCI bus ID, when the process first uses it, when a consumer attaches, and every 30 s. |
 | `nvtx_event_batch` | ptrs, count | NVTX events (`struct nvtx_event`, `src/nvtx.h`), flushed at 256 events or when the oldest is 100 ms old. |
 | `nvtx_resource_name` | kind, id, name | NVTX name for an OS thread, CUDA device or stream, or domain (`NVTX_RESOURCE_*`). |
-| `error` | code, message, component | A profiler error. |
+| `log` | level, code, timeNs, component, message | A log record (see [Logging](#logging)). `timeNs` is `CLOCK_REALTIME`. |
+| `error` | code, message, component | The `log` probe's warnings and errors, for consumers older than it. |
 
 Metadata probes fire as things load, when a consumer attaches, and every
 `PARCAGPU_METADATA_REFRESH_MS`.
+
+### Logging
+
+parcagpu logs to the `log` probe, so that an agent can show what parcagpu does
+in each process it attaches to. Levels: 1 debug (per window, context or
+call), 2 info (once per process or per change: a startup record with the
+version, CUDA and CUPTI versions and what is on, each device, agent
+configurations applied, starting and stopping recording every kernel for
+`kernel_stats`), 3 warn (something degraded: a feature off, input
+ignored, data lost), 4 error (parcagpu isn't working in this process, such as
+`cuptiSubscribe` failing because Nsight or DCGM profiling holds CUPTI). Records
+at or above `PARCAGPU_LOG_LEVEL` fire while a consumer is attached, at most
+100/s for debug and info and 20/s for warnings and errors; a warning reports
+what was not sent. `code` is the failed call's result (`CUptiResult`,
+`CUresult` or errno), or 0. Messages are at most 255 bytes.
+
+Most failures happen while the driver loads parcagpu, before an agent has
+attached to the new process. So parcagpu keeps the last 64 info, warning and
+error records and fires them again half a second after a consumer attaches (the
+probe's semaphore count goes up). Replayed records keep their `timeNs`, so a
+consumer that sees one twice, because another consumer attached, can drop it by
+(pid, `timeNs`). Info and higher records logged while a replay is pending go
+out with it. The `error` probe gets the same replay of warnings and errors.
+`trace` records (per PC sample, per NVTX event, per launch) go only to stderr.
 
 **Cubin files.** Attach to one of `cubin_loaded` and `cubin_loaded_file`,
 preferring the second where it exists (older parcagpu lacks it). Only
@@ -168,6 +194,7 @@ make test-graph-rate-limit # Graph rate limit at a production launch rate
 make docker-test-run      # make test in a container
 make test-pc-mock         # Mock PC sampling + BPF activity parser (root)
 make test-blocking-mock   # cuda_blocking_call with bpftrace (root)
+make test-log             # Log replay to a late consumer, failed start (root)
 make test-nvtx-real       # Real NVTX clients + BPF parser (root; NVTX_PYTHON=... adds Python)
 make test-multi           # Mock harness + BPF parser in parallel (root)
 make test-pc-real         # Real PC sampling on microbenchmarks/ (root, GPU)
@@ -201,6 +228,7 @@ src/
   device_info.cpp     device_info probe
   nvtx_*.cpp          NVTX injection and collector
   env_config.cpp      Environment variable checks
+  log.cpp             Log channel: log probe, replay, stderr
   probes.d            USDT probe definitions
 ebpf/cupti_bpf.h      Structs shared with BPF consumers
 test/                 Mock CUPTI and CUDA, test scripts, agentctl/ (Go), bpf/ (activity parser)

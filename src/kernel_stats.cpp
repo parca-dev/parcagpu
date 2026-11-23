@@ -6,6 +6,7 @@
 #include "kernel_stats.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -14,8 +15,12 @@
 #include <vector>
 
 #include "agent_ctl.h"
+#include "log.h"
 #include "parcagpu_ctl.h"
-#include "pc_sampling.h" // DEBUG_PRINTF
+
+namespace {
+constexpr const char *kLogComponent = "kernel_stats";
+} // namespace
 
 // Single call site for the probe (see the fireX wrappers in pc_sampling.cpp).
 __attribute__((noinline)) void
@@ -97,14 +102,45 @@ void fire(Interval &iv, uint32_t seq) {
         uint32_t(std::min<size_t>(kMaxEntriesPerFiring, ptrs.size() - off));
     fireKernelStats(&header, ptrs.data() + off, n);
   }
-  DEBUG_PRINTF("[PARCAGPU] kernel_stats: seq=%u entries=%zu\n", seq,
-               entries.size());
+  PLOG_DEBUG(kLogComponent, "kernel_stats: seq=%u entries=%zu", seq,
+             entries.size());
 }
 
 } // namespace
 
 bool enabled() {
   return agentCtlFeature(PARCAGPU_FEATURE_KERNEL_STATS, /*envDefault=*/true);
+}
+
+namespace {
+std::atomic<bool> g_activityEnabled{false};
+std::atomic<bool> g_recording{false}; // last state logged
+} // namespace
+
+void setActivityEnabled(bool on) {
+  g_activityEnabled.store(on, std::memory_order_relaxed);
+}
+
+void logStateChange() {
+  const bool activity = g_activityEnabled.load(std::memory_order_relaxed);
+  const bool buffers = PARCAGPU_CUDA_CORRELATION_ENABLED();
+  const bool consumer = PARCAGPU_KERNEL_STATS_ENABLED();
+  const bool feature = enabled();
+  const bool on = activity && buffers && consumer && feature;
+  bool was = !on;
+  if (!g_recording.compare_exchange_strong(was, on, std::memory_order_relaxed))
+    return; // unchanged, or another thread logs this change
+  if (on) {
+    PLOG_INFO(kLogComponent,
+              "recording every kernel: kernel_stats consumer attached%s",
+              agentCtlConfig().active ? ", agent turned kernel_stats on" : "");
+  } else {
+    PLOG_INFO(kLogComponent, "stopped recording every kernel: %s",
+              !activity   ? "kernel activity off"
+              : !feature  ? "agent turned kernel_stats off"
+              : !consumer ? "kernel_stats consumer detached"
+                          : "cuda_correlation consumer detached");
+  }
 }
 
 void record(const CUpti_ActivityKernel5 *k) {
