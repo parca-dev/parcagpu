@@ -23,6 +23,7 @@
 #include "correlation_filter.h"
 #include "device_info.h"
 #include "env_config.h"
+#include "event_timing.h"
 #include "kernel_stats.h"
 #include "machine_gpus.h"
 #include "nvtx_collector.h"
@@ -695,6 +696,7 @@ public:
     pcSampling.envSampling = parcagpu::PCSampling::envRequested();
     parcagpu::agentCtlSetCapable(pcSamplingEnabled);
     init_debug(); // reads the environment's rate limits
+    parcagpu::event_timing::init();
     // Reported as whole events/s (the split defaults are fractional), at
     // least 1: the state's 0 would read as "not set".
     auto reported = [](const std::atomic<double> &r) {
@@ -777,9 +779,11 @@ public:
       return false;
     }
 
-    // Enable kernel activity recording
-    result = proton::cupti::activityEnable<true>(
-        CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+    // Enable kernel activity recording (not in event-timing mode 1).
+    result = parcagpu::event_timing::mode() == 1
+                 ? CUPTI_SUCCESS
+                 : proton::cupti::activityEnable<true>(
+                       CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
     if (result != CUPTI_SUCCESS) {
       DEBUG_PRINTF(
           "[PARCAGPU] Failed to enable concurrent kernel activity: error %d\n",
@@ -1080,6 +1084,9 @@ private:
         // Count every execution, sampled or not, before the filter below
         // drops the launches the rate limiter skipped.
         kernel_stats::record(k);
+        if (parcagpu::event_timing::mode() == 2)
+          parcagpu::event_timing::logCuptiRecord(k->correlationId, k->start,
+                                                 k->end, k->graphId);
 
         // Check correlation filter - only emit probe if this kernel was sampled
         bool shouldEmit = false;
@@ -1351,6 +1358,20 @@ private:
 
           profiler.pcSampling.emitMetadata();
         }
+        // EXPERIMENT: event-time a sampled launch (dice, then the bucket).
+        if (event_timing::mode() && isKernelLaunchCb &&
+            PARCAGPU_CUDA_CORRELATION_ENABLED() &&
+            g_streamCaptures.load(std::memory_order_relaxed) == 0 &&
+            !profiler.pcSampling.isSampling(cbdata->context) &&
+            threadRandom(g_pcSamplingState) < event_timing::sampleP()) {
+          applyRateLimits();
+          TokenBucket &limiter = proton::isGraphLaunch(cbid)
+                                     ? graphCallbackLimiter
+                                     : callbackLimiter;
+          if (limiter.tryAcquire())
+            event_timing::begin(cbdata, cbid,
+                                blockingDeviceId(cbdata->context));
+        }
         device_info::emit();
         return;
       }
@@ -1358,6 +1379,12 @@ private:
       // Process on EXIT to avoid adding latency to GPU launch
       if (cbdata->callbackSite != CUPTI_API_EXIT) {
         return;
+      }
+      if (event_timing::mode() && isKernelLaunchCb) {
+        event_timing::end(cbdata);
+        // cuEventQuery during a (global-mode) stream capture invalidates it.
+        if (g_streamCaptures.load(std::memory_order_relaxed) == 0)
+          event_timing::reap();
       }
 
       // Take the blocking-call end time before the PC-sampling drain below.
@@ -1450,7 +1477,13 @@ private:
       // launch's context is PC sampling, whichever thread opened the window:
       // every kernel needs its correlation callback to match PC samples to
       // CPU stacks on the agent side.
-      if (!profiler.pcSampling.isSampling(cbdata->context)) {
+      if (event_timing::mode() &&
+          !profiler.pcSampling.isSampling(cbdata->context)) {
+        // EXPERIMENT: report exactly the launches that were event-timed.
+        if (event_timing::pendingCorrelation() != correlationId)
+          return;
+        event_timing::consumeCorrelation();
+      } else if (!profiler.pcSampling.isSampling(cbdata->context)) {
         applyRateLimits();
         TokenBucket &limiter =
             isGraphLaunch ? graphCallbackLimiter : callbackLimiter;
@@ -1468,7 +1501,9 @@ private:
       PARCAGPU_CUDA_CORRELATION(correlationId, signedCbid, name);
 
       // Insert into correlation filter so we can match kernel activities later
-      if (isGraphLaunch) {
+      if (event_timing::mode() == 1) {
+        return; // no activity records to match
+      } else if (isGraphLaunch) {
         g_graphCorrelationMap.insert(correlationId);
         DEBUG_PRINTF("[PARCAGPU] Inserted correlationId=%u into graph map\n",
                      correlationId);
