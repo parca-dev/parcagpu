@@ -104,6 +104,7 @@ add_library(parcagpucupti SHARED
     src/correlation_filter.cpp
     src/device_info.cpp
     src/env_config.cpp
+    src/event_timing.cpp
     src/kernel_stats.cpp
     src/nvtx_collector.cpp
     src/nvtx_injection.cpp
