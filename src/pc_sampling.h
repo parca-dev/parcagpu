@@ -219,6 +219,11 @@ private:
   // Plain vector of initialized context IDs for iteration in collectAllData.
   // Protected by contextMutex.
   std::vector<uint32_t> initializedContextIds;
+  // Contexts with PC sampling enabled. While any is, CONCURRENT_KERNEL
+  // activity is off (see holdKernelActivity()).
+  int kernelActivityHolds = 0;
+  void holdKernelActivity();
+  void releaseKernelActivity();
 
   // Contexts currently sampling (between a successful start and its stop).
   // Protected by pcSamplingMutex; numSampling mirrors its size so the

@@ -643,6 +643,7 @@ void PCSampling::initialize(CUcontext context, uint32_t factor,
 
         contextInitialized.insert(contextId);
         initializedContextIds.push_back(contextId);
+        holdKernelActivity();
         DEBUG_PRINTF(
             "PC sampling initialized (serialized mode) for context %u\n",
             contextId);
@@ -1243,7 +1244,32 @@ bool PCSampling::finalize(CUcontext context) {
 
   contextIdToConfigureData.erase(contextId);
   contextInitialized.erase(contextId);
+  releaseKernelActivity(); // contextMutex held (above)
   return true;
+}
+
+// CUPTI kernel activity (CONCURRENT_KERNEL) while a context has PC sampling
+// enabled costs vLLM and SGLang 50-75% of their throughput for the first ~15
+// minutes, and still several percent after that: CUPTI's activity worker
+// saturates a core and stops delivering buffers. With activity off while PC
+// sampling is enabled, throughput stays within ~1% of PC sampling off. So
+// kernel activity (kernel_executed, kernel_stats, activity_batch) pauses for
+// the process from the first context set up for PC sampling until the last
+// one is finalized. Called with contextMutex held.
+void PCSampling::holdKernelActivity() {
+  if (kernelActivityHolds++ > 0)
+    return;
+  auto r = proton::cupti::activityDisable<false>(
+      CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+  DEBUG_PRINTF("PC sampling: kernel activity off (%d)\n", (int)r);
+}
+
+void PCSampling::releaseKernelActivity() {
+  if (kernelActivityHolds == 0 || --kernelActivityHolds > 0)
+    return;
+  auto r = proton::cupti::activityEnable<false>(
+      CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+  DEBUG_PRINTF("PC sampling: kernel activity on (%d)\n", (int)r);
 }
 
 void PCSampling::loadModule(const char *cubin, size_t cubinSize,
