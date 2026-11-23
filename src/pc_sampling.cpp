@@ -705,6 +705,15 @@ bool PCSampling::start(CUcontext context, uint64_t gapNs, uint64_t windowNs) {
 
   if (isSampling(context))
     return false;
+  // Inside the gap nothing will start: return before the synchronize below,
+  // which otherwise drains the GPU on every check (every 30 ms per launching
+  // thread). Checked again under the lock.
+  if (gapNs) {
+    std::lock_guard<std::mutex> lock(pcSamplingMutex);
+    auto last = lastStopNs.find(context);
+    if (last != lastStopNs.end() && emitMetadataNowNs() - last->second < gapNs)
+      return false;
+  }
   // CUPTI requires the GPU to be idle before starting PC sampling. Before
   // closing the gate, so that only this thread waits for it.
   proton::cuda::ctxSynchronize<false>();
