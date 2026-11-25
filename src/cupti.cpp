@@ -782,7 +782,8 @@ static void loadCupti() {
   if (Cupti::lib)
     PLOG_DEBUG(kLogComponent, "Using system %s", Cupti::name);
   else
-    PLOG_DEBUG(kLogComponent, "No libcupti found: %s", dlerror());
+    PLOG_ERROR(0, kLogComponent, "parcagpu %s inactive: no libcupti found: %s",
+               log::version(), dlerror());
 }
 
 // CUPTI's PC sampling dlopens "libnvperf_host.so" by name, without an
@@ -824,6 +825,12 @@ public:
     PLOG_DEBUG(kLogComponent, "Starting initialization");
 
     loadCupti();
+    if (!proton::cupti::ExternLibCupti::lib) {
+      // Without CUPTI there is nothing to clean up; leaving initialized set
+      // makes the destructor call CUPTI at exit, throw, and abort (#36).
+      initialized = false;
+      return false;
+    }
 
     // cuda_blocking_call is opt-in: CUPTI has no probe-attach hook, so its
     // callbacks would otherwise cost every blocking call (including polling
