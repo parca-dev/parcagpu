@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -688,9 +689,8 @@ __attribute__((noinline)) void parcagpuActivityBatch(const void **ptrs,
 
 namespace parcagpu {
 
-// Directory (with trailing slash) and major version ("12" or "13") of the
-// bundled CUPTI in use; bundledDir is empty when none was loaded.
-static std::string bundledDir;
+// Major version ("12" or "13") of the bundled CUPTI in use; empty when
+// CUPTI came from TRITON_CUPTI_LIB_PATH or the system.
 static std::string bundledMajor;
 
 // The bundled CUPTI major version for this machine. CUPTI 13 (CUDA 13.0)
@@ -735,51 +735,75 @@ static int bundledCuptiMajor() {
   return minCC >= 75 ? 13 : 12;
 }
 
-// Load libcupti for Proton's dispatch. Proton's own lookup goes first
-// (TRITON_CUPTI_LIB_PATH, an already loaded libcupti.so, LD_LIBRARY_PATH,
-// ld.so.cache), so a CUPTI matching the installed toolkit wins. Failing
-// that, load libcupti.so.12 or libcupti.so.13 shipped next to this library.
+// Load libcupti for Proton's dispatch, trying in order:
+//  1. TRITON_CUPTI_LIB_PATH, the explicit override.
+//  2. libcupti.so.12 or libcupti.so.13 shipped next to this library, picked
+//     for the driver and GPUs. It goes before the system lookup because an
+//     older libcupti.so on the library path silently records nothing on
+//     newer GPUs (parcagpu#24).
+//  3. A libcupti.so the process has already loaded, then LD_LIBRARY_PATH and
+//     ld.so.cache, for builds without the bundled files.
 // An application's own libcupti.so.12/.13 (pip wheels) is not reused: CUPTI
 // takes one subscriber per process either way, and in a shared copy the
 // application's later cuptiActivityRegisterCallbacks steals our records.
 static void loadCupti() {
   using Cupti = proton::cupti::ExternLibCupti;
-  try {
-    proton::Dispatch<Cupti>::init(Cupti::name, &Cupti::lib);
-    return;
-  } catch (const std::runtime_error &) {
+  std::string overrideDir = proton::getStrEnv(Cupti::pathEnv);
+  if (!overrideDir.empty()) {
+    std::string path = overrideDir + "/" + Cupti::name;
+    Cupti::lib = dlopen(path.c_str(), RTLD_LOCAL | RTLD_LAZY);
+    if (Cupti::lib) {
+      PLOG_DEBUG(kLogComponent, "Using %s from %s", path.c_str(),
+                 Cupti::pathEnv);
+      return;
+    }
+    PLOG_WARN(0, kLogComponent, "Ignoring %s: %s", Cupti::pathEnv,
+              dlerror());
   }
+
   Dl_info info;
-  if (!dladdr(reinterpret_cast<void *>(&loadCupti), &info) ||
-      !info.dli_fname)
-    return;
-  std::string dir = info.dli_fname;
-  dir = dir.substr(0, dir.rfind('/') + 1);
-  std::string major = std::to_string(bundledCuptiMajor());
-  std::string path = dir + "libcupti.so." + major;
-  Cupti::lib = dlopen(path.c_str(), RTLD_LOCAL | RTLD_LAZY);
-  if (Cupti::lib) {
-    bundledDir = dir;
-    bundledMajor = major;
-    PLOG_DEBUG(kLogComponent, "Using bundled %s", path.c_str());
-  } else {
-    PLOG_DEBUG(kLogComponent, "No libcupti found, bundled %s: %s",
-               path.c_str(), dlerror());
+  if (dladdr(reinterpret_cast<void *>(&loadCupti), &info) && info.dli_fname) {
+    std::string dir = info.dli_fname;
+    dir = dir.substr(0, dir.rfind('/') + 1);
+    std::string major = std::to_string(bundledCuptiMajor());
+    std::string path = dir + "libcupti.so." + major;
+    Cupti::lib = dlopen(path.c_str(), RTLD_LOCAL | RTLD_LAZY);
+    if (Cupti::lib) {
+      bundledMajor = major;
+      PLOG_DEBUG(kLogComponent, "Using bundled %s", path.c_str());
+      return;
+    }
+    PLOG_DEBUG(kLogComponent, "No bundled %s: %s", path.c_str(), dlerror());
   }
+
+  Cupti::lib = dlopen(Cupti::name, RTLD_NOLOAD);
+  if (!Cupti::lib)
+    Cupti::lib = dlopen(Cupti::name, RTLD_LOCAL | RTLD_LAZY);
+  if (Cupti::lib)
+    PLOG_DEBUG(kLogComponent, "Using system %s", Cupti::name);
+  else
+    PLOG_DEBUG(kLogComponent, "No libcupti found: %s", dlerror());
 }
 
-// CUPTI's PC sampling dlopens "libnvperf_host.so" by name and reports no
-// stall reasons when it is missing. A loaded library with that soname
-// satisfies the lookup, so load the copy bundled with the CUPTI in use. It
-// adds about 110 MB of RSS, so only when PC sampling is on.
-static void loadBundledNvperf() {
-  if (bundledDir.empty())
+// CUPTI's PC sampling dlopens "libnvperf_host.so" by name, without an
+// RPATH, and reports no stall reasons when it is missing. A loaded library
+// with that soname satisfies the lookup, so load the libnvperf_host.so in the
+// directory of the CUPTI in use, whatever its source; the bundled copies are
+// named libnvperf_host.so.12 and .13. If there is none, CUPTI still searches
+// LD_LIBRARY_PATH and the system library paths. It adds about 110 MB of RSS,
+// so only when PC sampling is on.
+static void loadNvperf() {
+  using Cupti = proton::cupti::ExternLibCupti;
+  char dir[PATH_MAX];
+  if (!Cupti::lib || dlinfo(Cupti::lib, RTLD_DI_ORIGIN, dir) != 0)
     return;
-  std::string path = bundledDir + "libnvperf_host.so." + bundledMajor;
+  std::string path = std::string(dir) + "/libnvperf_host.so";
+  if (!bundledMajor.empty())
+    path += "." + bundledMajor;
   if (dlopen(path.c_str(), RTLD_LOCAL | RTLD_LAZY)) {
-    PLOG_DEBUG(kLogComponent, "Using bundled %s", path.c_str());
+    PLOG_DEBUG(kLogComponent, "Using %s", path.c_str());
   } else {
-    PLOG_DEBUG(kLogComponent, "Bundled %s: %s", path.c_str(), dlerror());
+    PLOG_DEBUG(kLogComponent, "No %s: %s", path.c_str(), dlerror());
   }
 }
 
@@ -833,7 +857,7 @@ public:
         PARCAGPU_FEATURE_KERNEL_STATS |
         (blockingCallsEnabled ? PARCAGPU_FEATURE_BLOCKING_CALLS : 0));
     if (pcSamplingEnabled) {
-      loadBundledNvperf();
+      loadNvperf();
       PLOG_DEBUG(kLogComponent, "PC sampling enabled (serialized mode)");
     } else {
       PLOG_DEBUG(kLogComponent,
