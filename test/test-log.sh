@@ -3,13 +3,18 @@
 # the log and error probes after parcagpu has started, and checks that the
 # records logged before the attach are replayed to it. No GPU needed.
 #
+# Build identity:  the library's .note.parcagpu ELF note carries the build
+#                  info, the same string as the build record.
 # Phase replay:    warnings (bad environment) and the startup record reach a
 #                  consumer that attached after them, each once, on the log
 #                  probe and (warnings) on the error probe; nothing goes to
 #                  stderr without PARCAGPU_DEBUG.
 # Phase subscribe: cuptiSubscribe fails (another CUPTI client): the error
 #                  goes to stderr and is replayed, though parcagpu is inactive.
-# Phase level:     PARCAGPU_LOG_LEVEL=warn keeps info records off the probe.
+# Phase level:     PARCAGPU_LOG_LEVEL=warn keeps info records off the probe,
+#                  except the build record.
+# Phase pinned:    after more records than the replay ring holds, the build
+#                  record is still replayed, first.
 # Phase kernels:   a consumer attaching to cuda_correlation and kernel_stats
 #                  (as parca-agent does) and detaching is logged as parcagpu
 #                  starting and stopping recording every kernel.
@@ -80,6 +85,21 @@ run_phase() {
 
 count() { grep -cE "$1" "$2" || true; }
 
+# --- Build identity ---
+BUILD_INFO=$(strings "$LIB" | grep -m1 '^version=' || true)
+echo "build info: $BUILD_INFO"
+check_expr "ELF note .note.parcagpu present" \
+  "readelf -n '$LIB' | grep -q 'Displaying notes found in: .note.parcagpu'"
+check_expr "build info has version, sha, dirty, build_type, cuda_headers, cupti_api" \
+  "echo '$BUILD_INFO' | grep -qE '^version=[^ ]+ sha=[^ ]+ dirty=(0|1|unknown) build_type=[^ ]+ cuda_headers=[^ ]+ cupti_api=[^ ]+$'"
+if HEAD_SHA=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null); then
+  check_expr "build info sha is HEAD" \
+    "echo '$BUILD_INFO' | grep -q ' sha=$HEAD_SHA '"
+fi
+BUILD_VERSION=${BUILD_INFO%% *}; BUILD_VERSION=${BUILD_VERSION#version=}
+# The build record as the log probe shows it.
+BUILD_RE="^L2 t=[0-9]+ build: ${BUILD_INFO//+/\\+}\$"
+
 # --- Replay ---
 run_phase replay PARCAGPU_BOGUS=1 PARCAGPU_RATE_LIMIT=abc
 check_expr "unknown variable warning replayed once on log" \
@@ -88,6 +108,13 @@ check_expr "invalid value warning replayed once on log" \
   "[ $(count "^L3 .* env_config: PARCAGPU_RATE_LIMIT=abc invalid" "$BT_LOG") -eq 1 ]"
 check_expr "startup record replayed once on log" \
   "[ $(count "^L2 .* cupti: parcagpu .* active: " "$BT_LOG") -eq 1 ]"
+check_expr "build record replayed once on log" \
+  "[ $(count "$BUILD_RE" "$BT_LOG") -eq 1 ]"
+check_expr "build record is the first record" \
+  "grep -E '^[LE]' '$BT_LOG' | head -1 | grep -qE '$BUILD_RE'"
+check_expr "build record not on error" "[ $(count "^E .*: version=" "$BT_LOG") -eq 0 ]"
+check_expr "startup record carries the version" \
+  "[ $(count "^L2 .* cupti: parcagpu ${BUILD_VERSION//+/\\+} active: " "$BT_LOG") -eq 1 ]"
 check_expr "startup record says kernel activity is on" \
   "[ $(count "^L2 .* active: .*, kernel activity on, " "$BT_LOG") -eq 1 ]"
 check_expr "warnings replayed once on error" \
@@ -112,7 +139,22 @@ check_expr "subscribe failure replayed on error" \
 run_phase level PARCAGPU_LOG_LEVEL=warn PARCAGPU_BOGUS=1
 check_expr "warning on log at warn" \
   "[ $(count "^L3 .* unrecognized env var" "$BT_LOG") -eq 1 ]"
-check_expr "no info on log at warn" "[ $(count "^L[012] " "$BT_LOG") -eq 0 ]"
+check_expr "no info on log at warn but the build record" \
+  "[ $(grep -E '^L[012] ' '$BT_LOG' | grep -cvE '$BUILD_RE' || true) -eq 0 ]"
+check_expr "build record on log at warn" \
+  "[ $(count "$BUILD_RE" "$BT_LOG") -eq 1 ]"
+
+# --- Pinned: 80 warnings overflow the 64-record ring ---
+BOGUS=()
+for i in $(seq 1 80); do BOGUS+=("PARCAGPU_BOGUS_$i=1"); done
+echo "=== Phase pinned: PARCAGPU_BOGUS_{1..80}=1 ==="
+run_phase pinned "${BOGUS[@]}" > /dev/null
+check_expr "ring overflowed (fewer than 80 warnings replayed)" \
+  "[ $(count "^L3 .* unrecognized env var" "$BT_LOG") -lt 80 ]"
+check_expr "build record still replayed once after the ring wrapped" \
+  "[ $(count "$BUILD_RE" "$BT_LOG") -eq 1 ]"
+check_expr "build record first after the ring wrapped" \
+  "grep -E '^L' '$BT_LOG' | head -1 | grep -qE '$BUILD_RE'"
 
 # --- Recording every kernel: a second consumer attaches, then detaches ---
 TEST_LOG="/tmp/parcagpu-log-kernels-test.log"

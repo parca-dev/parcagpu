@@ -17,10 +17,7 @@
 #include "probes.h"
 
 #include "pc_sampling.h" // fireError
-
-#ifndef PARCAGPU_VERSION
-#define PARCAGPU_VERSION "unknown"
-#endif
+#include "version.h"
 
 namespace parcagpu {
 namespace log {
@@ -103,6 +100,12 @@ struct Record {
   char message[kMessageMax];
 };
 
+// The build record: written before any other record, exempt from the probe
+// threshold, and kept outside the ring, so every replay starts with it however
+// much was logged since. Guarded by g_mutex.
+Record g_build;
+bool g_buildWritten = false;
+
 // Guarded by g_mutex.
 Record g_ring[kReplayRecords];
 size_t g_ringNext = 0; // total records pushed; next slot is % kReplayRecords
@@ -181,6 +184,9 @@ void replayLocked() {
       now < g_replayDueNs.load(std::memory_order_relaxed))
     return;
   const Level threshold = config().probe;
+  // The build record first, whatever the threshold.
+  if (g_buildWritten)
+    fire(g_build, g_replayLog && logSem() > 0, false);
   // The whole ring, records kept since the join included: write() holds
   // those back from the probes being replayed to, so each goes out once.
   const size_t begin =
@@ -200,6 +206,47 @@ void copyStr(char *dst, size_t cap, const char *src) {
   size_t n = strnlen(src, cap - 1);
   memcpy(dst, src, n);
   dst[n] = '\0';
+}
+
+void printStderr(const Record &r) {
+  fprintf(stderr, "[%lu.%09lu] [PARCAGPU] %s %s: %s\n",
+          (unsigned long)(r.timeNs / 1000000000ULL),
+          (unsigned long)(r.timeNs % 1000000000ULL), levelName(r.level),
+          r.component, r.message);
+}
+
+// Keep r for replay and fire it where it goes now. pinned: the build record,
+// kept apart from the ring and sent whatever the probe threshold.
+void submitLocked(const Record &r, bool pinned) {
+  const Level level = r.level;
+  const Config &c = config();
+  if (level >= kInfo && !pinned)
+    g_ring[g_ringNext++ % kReplayRecords] = r;
+  // A record kept for replay waits for a pending replay to a probe rather
+  // than fire now, maybe before the new consumer's program is attached.
+  const bool held =
+      level >= kInfo && g_replayPending.load(std::memory_order_relaxed);
+  const bool toLog =
+      (pinned || level >= c.probe) && logSem() > 0 && !(held && g_replayLog);
+  const bool toError =
+      level >= kWarn && errorSem() > 0 && !(held && g_replayError);
+  if (toLog || toError) {
+    Bucket &b = level >= kWarn ? g_highBucket : g_lowBucket;
+    if (b.take()) {
+      // At most one notice a second about what wasn't sent.
+      if (b.suppressed && b.lastNs - b.lastNoticeNs >= 1000000000ULL) {
+        Record s{kWarn, 0, r.timeNs, "log", ""};
+        snprintf(s.message, sizeof(s.message),
+                 "%lu %s records not sent (over %.0f/s)",
+                 (unsigned long)b.suppressed,
+                 &b == &g_highBucket ? "warn/error" : "debug/info", b.rate);
+        b.suppressed = 0;
+        b.lastNoticeNs = b.lastNs;
+        fire(s, logSem() > 0, false);
+      }
+      fire(r, toLog, toError);
+    }
+  }
 }
 
 } // namespace
@@ -229,43 +276,22 @@ void write(Level level, int32_t code, const char *component, const char *fmt,
     r.message[n - 1] = '\0';
 
   const Config &c = config();
-  if (c.stderrAll || level >= kError) {
-    fprintf(stderr, "[%lu.%09lu] [PARCAGPU] %s %s: %s\n",
-            (unsigned long)(r.timeNs / 1000000000ULL),
-            (unsigned long)(r.timeNs % 1000000000ULL), levelName(level),
-            r.component, r.message);
-  }
+  if (c.stderrAll || level >= kError)
+    printStderr(r);
   if (level == kTrace)
     return;
 
   pthread_mutex_lock(&g_mutex);
   replayLocked();
-  if (level >= kInfo)
-    g_ring[g_ringNext++ % kReplayRecords] = r;
-  // A record the ring keeps waits for a pending replay to a probe rather
-  // than fire now, maybe before the new consumer's program is attached.
-  const bool held =
-      level >= kInfo && g_replayPending.load(std::memory_order_relaxed);
-  const bool toLog = level >= c.probe && logSem() > 0 && !(held && g_replayLog);
-  const bool toError =
-      level >= kWarn && errorSem() > 0 && !(held && g_replayError);
-  if (toLog || toError) {
-    Bucket &b = level >= kWarn ? g_highBucket : g_lowBucket;
-    if (b.take()) {
-      // At most one notice a second about what wasn't sent.
-      if (b.suppressed && b.lastNs - b.lastNoticeNs >= 1000000000ULL) {
-        Record s{kWarn, 0, r.timeNs, "log", ""};
-        snprintf(s.message, sizeof(s.message),
-                 "%lu %s records not sent (over %.0f/s)",
-                 (unsigned long)b.suppressed,
-                 &b == &g_highBucket ? "warn/error" : "debug/info", b.rate);
-        b.suppressed = 0;
-        b.lastNoticeNs = b.lastNs;
-        fire(s, logSem() > 0, false);
-      }
-      fire(r, toLog, toError);
-    }
+  if (!g_buildWritten) {
+    g_buildWritten = true;
+    g_build = Record{kInfo, 0, r.timeNs, "build", ""};
+    copyStr(g_build.message, sizeof(g_build.message), buildInfo());
+    if (c.stderrAll)
+      printStderr(g_build);
+    submitLocked(g_build, true);
   }
+  submitLocked(r, false);
   pthread_mutex_unlock(&g_mutex);
 }
 
@@ -344,8 +370,6 @@ const char *levelName(Level level) {
   }
   return "?";
 }
-
-const char *version() { return PARCAGPU_VERSION; }
 
 } // namespace log
 } // namespace parcagpu

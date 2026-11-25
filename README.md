@@ -163,6 +163,24 @@ consumer that sees one twice, because another consumer attached, can drop it by
 out with it. The `error` probe gets the same replay of warnings and errors.
 `trace` records (per PC sample, per NVTX event, per launch) go only to stderr.
 
+**Build identity.** A process's first record is a build record at info,
+component `build`, with space-separated `key=value` fields:
+
+```
+version=v0.4.0-4-gabc1234 sha=<40 hex> dirty=0 build_type=RelWithDebInfo cuda_headers=12.8 cupti_api=24
+```
+
+`version` is `git describe --always --dirty --tags`; `dirty=1` means the tree
+had uncommitted changes to tracked files. A value that couldn't be told is
+`unknown`. The keys are stable, and new ones are added at the end. The build
+record goes to the `log` probe whatever `PARCAGPU_LOG_LEVEL` is, and is replayed
+first on every replay, however many records came after it. The same string is
+in the library's `.note.parcagpu` ELF note (owner `parcagpu`, type 1), so
+`readelf -n libparcagpucupti.so` or an agent reading the mapped file can tell the
+build without parcagpu running. Builds without `.git` (Docker) take the values
+from `PARCAGPU_VERSION`, `PARCAGPU_GIT_SHA` and `PARCAGPU_GIT_DIRTY` (CMake
+variables and Docker build args), which the Makefile and CI set.
+
 **Cubin files.** Attach to one of `cubin_loaded` and `cubin_loaded_file`,
 preferring the second where it exists (older parcagpu lacks it). Only
 `cuModuleLoad` gives a path, absolute and resolved in the application's working

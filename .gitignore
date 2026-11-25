@@ -6,3 +6,4 @@ test/bpf/activityparser_*.go
 test/bpf/activityparser_*.o
 microbenchmarks/rapid_launch
 microbenchmarks/pc_sample_toy
+build-local/

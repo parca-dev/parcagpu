@@ -35,6 +35,7 @@
 #include "pc_gate.h"
 #include "pc_sampling.h"
 #include "token_bucket.h"
+#include "version.h"
 
 namespace {
 constexpr const char *kLogComponent = "cupti";
@@ -881,7 +882,7 @@ public:
       // CUPTI's one subscriber slot.
       PLOG_ERROR(result, kLogComponent,
                  "parcagpu %s inactive: cuptiSubscribe failed: %s (%d)%s",
-                 log::version(), cuptiResultName(result), result,
+                 parcagpu::buildVersion(), cuptiResultName(result), result,
                  result == CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED
                      ? "; another CUPTI client (Nsight, DCGM profiling) "
                        "is attached to this process"
@@ -940,7 +941,7 @@ public:
       PLOG_ERROR(result, kLogComponent,
                  "parcagpu %s inactive: cuptiActivityRegisterCallbacks "
                  "failed: %s (%d)",
-                 log::version(), cuptiResultName(result), result);
+                 parcagpu::buildVersion(), cuptiResultName(result), result);
       return false;
     }
 
@@ -1060,8 +1061,9 @@ private:
               "API %d), kernel activity %s, PC sampling %s, blocking calls "
               "%s, launch rate limit %.1f/s, graph %.1f/s per thread, agent "
               "control %s",
-              log::version(), driver / 1000, (driver % 1000) / 10, driver % 10,
-              cupti, CUPTI_API_VERSION, kernelActivityEnabled ? "on" : "off",
+              parcagpu::buildVersion(), driver / 1000, (driver % 1000) / 10,
+              driver % 10, cupti, CUPTI_API_VERSION,
+              kernelActivityEnabled ? "on" : "off",
               !pcSamplingEnabled       ? "off"
               : pcSampling.envSampling ? "on (environment)"
                                        : "available to the agent",
@@ -1763,14 +1765,14 @@ extern "C" int InitializeInjection(void) {
   } catch (const std::exception &e) {
     PLOG_ERROR(0, kLogComponent,
                "parcagpu %s inactive: initialization caught: %s",
-               parcagpu::log::version(), e.what());
+               parcagpu::buildVersion(), e.what());
     parcagpu::log::startPoller();
     return 0;
   } catch (...) {
     PLOG_ERROR(0, kLogComponent,
                "parcagpu %s inactive: initialization caught an unknown "
                "exception",
-               parcagpu::log::version());
+               parcagpu::buildVersion());
     parcagpu::log::startPoller();
     return 0;
   }

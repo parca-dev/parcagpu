@@ -49,19 +49,25 @@ WORKDIR /build
 # Copy CUDA headers from header image
 COPY --from=cuda-headers /usr/local/cuda /usr/local/cuda
 
-# Version for parcagpu's startup log record (no .git in the build context).
-ARG PARCAGPU_VERSION=unknown
+# Build identity (src/version.h); there is no .git in the build context.
+# Empty values are reported as "unknown".
+ARG PARCAGPU_VERSION=
+ARG PARCAGPU_GIT_SHA=
+ARG PARCAGPU_GIT_DIRTY=
 
 # Copy parcagpu source files and proton submodule
 COPY src /build/src
 COPY proton /build/proton
 COPY CMakeLists.txt /build/
+COPY cmake /build/cmake
 
 # Build the library (disable tests for Docker build)
 RUN mkdir -p build && \
     cd build && \
     cmake -DCUDA_INCLUDE_DIR=/usr/local/cuda/include -DBUILD_TESTS=OFF \
-          -DPARCAGPU_VERSION="${PARCAGPU_VERSION}" .. && \
+          -DPARCAGPU_VERSION="${PARCAGPU_VERSION}" \
+          -DPARCAGPU_GIT_SHA="${PARCAGPU_GIT_SHA}" \
+          -DPARCAGPU_GIT_DIRTY="${PARCAGPU_GIT_DIRTY}" .. && \
     make -j$(nproc)
 
 # Export stage for extracting the library (used by Makefile and release binaries).
