@@ -1,4 +1,4 @@
-.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-blocking-mock test-graph-rate-limit test-pc-contexts test-nvtx test-nvtx-real test-agent-ctl test-gate test-machine-gpus test-log
+.PHONY: all clean test build-amd64 build-arm64 build-all cross docker-push docker-test-build docker-test-run format local debug generate bpf-test microbenchmarks test-multi test-pc-real test-pc-mock test-blocking-mock test-graph-rate-limit test-pc-contexts test-nvtx test-nvtx-real test-agent-ctl test-gate test-machine-gpus test-profiling-access test-log
 
 LIB_NAME = libparcagpucupti.so
 # Bundled CUPTI that Docker builds ship next to $(LIB_NAME)
@@ -80,6 +80,10 @@ test: local
 # Machine GPU count and the default launch rate limit split (no GPU/root).
 test-machine-gpus: local
 	./build-local/bin/test_machine_gpus
+
+# Driver profiling restriction and CAP_SYS_ADMIN check (no GPU/root).
+test-profiling-access: local
+	./build-local/bin/test_profiling_access
 
 test-nvtx: local
 	@echo "=== Running NVTX test ==="

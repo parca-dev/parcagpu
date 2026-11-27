@@ -73,7 +73,7 @@ variable or an invalid value is logged as a warning (see [Logging](#logging)).
 |---|---|---|
 | `PARCAGPU_RATE_LIMIT` | 100 / GPUs | Kernel launches per second per thread that reach the probes (token bucket). Split across the machine's GPUs (`/proc/driver/nvidia/gpus`, not only those the process sees), so with a launching thread per GPU the machine sends about 100/s: 12.5 per thread on 8 GPUs. |
 | `PARCAGPU_GRAPH_RATE_LIMIT` | 20 / GPUs | The same for graph launches (`cuGraphLaunch`, `cudaGraphLaunch`), from a separate bucket, so graph replays can't flood the probes and eager bursts can't starve graphs. |
-| `PARCAGPU_PC_SAMPLING_RATE` | unset | Set to enable PC sampling: target samples per second, reached by adjusting each window's dice-roll probability. 0 enables it at a fixed probability. |
+| `PARCAGPU_PC_SAMPLING_RATE` | unset | Set to enable PC sampling: target samples per second, reached by adjusting each window's dice-roll probability. 0 enables it at a fixed probability. Needs access to the GPU performance counters: CAP_SYS_ADMIN, or the driver loaded with `NVreg_RestrictProfilingToAdminUsers=0`; without it parcagpu keeps PC sampling off. |
 | `PARCAGPU_SAMPLING_FACTOR` | 20 | PC sampling period, 2^factor cycles per SM, 5-31. Applied instead of CUPTI's per-GPU default (10 on a GB10). |
 | `PARCAGPU_PC_HW_BUFFER_MB` | unset | CUPTI's PC sampling hardware buffer in MB, up to 4096. Unset, 0 or out of range: CUPTI's 512 MB. On a GB10, forcing any size has made PC sampling return no data. |
 | `PARCAGPU_METADATA_REFRESH_MS` | 30000 | How often cubins, the stall reason map and `gpu_config` are re-emitted. A consumer that attaches while another is attached gets them only then: the USDT semaphore stays at 1. |
@@ -227,6 +227,7 @@ make clean
 make test                 # Mock CUPTI harness
 make test-nvtx            # NVTX collector
 make test-machine-gpus    # Machine GPU count and the rate limit split
+make test-profiling-access # Driver profiling restriction check
 make test-gate            # PC sampling gate, under ThreadSanitizer
 make test-pc-contexts     # PC sampling start/stop across mock contexts
 make test-agent-ctl       # Control over procctl, from a Go agent

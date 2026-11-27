@@ -226,6 +226,16 @@ if(BUILD_TESTS)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
 
+    add_executable(test_profiling_access
+        test/test_profiling_access.cpp
+    )
+    target_include_directories(test_profiling_access PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    set_target_properties(test_profiling_access PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
     add_executable(test_nvtx
         test/test_nvtx.c
     )

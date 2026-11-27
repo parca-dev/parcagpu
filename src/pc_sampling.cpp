@@ -9,6 +9,7 @@
 #include "parcagpu_ctl.h"
 #include "pc_gate.h"
 #include "probes.h"
+#include "profiling_access.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -555,14 +556,19 @@ bool PCSampling::isSupported(bool agentControl) {
     return false;
   }
 
-  // Attempt a lightweight permission probe. CUPTI PC sampling requires
-  // either root, CAP_SYS_ADMIN, or the NVIDIA module parameter
-  // NVreg_RestrictProfilingToAdminUsers=0.
-  // We cannot easily pre-check permissions without attempting CUPTI calls,
-  // so we defer the real check to initialize() where enablePCSampling()
-  // will fail with a CUPTI error if permissions are insufficient.
-  // TODO: Add explicit permission pre-check.
-  // Reference: https://developer.nvidia.com/nvidia-development-tools-solutions-err_nvgpuctrperm-permission-issue-performance-counters
+  // Without access to the performance counters, CUPTI accepts PC sampling
+  // and then finalizes itself at the first kernel launch, silencing all of
+  // parcagpu (profiling_access.h).
+  if (!profilingAllowed()) {
+    PLOG_WARN(0, kLogComponent,
+              "PC sampling disabled: the NVIDIA driver restricts GPU "
+              "profiling to admin users (NVreg_RestrictProfilingToAdminUsers"
+              "=1) and this process lacks CAP_SYS_ADMIN; see "
+              "https://developer.nvidia.com/"
+              "nvidia-development-tools-solutions-err_nvgpuctrperm-permission-"
+              "issue-performance-counters");
+    return false;
+  }
 
   int major = driverVersion / 1000;
   int minor = (driverVersion % 1000) / 10;
